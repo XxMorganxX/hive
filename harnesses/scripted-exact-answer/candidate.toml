@@ -1,0 +1,3 @@
+schema_version = 1
+agent = "scripted"
+description = "Dry-run seed for exact_answer: replays canned answers, right on some search tasks and wrong on others."

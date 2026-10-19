@@ -1,0 +1,16 @@
+# TEST DOUBLE, not a real agent: the scripted adapter replays these canned outputs
+# verbatim and calls no model. This seed exists so `hive run` can exercise the whole
+# loop with zero spend.
+#
+# It is deliberately mid-range on the search split (3 of 6 correct), so a change can
+# move the score either way. Only search-split task ids appear here: a seed that named
+# held-out tasks would leak them into every overseer workspace (P7).
+
+default = "ANSWER: unknown"
+
+[responses]
+"mixed-arithmetic" = "17 * 23 = 391, 144 / 12 = 12, 391 - 12 + 9 = 388.\nANSWER: 388"
+"pet-logic" = "Alice has the cat, Bob the fish, so Carol has the dog.\nANSWER: Carol"
+"reverse-string" = "ANSWER: 24ssenrah"
+"count-letter-e" = "ANSWER: 7"  # wrong on purpose
+# weekday-offset and days-to-seconds have no entry, so they get the default (wrong).

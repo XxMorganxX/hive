@@ -1,0 +1,3 @@
+schema_version = 1
+agent = "scripted"
+description = "Dry-run seed for python_functions: writes canned solution.py files, correct for some search tasks and buggy or missing for others."
