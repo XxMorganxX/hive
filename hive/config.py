@@ -11,7 +11,7 @@ config takes one round trip rather than one per mistake.
 
 Plug-in sections ([agent], [suite], [overseer]) are open: their extra keys belong
 to the plug-in, which validates them itself. One convention applies to all of them:
-a key ending in `_file` or `_dir` is a path, and a relative one resolves against the
+a key ending in `_file`, `_dir` or `_path` is a path, and a relative one resolves against the
 config file's directory, like `seed_candidate` and `output_dir` do.
 """
 
@@ -182,7 +182,7 @@ def _resolve_path(base: Path, text: str) -> Path:
 
 # Plug-in settings named like these are paths. They resolve against the config file, as
 # seed_candidate and output_dir do, so a config behaves the same from any working directory.
-PATH_SETTING_SUFFIXES = ("_file", "_dir")
+PATH_SETTING_SUFFIXES = ("_file", "_dir", "_path")
 
 
 def _resolve_path_settings(section: str, settings: dict[str, Any], base: Path, problems: list[str]) -> dict[str, Any]:

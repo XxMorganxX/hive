@@ -445,3 +445,10 @@ def test_settings_without_a_path_suffix_are_left_alone(tmp_path):
 def test_a_non_string_path_setting_is_a_problem(tmp_path):
     problems = problems_for(write_config(tmp_path, {"suite": {"tasks_file": "3"}}))
     assert any("tasks_file" in problem for problem in problems)
+
+
+def test_relative_path_settings_resolve_against_the_config_file(tmp_path):
+    # e.g. the interpreter of a framework's own venv: [agent] python_path = "../.venvs/strands/bin/python"
+    path = write_config(tmp_path, {"agent": {"python_path": '"../.venvs/x/bin/python"'}})
+    config = load_experiment(path)
+    assert config.agent_settings["python_path"] == str((path.parent / ".." / ".venvs" / "x" / "bin" / "python").resolve())

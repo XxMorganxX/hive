@@ -30,3 +30,6 @@ Thumbs.db
 
 # Optimizer experience store (raw traces, large)
 experience/
+
+# Per-framework virtualenvs (Deep Agents, Strands); recreate with scripts/setup-framework-venvs.sh
+.venvs/
