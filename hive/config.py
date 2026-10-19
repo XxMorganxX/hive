@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import math
+import os
 import re
 import tomllib
 from collections.abc import Mapping
@@ -180,6 +181,13 @@ def _resolve_path(base: Path, text: str) -> Path:
     return (path if path.is_absolute() else base / path).resolve()
 
 
+def _absolute_path(base: Path, text: str) -> str:
+    """Absolute and normalized, but symlinks kept: a venv's bin/python is a symlink to a base
+    interpreter, and following it would run without the venv's packages."""
+    path = Path(text).expanduser()
+    return os.path.normpath(path if path.is_absolute() else base / path)
+
+
 # Plug-in settings named like these are paths. They resolve against the config file, as
 # seed_candidate and output_dir do, so a config behaves the same from any working directory.
 PATH_SETTING_SUFFIXES = ("_file", "_dir", "_path")
@@ -193,7 +201,7 @@ def _resolve_path_settings(section: str, settings: dict[str, Any], base: Path, p
         if not isinstance(value, str) or not value:
             problems.append(f"[{section}] {key} must be a non-empty path string, got {value!r}")
             continue
-        resolved[key] = str(_resolve_path(base, value))
+        resolved[key] = _absolute_path(base, value)
     return resolved
 
 

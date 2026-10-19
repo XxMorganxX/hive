@@ -452,3 +452,14 @@ def test_relative_path_settings_resolve_against_the_config_file(tmp_path):
     path = write_config(tmp_path, {"agent": {"python_path": '"../.venvs/x/bin/python"'}})
     config = load_experiment(path)
     assert config.agent_settings["python_path"] == str((path.parent / ".." / ".venvs" / "x" / "bin" / "python").resolve())
+
+
+def test_path_settings_keep_symlinks_so_a_venv_interpreter_stays_the_venv_interpreter(tmp_path):
+    # .venvs/x/bin/python is a symlink to a base interpreter; following it would drop the venv.
+    venv_bin = tmp_path / ".venvs" / "x" / "bin"
+    venv_bin.mkdir(parents=True)
+    base = tmp_path / "base-python"
+    base.write_text("")
+    (venv_bin / "python").symlink_to(base)
+    path = write_config(tmp_path, {"agent": {"python_path": '"../.venvs/x/bin/python"'}})
+    assert load_experiment(path).agent_settings["python_path"] == str(venv_bin / "python")
