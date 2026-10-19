@@ -504,6 +504,7 @@ Each item is documented behavior of the tools or a standard failure mode of eval
 - [ ] A task that never ran can look like a cheap failure. **Flag trials with zero tokens or zero cost.**
 - [ ] A coding-agent overseer fixates on one idea. **Track explored valves and push toward unexplored ones.**
 - [ ] Best-of-population rises with noise alone. **Use the null-overseer arm and promotion margins.**
+- [ ] In the scaffold, trials run on the host. An agent with `bash` can read the repository, including the `python_functions` hidden cases. **Run agents and verifiers in containers (a Harbor suite) before any experiment whose numbers matter.**
 
 ## 10. Budget model
 
