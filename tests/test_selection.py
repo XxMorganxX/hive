@@ -23,7 +23,7 @@ def report_scoring(*task_rewards: float, candidate_id: str = "c", **overrides) -
                     detail="",
                     usage=Usage(),
                     wall_clock_s=1.0,
-                    trial_dir=f"/runs/t{index}/1",
+                    trial_dir=f"trials/t{index}/1",
                 ),
             ),
         )
@@ -142,3 +142,18 @@ def test_rule_description_says_held_out_split_is_hidden_and_scored_once_at_the_e
 
 def test_rule_description_says_the_child_must_not_fall_below_the_seed():
     assert "seed" in describe_rule(0.05).lower()
+
+
+def test_gain_exactly_equal_to_a_decimal_margin_is_not_promoted_despite_float_rounding():
+    # 0.7 + 0.1 == 0.7999999999999999 in binary floating point, so a naive bar lets 0.8 through.
+    incumbent = report_scoring(*([1.0] * 7 + [0.0] * 3), candidate_id="inc")  # 0.7
+    child = report_scoring(*([1.0] * 8 + [0.0] * 2), candidate_id="child")  # 0.8
+    decision = decide(child, incumbent, incumbent, margin=0.1)
+    assert not decision.promoted
+    assert "<=" in decision.reason
+
+
+def test_gain_clearly_above_a_decimal_margin_is_still_promoted():
+    incumbent = report_scoring(*([1.0] * 7 + [0.0] * 3), candidate_id="inc")  # 0.7
+    child = report_scoring(*([1.0] * 9 + [0.0] * 1), candidate_id="child")  # 0.9
+    assert decide(child, incumbent, incumbent, margin=0.1).promoted

@@ -271,10 +271,7 @@ def test_each_trial_gets_its_own_workdir_and_trace_dir(candidate, tmp_path):
     }
     assert {(workdir, trace_dir) for _, workdir, trace_dir in adapter.agent.calls} == expected
     assert all(workdir.is_dir() and trace_dir.is_dir() for workdir, trace_dir in expected)
-    assert [trial.trial_dir for trial in report.tasks[0].trials] == [
-        str((out_dir / "trials" / "t1" / "1").resolve()),
-        str((out_dir / "trials" / "t1" / "2").resolve()),
-    ]
+    assert [trial.trial_dir for trial in report.tasks[0].trials] == ["trials/t1/1", "trials/t1/2"]
 
 
 def test_unsafe_task_ids_get_distinct_directories_inside_trials(candidate, tmp_path):
@@ -282,9 +279,9 @@ def test_unsafe_task_ids_get_distinct_directories_inside_trials(candidate, tmp_p
     suite = FakeSuite([search_task("a/b"), search_task("a_b"), search_task(".."), search_task("a b")])
     report = run_eval(candidate, FakeAdapter(), suite, out_dir)
     trials_root = (out_dir / "trials").resolve()
-    dirs = [Path(task.trials[0].trial_dir) for task in report.tasks]
+    dirs = [(out_dir / task.trials[0].trial_dir).resolve() for task in report.tasks]
     assert len(set(dirs)) == len(dirs)
-    assert all(directory.parent.parent == trials_root for directory in dirs)
+    assert all(directory.parent.parent == trials_root and directory.is_dir() for directory in dirs)
 
 
 def test_unsafe_task_id_directory_name_is_deterministic(candidate, tmp_path):
@@ -433,10 +430,11 @@ def test_outcome_json_is_written_for_every_trial(candidate, tmp_path):
         return completed()
 
     suite = FakeSuite([search_task("t1"), search_task("t2"), search_task("t3", files={"../x": "y"})])
-    report = run_eval(candidate, FakeAdapter(crash_on_t2), suite, tmp_path / "out", trials_per_task=2)
+    out_dir = tmp_path / "out"
+    report = run_eval(candidate, FakeAdapter(crash_on_t2), suite, out_dir, trials_per_task=2)
     for task in report.tasks:
         for trial in task.trials:
-            written = json.loads((Path(trial.trial_dir) / "outcome.json").read_text())
+            written = json.loads((out_dir / trial.trial_dir / "outcome.json").read_text())
             assert (written["task_id"], written["trial"], written["status"]) == (trial.task_id, trial.trial, trial.status)
 
 
@@ -459,7 +457,7 @@ def scored(task_id: str, trial: int, reward: float, usage: Usage | None = None) 
         detail="",
         usage=usage or Usage(),
         wall_clock_s=1.0,
-        trial_dir=f"/runs/{task_id}/{trial}",
+        trial_dir=f"trials/{task_id}/{trial}",
     )
 
 
@@ -473,7 +471,7 @@ def errored(task_id: str, trial: int, error_class: str = "timeout", usage: Usage
         detail="timed out",
         usage=usage or Usage(),
         wall_clock_s=2.0,
-        trial_dir=f"/runs/{task_id}/{trial}",
+        trial_dir=f"trials/{task_id}/{trial}",
     )
 
 
@@ -596,3 +594,177 @@ def test_from_dict_recomputes_aggregates_instead_of_trusting_them():
     data["selection_score"] = 0.99
     data["tasks"][0]["selection_reward"] = 0.99
     assert EvalReport.from_dict(data).selection_score == sample_report().selection_score
+
+
+# --- spend accounting and aborted evaluations ---------------------------------------------------
+
+
+class AbortTrial(BaseException):
+    """Escapes `except Exception`, as a real interrupt or an evaluator bug would."""
+
+
+def costly_run(cost: float, counter: list[str], lock: threading.Lock, raise_on: str | None = None) -> RunBehavior:
+    def run(task, workdir, trace_dir):
+        with lock:
+            counter.append(task.id)
+        if task.id == raise_on:
+            raise AbortTrial("worker blew up")
+        time.sleep(0.01)
+        return completed(usage=Usage(cost_usd=cost))
+
+    return run
+
+
+def test_on_trial_cost_is_called_once_per_finished_trial_with_its_cost(candidate, tmp_path):
+    seen: list[float] = []
+    suite = FakeSuite([search_task(f"t{i}") for i in range(3)])
+    adapter = FakeAdapter(lambda task, workdir, trace_dir: completed(usage=Usage(cost_usd=0.25)))
+    report = evaluate(
+        candidate, adapter, suite, "search", model=MODEL, agent_settings={}, trials_per_task=2,
+        out_dir=tmp_path / "out", concurrency=2, on_trial_cost=seen.append,
+    )  # fmt: skip
+    assert seen == [0.25] * 6
+    assert sum(seen) == report.cost_usd
+
+
+def test_interrupt_while_collecting_cancels_queued_trials_and_reports_finished_ones(candidate, tmp_path):
+    calls: list[str] = []
+    seen: list[float] = []
+
+    def interrupt_after_first(cost: float) -> None:
+        seen.append(cost)
+        if len(seen) == 1:
+            raise KeyboardInterrupt  # stands in for Ctrl-C arriving while the main thread waits
+
+    suite = FakeSuite([search_task(f"t{i}") for i in range(12)])
+    adapter = FakeAdapter(costly_run(0.1, calls, threading.Lock()))
+    with pytest.raises(KeyboardInterrupt):
+        evaluate(
+            candidate, adapter, suite, "search", model=MODEL, agent_settings={}, trials_per_task=1,
+            out_dir=tmp_path / "out", concurrency=1, on_trial_cost=interrupt_after_first,
+        )  # fmt: skip
+    assert len(calls) < 12, "queued paid trials kept running after the interrupt"
+    # Every trial that ran finished (none raised), so every one of them was reported.
+    assert len(seen) == len(calls)
+    assert sum(seen) == pytest.approx(0.1 * len(calls))
+
+
+def test_worker_exception_cancels_queued_trials_and_still_reports_finished_ones(candidate, tmp_path):
+    calls: list[str] = []
+    seen: list[float] = []
+    suite = FakeSuite([search_task(f"t{i}") for i in range(12)])
+    adapter = FakeAdapter(costly_run(0.1, calls, threading.Lock(), raise_on="t1"))
+    with pytest.raises(AbortTrial):
+        evaluate(
+            candidate, adapter, suite, "search", model=MODEL, agent_settings={}, trials_per_task=1,
+            out_dir=tmp_path / "out", concurrency=1, on_trial_cost=seen.append,
+        )  # fmt: skip
+    assert len(calls) < 12, "queued paid trials kept running after a worker raised"
+    finished = len(calls) - 1  # t1 raised, everything else that started finished
+    assert len(seen) == finished
+    assert sum(seen) == pytest.approx(0.1 * finished)
+
+
+# --- agent-reported usage -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_usage",
+    [
+        Usage(cost_usd=-5.0),
+        Usage(cost_usd=math.nan),
+        Usage(cost_usd=math.inf),
+        Usage(cost_usd=True),
+        Usage(cost_usd="0.1"),
+        Usage(input_tokens=-1),
+        Usage(output_tokens=1.5),
+        Usage(cache_read_tokens=True),
+        None,
+        {"cost_usd": 0.1},
+    ],
+    ids=["negative-cost", "nan-cost", "inf-cost", "bool-cost", "str-cost", "negative-tokens", "float-tokens",
+         "bool-tokens", "none", "dict"],
+)  # fmt: skip
+@pytest.mark.parametrize("status", ["completed", "errored"])
+def test_invalid_usage_makes_the_trial_an_agent_error(candidate, tmp_path, bad_usage, status):
+    def run(task, workdir, trace_dir):
+        return AgentResult(status=status, final_text="ok", usage=bad_usage, wall_clock_s=1.0, error_class="timeout")
+
+    suite = FakeSuite([search_task("t1")])
+    report = run_eval(candidate, FakeAdapter(run), suite, tmp_path / "out")
+    trial = only_trial(report)
+    assert (trial.status, trial.error_class, trial.reward) == ("errored", "agent_error", None)
+    assert "usage" in trial.detail
+    assert suite.grade_calls == []
+    cost = report.cost_usd
+    assert math.isfinite(cost) and cost >= 0
+
+
+def test_invalid_tokens_keep_a_valid_reported_cost(candidate, tmp_path):
+    # The money was still spent; dropping it would understate the run's spend.
+    usage = Usage(input_tokens=1.5, cost_usd=0.2)
+    adapter = FakeAdapter(lambda task, workdir, trace_dir: completed(usage=usage))
+    trial = only_trial(run_eval(candidate, adapter, FakeSuite([search_task("t1")]), tmp_path / "out"))
+    assert trial.error_class == "agent_error"
+    assert trial.usage == Usage(cost_usd=0.2)
+
+
+# --- workspace encoding -------------------------------------------------------------------------
+
+
+def test_workspace_text_that_cannot_be_encoded_is_a_workspace_error_for_that_trial(candidate, tmp_path):
+    out_dir = tmp_path / "out"
+    suite = FakeSuite([search_task("bad", files={"notes.txt": "caf\udce9"}), search_task("good")])
+    report = run_eval(candidate, FakeAdapter(), suite, out_dir)
+    bad, good = (task.trials[0] for task in report.tasks)
+    assert (bad.status, bad.error_class) == ("errored", "workspace_error")
+    assert "notes.txt" in bad.detail
+    assert good.status == "scored"
+    assert (out_dir / "report.json").is_file()
+
+
+def test_workspace_files_are_written_as_utf8(candidate, tmp_path):
+    # The Task contract fixes UTF-8; the locale's encoding must not decide what lands on disk.
+    seen = {}
+
+    def read_bytes(task, workdir, trace_dir):
+        seen["bytes"] = (workdir / "names.txt").read_bytes()
+        return completed()
+
+    suite = FakeSuite([search_task("t1", files={"names.txt": "Zoë → 東京"})])
+    run_eval(candidate, FakeAdapter(read_bytes), suite, tmp_path / "out")
+    assert seen["bytes"] == "Zoë → 東京".encode("utf-8")
+
+
+# --- trial paths ------------------------------------------------------------------------------
+
+
+def test_trial_dir_is_relative_to_the_evaluation_out_dir(candidate, tmp_path):
+    out_dir = tmp_path / "out"
+    report = run_eval(candidate, FakeAdapter(), FakeSuite([search_task("t1")]), out_dir)
+    trial = only_trial(report)
+    assert trial.trial_dir == "trials/t1/1"
+    assert str(tmp_path) not in (out_dir / "report.json").read_text()
+    assert str(tmp_path) not in (out_dir / "trials" / "t1" / "1" / "outcome.json").read_text()
+
+
+# --- malformed AgentResult fields ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("error", object()), ("error_class", 7), ("final_text", None), ("wall_clock_s", float("nan")), ("wall_clock_s", -1.0)],
+)
+def test_malformed_agent_result_field_errors_one_trial_and_keeps_its_cost(candidate, tmp_path, field, value):
+    def malformed(task, workdir, trace_dir):
+        values = dict(status="errored", final_text="", usage=Usage(cost_usd=0.1), wall_clock_s=1.0, error="x")
+        values[field] = value
+        return AgentResult(**values)
+
+    report = run_eval(candidate, FakeAdapter(malformed), FakeSuite([search_task("t1")]), tmp_path / "out")
+    trial = only_trial(report)
+    assert trial.status == "errored"
+    assert trial.error_class == "agent_error"
+    assert field in trial.detail
+    assert trial.usage.cost_usd == pytest.approx(0.1)
+    assert (tmp_path / "out" / "report.json").is_file()

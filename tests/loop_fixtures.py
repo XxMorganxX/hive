@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import threading
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Any
 from hive.agents.scripted.adapter import ScriptedAdapter
 from hive.candidate import Candidate
 from hive.contracts import AgentResult, Grade, MetricSpec, OverseerBrief, Proposal, Task, Usage
+from hive.loop import SKIPPED_EVIDENCE_FILE
 from hive.overseers.claude_code.overseer import build_workspace
 from hive.suites.exact_answer.suite import BUNDLED_TASKS_FILE
 
@@ -179,6 +181,7 @@ class RecordingOverseer(_BaseOverseer):
     workspaces: list[Path] = []
     heldout_existed: list[bool] = []
     reports: list[dict[str, Any]] = []
+    skipped_notes: list[str | None] = []  # the evidence's skipped-files note, when there is one
 
     def propose(self, brief: OverseerBrief, workspace: Path) -> Proposal:
         workspace = Path(workspace)
@@ -186,6 +189,8 @@ class RecordingOverseer(_BaseOverseer):
         RecordingOverseer.workspaces.append(workspace)
         # The brief's files are temporary copies, so record what they held while they exist.
         RecordingOverseer.reports.append(json.loads(Path(brief.incumbent_report).read_text()))
+        note = Path(brief.evidence_dir) / SKIPPED_EVIDENCE_FILE
+        RecordingOverseer.skipped_notes.append(note.read_text() if note.is_file() else None)
         # Briefs hold copies outside the run dir, so the test passes the run dir in explicitly.
         if "run_dir" in self.settings:
             RecordingOverseer.heldout_existed.append((Path(self.settings["run_dir"]) / "heldout").exists())
@@ -198,6 +203,7 @@ class RecordingOverseer(_BaseOverseer):
         cls.workspaces = []
         cls.heldout_existed = []
         cls.reports = []
+        cls.skipped_notes = []
 
 
 # --- suites ------------------------------------------------------------------------------
@@ -291,3 +297,69 @@ class _CostlyAgent:
     def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
         result = self.inner.run(task, workdir, trace_dir)
         return dataclasses.replace(result, usage=Usage(cost_usd=self.cost_per_trial))
+
+
+class InterruptingScriptedAdapter(CostlyScriptedAdapter):
+    """Costly scripted trials, where run number settings["interrupt_on_run"] of an evaluation
+    raises KeyboardInterrupt: stands in for Ctrl-C landing in the middle of a paid evaluation."""
+
+    name = "loop_fixtures:InterruptingScriptedAdapter"
+
+    def build(self, candidate: Candidate, model: Any, settings: Mapping[str, Any]) -> _InterruptingAgent:
+        costly = super().build(candidate, model, settings)
+        return _InterruptingAgent(costly, int(settings["interrupt_on_run"]))
+
+
+class _InterruptingAgent:
+    def __init__(self, inner: Any, interrupt_on_run: int) -> None:
+        self.inner = inner
+        self.interrupt_on_run = interrupt_on_run
+        self.runs = 0
+        self._lock = threading.Lock()
+
+    def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
+        with self._lock:
+            self.runs += 1
+            number = self.runs
+        if number == self.interrupt_on_run:
+            raise KeyboardInterrupt
+        return self.inner.run(task, workdir, trace_dir)
+
+
+class LitteringScriptedAdapter(ScriptedAdapter):
+    """The scripted agent, but every trial leaves a FIFO, an unreadable file and an unreadable
+    directory in its workdir, as a bash tool or a dev server could."""
+
+    name = "loop_fixtures:LitteringScriptedAdapter"
+
+    def build(self, candidate: Candidate, model: Any, settings: Mapping[str, Any]) -> _LitteringAgent:
+        return _LitteringAgent(super().build(candidate, model, settings))
+
+
+class _LitteringAgent:
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
+        result = self.inner.run(task, workdir, trace_dir)
+        os.mkfifo(workdir / "pipe")
+        unreadable = workdir / "unreadable.txt"
+        unreadable.write_text("secret")
+        unreadable.chmod(0)
+        locked = workdir / "locked"
+        locked.mkdir()
+        (locked / "inside.txt").write_text("x")
+        locked.chmod(0)
+        return result
+
+
+class FifoLeavingOverseer(_BaseOverseer):
+    """Leaves a FIFO in its workspace (copying one blocks or fails), then proposes a null-style copy."""
+
+    name = "fifo-leaving"
+    proposes_changes = False
+
+    def propose(self, brief: OverseerBrief, workspace: Path) -> Proposal:
+        child = self._copy(brief, workspace)
+        os.mkfifo(Path(workspace) / "pipe")
+        return Proposal(candidate_dir=child.root, rationale="left a pipe behind")

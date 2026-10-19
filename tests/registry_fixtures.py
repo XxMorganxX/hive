@@ -13,7 +13,8 @@ from typing import Any
 
 
 class FakeAdapter:
-    name = "fake"
+    # An adapter loaded by import path is named by that path (hive.contracts.AgentAdapter).
+    name = "registry_fixtures:FakeAdapter"
 
     def __init__(self, settings: Mapping[str, Any] | None = None):
         self.settings = settings
@@ -76,3 +77,15 @@ class Outer:
 
 
 NOT_A_CLASS = 42
+
+
+class NamedByImportPath(FakeAdapter):
+    """Named exactly as candidates refer to it, as hive.contracts.AgentAdapter requires."""
+
+    name = "registry_fixtures:NamedByImportPath"
+
+
+class NamedShort(FakeAdapter):
+    """Named the natural way, but resolved by import path: its name can't match candidates."""
+
+    name = "tiny"

@@ -7,6 +7,13 @@ config change and the controller never imports a concrete plug-in.
 A name is either a built-in short name (see `BUILTINS`) or an import path of the
 form "package.module:Attr". The import path means a third-party plug-in works
 without editing this file.
+
+An agent adapter's `name` must equal the string it was resolved from, because that
+string is what candidates write in `agent = "..."` and what the controller compares
+with `adapter.name` (see `hive.contracts.AgentAdapter`). A third-party adapter is
+therefore named by its own import path. The check runs here, where the adapter is
+built, so a mismatch fails at once with the rule rather than later as a confusing
+"candidate belongs to another adapter".
 """
 
 from __future__ import annotations
@@ -100,7 +107,14 @@ def _make(kind: str, contract: type, name: str, settings: Mapping[str, Any] | No
 
 
 def make_agent_adapter(name: str, settings: Mapping[str, Any] | None = None) -> AgentAdapter:
-    return _make("agent", AgentAdapter, name, settings)
+    adapter = _make("agent", AgentAdapter, name, settings)
+    if adapter.name != name:
+        raise RegistryError(
+            f"agent {name!r} resolved to an adapter whose name is {adapter.name!r}; an adapter's name must be exactly "
+            f'the string candidates use in agent = "...": the built-in short name for a built-in, or the import '
+            f"path for any other, so set name = {name!r} on {type(adapter).__qualname__} (hive.contracts.AgentAdapter)"
+        )
+    return adapter
 
 
 def make_suite(name: str, settings: Mapping[str, Any] | None = None) -> Suite:

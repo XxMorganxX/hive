@@ -191,6 +191,9 @@ class OverseerBrief:
     incumbent_report: Path  # search-split EvalReport as JSON
     evidence_dir: Path  # the incumbent's search-split trial directories (traces + workdirs)
     history: Sequence[Mapping[str, Any]]  # earlier generations: ids, scores, decisions, rationales
+    # Where the evidence was recorded. Native traces name absolute paths under it; an overseer
+    # maps those onto evidence_dir so its own workspace never names the run directory (P7).
+    evidence_origin: Path | None = None
 
 
 @dataclass(frozen=True)

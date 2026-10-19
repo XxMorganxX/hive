@@ -409,7 +409,7 @@ def test_run_meta_records_config_versions_and_outcome(tmp_path):
     summary = run(tmp_path)
     meta = json.loads((summary.run_dir / "run_meta.json").read_text())
     assert meta["config"]["name"] == "loop-test"
-    assert meta["config"]["model"] == {"provider": "scripted", "id": "none"}
+    assert meta["config"]["model"] == {"provider": "scripted", "id": "none", "thinking": None}
     assert meta["run_id"] == "r1"
     assert meta["stopped_reason"] == "completed"
     assert meta["error"] is None
@@ -526,11 +526,16 @@ SEARCH_EVAL_COST = 6 * COST_PER_TRIAL  # six search tasks, one trial each
 HELDOUT_EVAL_COST = 4 * COST_PER_TRIAL
 
 
-def costly_config(tmp_path: Path, **overrides: Any) -> ExperimentConfig:
+def seed_with_agent(tmp_path: Path, agent: str) -> None:
+    """Copy the scripted seed, naming a fixture adapter by import path (its `name`)."""
     seed = tmp_path / "seed"
     shutil.copytree(EXACT_SEED, seed)
     manifest = seed / "candidate.toml"
-    manifest.write_text(manifest.read_text().replace('agent = "scripted"', 'agent = "loop_fixtures:CostlyScriptedAdapter"'))
+    manifest.write_text(manifest.read_text().replace('agent = "scripted"', f'agent = "{agent}"'))
+
+
+def costly_config(tmp_path: Path, **overrides: Any) -> ExperimentConfig:
+    seed_with_agent(tmp_path, fixture("CostlyScriptedAdapter"))
     overrides.setdefault("agent_settings", {"cost_per_trial": COST_PER_TRIAL})
     return make_config(tmp_path, **overrides)
 
@@ -593,3 +598,89 @@ def test_run_meta_records_whether_the_checkout_had_uncommitted_changes(tmp_path)
     summary = run(tmp_path)
     meta = json.loads((summary.run_dir / "run_meta.json").read_text())
     assert meta["git_dirty"] in (True, False, None)  # None only when git is unavailable
+
+
+# --- aborted evaluations ---------------------------------------------------------------------
+
+
+def test_run_meta_records_the_spend_of_an_evaluation_aborted_midway(tmp_path):
+    seed_with_agent(tmp_path, fixture("InterruptingScriptedAdapter"))
+    config = make_config(
+        tmp_path, agent_settings={"cost_per_trial": COST_PER_TRIAL, "interrupt_on_run": 3}, concurrency=1
+    )
+    with pytest.raises(KeyboardInterrupt):
+        run_experiment(config, run_id="r1")
+    run_dir = tmp_path / "out" / "loop-test" / "r1"
+    finished = len(list((run_dir / "evals" / "gen-000" / "trials").rglob("outcome.json")))
+    assert 2 <= finished < 6, "queued trials kept running after the interrupt"
+    meta = json.loads((run_dir / "run_meta.json").read_text())
+    assert "KeyboardInterrupt" in meta["error"]
+    assert meta["spent_usd"] == pytest.approx(COST_PER_TRIAL * finished)
+
+
+def test_finished_evaluations_are_counted_once(tmp_path):
+    config = costly_config(tmp_path, generations=1, max_usd=10.0)
+    summary = run_experiment(config, run_id="r1")
+    [row] = summary.generations
+    assert row["eval_cost_usd"] == pytest.approx(SEARCH_EVAL_COST)
+    meta = json.loads((summary.run_dir / "run_meta.json").read_text())
+    # seed search + child search + seed held-out (the null control's final is the seed)
+    assert meta["spent_usd"] == pytest.approx(summary.total_cost_usd) == pytest.approx(
+        2 * SEARCH_EVAL_COST + HELDOUT_EVAL_COST
+    )
+
+
+# --- evidence the overseer is briefed with ---------------------------------------------------
+
+
+@pytest.fixture
+def restore_permissions(tmp_path):
+    """The littering agent leaves chmod-000 directories; pytest can't clean those up."""
+    yield
+    for directory in tmp_path.rglob("locked"):
+        directory.chmod(0o700)
+
+
+def test_special_and_unreadable_files_in_trial_workdirs_are_skipped_and_listed(tmp_path, restore_permissions):
+    seed_with_agent(tmp_path, fixture("LitteringScriptedAdapter"))
+    summary = run(tmp_path, overseer_kind=fixture("RecordingOverseer"), generations=1)
+    assert summary.stopped_reason == "completed"
+    assert summary.heldout["seed"] is not None
+    [note] = loop_fixtures.RecordingOverseer.skipped_notes
+    assert note is not None
+    for name in ("pipe", "unreadable.txt", "locked"):
+        assert f"/workdir/{name}:" in note
+    assert str(summary.run_dir) not in note
+    archived = summary.run_dir / "overseer" / "gen-001" / "workspace" / "context" / "evidence"
+    assert (archived / "SKIPPED FILES.txt").is_file()
+
+
+def test_clean_evidence_has_no_skipped_files_note(tmp_path):
+    run(tmp_path, overseer_kind=fixture("RecordingOverseer"))
+    assert loop_fixtures.RecordingOverseer.skipped_notes == [None]
+
+
+def test_brief_carries_no_absolute_paths_into_the_run_dir(tmp_path):
+    summary = run(tmp_path, overseer_kind=fixture("RecordingOverseer"))
+    [report] = loop_fixtures.RecordingOverseer.reports
+    trial_dirs = [trial["trial_dir"] for task in report["tasks"] for trial in task["trials"]]
+    assert all(not Path(path).is_absolute() and path.startswith("trials/") for path in trial_dirs)
+    workspace = summary.run_dir / "overseer" / "gen-001" / "workspace"
+    for path in workspace.rglob("*"):
+        if path.is_file():
+            assert str(tmp_path) not in path.read_text(errors="replace"), path
+
+
+def test_brief_names_where_its_evidence_was_recorded_so_overseers_can_map_trace_paths(tmp_path):
+    summary = run(tmp_path, overseer_kind=fixture("RecordingOverseer"))
+    [brief] = loop_fixtures.RecordingOverseer.briefs
+    assert brief.evidence_origin == summary.run_dir / "evals" / "gen-000" / "trials"
+
+
+def test_a_fifo_left_in_the_overseer_workspace_does_not_stop_the_run(tmp_path):
+    summary = run(tmp_path, overseer_kind=fixture("FifoLeavingOverseer"))
+    [row] = summary.generations
+    assert row["status"] == "evaluated"
+    archive = summary.run_dir / "overseer" / "gen-001" / "workspace"
+    assert (archive / "candidate" / "candidate.toml").is_file()
+    assert not (archive / "pipe").exists()

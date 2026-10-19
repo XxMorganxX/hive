@@ -2,7 +2,7 @@
 # Every tunable for this experiment lives here; relative paths resolve against this file.
 #
 # [experiment]  name of the run directory, the seed harness, and where run outputs go
-# [model]       the frozen model under test, never part of a candidate (P3)
+# [model]       the frozen model under test and its reasoning effort, never part of a candidate (P3)
 # [agent]       settings for the agent adapter the seed names (here Pi): pinned version, per-trial timeout
 # [suite]       which evaluation suite to score on
 # [evaluation]  trials per task (k) and how many trials run at once
@@ -17,6 +17,7 @@ output_dir = "../experience"
 [model]
 provider = "openai"
 id = "gpt-5-nano"
+thinking = "low"
 
 [agent]
 pi_version = "0.75.3"

@@ -124,3 +124,20 @@ def test_make_overseer_rejects_class_without_overseer_contract():
 def test_constructor_failure_becomes_registry_error_with_cause():
     with pytest.raises(RegistryError, match="timeout_s must be positive"):
         make_agent_adapter(f"{FIXTURES}:RejectsSettings")
+
+
+def test_agent_adapter_named_by_its_import_path_is_accepted():
+    adapter = make_agent_adapter(f"{FIXTURES}:NamedByImportPath")
+    assert adapter.name == f"{FIXTURES}:NamedByImportPath"
+
+
+def test_agent_adapter_whose_name_differs_from_the_key_it_was_resolved_from_is_rejected():
+    # Candidates say agent = "<key>", and evaluate/validate compare that with adapter.name, so a
+    # mismatch would only surface later as a confusing "candidate belongs to another adapter".
+    with pytest.raises(RegistryError, match=r"name is 'tiny'.*agent = .*name = 'registry_fixtures:NamedShort'"):
+        make_agent_adapter(f"{FIXTURES}:NamedShort")
+
+
+def test_builtin_agent_adapters_are_named_by_their_builtin_key():
+    for key in registry.BUILTINS["agent"]:
+        assert make_agent_adapter(key).name == key

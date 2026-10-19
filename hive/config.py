@@ -34,7 +34,7 @@ KNOWN_SECTIONS = ("experiment", "model", "agent", "suite", "evaluation", "loop",
 # Sections whose keys are all HIVE's own; any other key in them is a typo.
 STRICT_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "experiment": ("name", "seed_candidate", "output_dir"),
-    "model": ("provider", "id"),
+    "model": ("provider", "id", "thinking"),
     "evaluation": ("trials_per_task", "concurrency"),
     "loop": ("generations", "promotion_margin", "max_usd"),
 }
@@ -107,6 +107,16 @@ class _Section:
         value = self._get(key, required=default is None)
         if value is None:  # absent (TOML has no null); a missing required key is already reported
             return default
+        if not isinstance(value, str) or not value.strip():
+            self.problem(f"{key} must be a non-empty string")
+            return None
+        return value
+
+    def optional_string(self, key: str) -> str | None:
+        """A non-empty string, or None when the key is absent (TOML has no null)."""
+        value = self._get(key, required=False)
+        if value is None:
+            return None
         if not isinstance(value, str) or not value.strip():
             self.problem(f"{key} must be a non-empty string")
             return None
@@ -220,6 +230,8 @@ def load_experiment(path: Path | str) -> ExperimentConfig:
     model = sections["model"]
     provider = model.string("provider")
     model_id = model.string("id")
+    # Reasoning effort is part of the frozen model (P3); absent means the provider's default.
+    thinking = model.optional_string("thinking")
 
     suite = sections["suite"]
     suite_name = suite.string("name")
@@ -250,7 +262,7 @@ def load_experiment(path: Path | str) -> ExperimentConfig:
         config_path=config_path,
         seed_candidate=_resolve_path(base, seed_candidate),
         output_dir=_resolve_path(base, output_dir),
-        model=ModelSpec(provider=provider, id=model_id),
+        model=ModelSpec(provider=provider, id=model_id, thinking=thinking),
         agent_settings=agent_settings,
         suite_name=suite_name,
         suite_settings=suite_settings,
@@ -268,7 +280,7 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, ModelSpec):
-        return {"provider": value.provider, "id": value.id}
+        return {"provider": value.provider, "id": value.id, "thinking": value.thinking}
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, list | tuple):

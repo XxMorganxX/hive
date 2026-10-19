@@ -20,6 +20,12 @@ SELECTION_SPLIT = "search"
 
 _RULE_TEMPLATE = Path(__file__).with_name("selection_rule.md")
 
+# Scores are float means, so `incumbent + margin` can round below its decimal value
+# (0.7 + 0.1 == 0.7999999999999999) and let a gain of exactly the margin promote. The
+# tolerance is far below any real score step (1/(tasks * trials)) and errs toward the
+# incumbent, as the stated rule does: "a gain of the margin or less keeps the incumbent".
+_TIE_TOLERANCE = 1e-9
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -36,7 +42,7 @@ def decide(child: EvalReport, incumbent: EvalReport, seed: EvalReport, margin: f
     incumbent_score = incumbent.selection_score
     seed_score = seed.selection_score
     bar = incumbent_score + margin
-    beats_incumbent = child_score > bar
+    beats_incumbent = child_score - incumbent_score > margin + _TIE_TOLERANCE
     holds_seed = child_score >= seed_score
 
     comparison = (

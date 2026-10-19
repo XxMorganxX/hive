@@ -11,6 +11,14 @@ Errored trials are left out of `measured_mean` (what we report) but count as 0 i
 `selection_score` (what we promote on), so a candidate can't climb by pushing hard
 tasks into errors. The report is written to disk as JSON, and loading it back
 recomputes every aggregate instead of trusting the stored numbers.
+
+Paths in the report are relative to the evaluation's out_dir ("trials/<task>/<n>"). The
+report and its trials are copied into overseer briefs, and an absolute path would tell the
+overseer where the live run directory, the HIVE repo and earlier runs' held-out results are.
+
+Spend is reported trial by trial through `on_trial_cost`, not only in the finished
+report: an evaluation aborted by Ctrl-C or a crash has still spent money, and the caller's
+budget record must include it (P12).
 """
 
 from __future__ import annotations
@@ -21,8 +29,8 @@ import math
 import re
 import statistics
 import time
-from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any, Literal
@@ -70,7 +78,7 @@ class TrialOutcome:
     detail: str
     usage: Usage
     wall_clock_s: float
-    trial_dir: str  # absolute path; holds workdir/, trace/ and outcome.json
+    trial_dir: str  # relative to the evaluation's out_dir ("trials/<task>/<n>"); holds workdir/, trace/, outcome.json
 
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "usage": asdict(self.usage)}
@@ -230,12 +238,18 @@ def evaluate(
     trials_per_task: int,
     out_dir: Path,
     concurrency: int = 1,
+    on_trial_cost: Callable[[float], None] | None = None,
 ) -> EvalReport:
     """Run every task in `split` `trials_per_task` times and write report.json under `out_dir`.
 
+    `on_trial_cost` is called in the calling thread with each trial's validated cost as the
+    trial finishes, so a caller can keep an exact spend record even if this raises.
+
     Raises EvaluationError for configuration bugs, before any agent is built or run.
     Exceptions from `adapter.build` propagate: a candidate that can't be built is an
-    environment or config problem, not a trial outcome.
+    environment or config problem, not a trial outcome. If anything interrupts the
+    collection (Ctrl-C, or a trial that raised), queued trials are cancelled, running ones
+    finish and are still reported through `on_trial_cost`, and the exception propagates.
     """
     if trials_per_task < 1:
         raise EvaluationError(f"trials_per_task must be at least 1, got {trials_per_task}")
@@ -258,12 +272,7 @@ def evaluate(
     agent = adapter.build(candidate, model, agent_settings)
 
     jobs = [(task, trial) for task in tasks for trial in range(1, trials_per_task + 1)]
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {
-            (task.id, trial): pool.submit(_run_trial, agent, suite, task, trial, trials_root) for task, trial in jobs
-        }
-        # Collect in job order, not completion order, so the report is deterministic.
-        outcomes = {key: future.result() for key, future in futures.items()}
+    outcomes = _run_all(jobs, agent, suite, trials_root, concurrency, on_trial_cost or _ignore_cost)
 
     report = EvalReport(
         candidate_id=candidate.id,
@@ -281,6 +290,55 @@ def evaluate(
     )
     _write_json(out_dir / REPORT_FILE, report.to_dict())
     return report
+
+
+def _ignore_cost(cost: float) -> None:
+    pass
+
+
+def _run_all(
+    jobs: Sequence[tuple[Task, int]],
+    agent: Agent,
+    suite: Suite,
+    trials_root: Path,
+    concurrency: int,
+    on_trial_cost: Callable[[float], None],
+) -> dict[tuple[str, int], TrialOutcome]:
+    """Run every job on a pool and return its outcomes keyed by (task id, trial).
+
+    Outcomes are keyed, and the report built in job order, so completion order never
+    changes the report. Costs are reported in completion order, as the money is spent.
+    """
+    pool = ThreadPoolExecutor(max_workers=concurrency)
+    futures: dict[Future[TrialOutcome], tuple[str, int]] = {}
+    reported: set[Future[TrialOutcome]] = set()
+    outcomes: dict[tuple[str, int], TrialOutcome] = {}
+
+    def report(future: Future[TrialOutcome]) -> None:
+        # Marked first, so a cost is never reported twice even if the callback is interrupted.
+        reported.add(future)
+        outcome = future.result()
+        outcomes[futures[future]] = outcome
+        on_trial_cost(outcome.usage.cost_usd)
+
+    try:
+        for task, trial in jobs:
+            futures[pool.submit(_run_trial, agent, suite, task, trial, trials_root)] = (task.id, trial)
+        for future in as_completed(futures):
+            report(future)
+    except BaseException:
+        # A plain `with` would wait for every queued trial, each a paid agent run, before
+        # letting the exception out. Cancel the queue, let running trials finish, and
+        # still report what they cost before re-raising.
+        pool.shutdown(wait=True, cancel_futures=True)
+        for future in futures:
+            if future in reported or future.cancelled() or future.exception() is not None:
+                continue
+            reported.add(future)
+            on_trial_cost(future.result().usage.cost_usd)
+        raise
+    pool.shutdown(wait=True)
+    return outcomes
 
 
 def _check_tasks(tasks: Sequence[Task], suite_name: str, split: Split) -> None:
@@ -305,7 +363,8 @@ def _check_tasks(tasks: Sequence[Task], suite_name: str, split: Split) -> None:
 
 
 def _run_trial(agent: Agent, suite: Suite, task: Task, trial: int, trials_root: Path) -> TrialOutcome:
-    trial_dir = trials_root / safe_task_dirname(task.id) / str(trial)
+    relative_trial_dir = f"{TRIALS_DIR}/{safe_task_dirname(task.id)}/{trial}"
+    trial_dir = trials_root.parent / relative_trial_dir
     workdir = trial_dir / "workdir"
     trace_dir = trial_dir / "trace"
     workdir.mkdir(parents=True)
@@ -321,7 +380,7 @@ def _run_trial(agent: Agent, suite: Suite, task: Task, trial: int, trials_root: 
             detail=detail,
             usage=usage,
             wall_clock_s=wall_clock_s,
-            trial_dir=str(trial_dir),
+            trial_dir=relative_trial_dir,
         )
 
     workspace_problem = _materialize_workspace(task.workspace_files, workdir)
@@ -348,6 +407,20 @@ def _run_and_grade(agent: Agent, suite: Suite, task: Task, workdir: Path, trace_
             wall_clock_s=time.monotonic() - started,
         )
 
+    usage, usage_problem = _checked_usage(result.usage)
+    field_problem = _result_field_problem(result)
+    if field_problem is not None:
+        # Every field ends up in outcome.json and in the overseer's evidence, so a value that
+        # can't be serialized or compared would abort the whole evaluation, not just this trial.
+        detail = field_problem if usage_problem is None else f"{field_problem}; {usage_problem}"
+        return outcome("errored", None, "agent_error", f"agent returned a malformed result: {detail}", usage,
+                       time.monotonic() - started)  # fmt: skip
+    if usage_problem is not None:
+        # Spend feeds the budget cap (P12): a negative cost would offset real spend and a NaN
+        # would make every cap comparison False, so an unusable report can't be trusted at all.
+        return outcome("errored", None, "agent_error", f"agent reported invalid usage: {usage_problem}", usage,
+                       result.wall_clock_s)  # fmt: skip
+
     if result.status == "errored":
         detail = result.error or ""
         error_class = result.error_class
@@ -356,20 +429,63 @@ def _run_and_grade(agent: Agent, suite: Suite, task: Task, workdir: Path, trace_
             if error_class is not None:
                 detail = f"[unknown error_class {error_class!r}] {detail}"
             error_class = "agent_error"
-        return outcome("errored", None, error_class, detail, result.usage, result.wall_clock_s)
+        return outcome("errored", None, error_class, detail, usage, result.wall_clock_s)
     if result.status != "completed":
-        return outcome(
-            "errored", None, "agent_error", f"unknown agent status {result.status!r}", result.usage, result.wall_clock_s
-        )
+        return outcome("errored", None, "agent_error", f"unknown agent status {result.status!r}", usage,
+                       result.wall_clock_s)  # fmt: skip
 
     try:
         grade = suite.grade(task, result, workdir)
     except Exception as error:
-        return outcome("errored", None, "grader_error", _describe(error), result.usage, result.wall_clock_s)
+        return outcome("errored", None, "grader_error", _describe(error), usage, result.wall_clock_s)
     problem = _grade_problem(grade)
     if problem is not None:
-        return outcome("errored", None, "grader_error", problem, result.usage, result.wall_clock_s)
-    return outcome("scored", float(grade.reward), None, grade.detail, result.usage, result.wall_clock_s)
+        return outcome("errored", None, "grader_error", problem, usage, result.wall_clock_s)
+    return outcome("scored", float(grade.reward), None, grade.detail, usage, result.wall_clock_s)
+
+
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+
+
+def _result_field_problem(result: AgentResult) -> str | None:
+    problems = []
+    if not isinstance(result.final_text, str):
+        problems.append(f"final_text is {type(result.final_text).__name__}, not str")
+    for name in ("error", "error_class"):
+        value = getattr(result, name)
+        if value is not None and not isinstance(value, str):
+            problems.append(f"{name} is {type(value).__name__}, not str or None")
+    wall = result.wall_clock_s
+    if isinstance(wall, bool) or not isinstance(wall, int | float) or not math.isfinite(wall) or wall < 0:
+        problems.append(f"wall_clock_s {wall!r} is not a finite number >= 0")
+    return "; ".join(problems) or None
+
+
+def _is_valid_cost(cost: object) -> bool:
+    # bool is an int subclass, but True as a cost is an adapter bug, not $1.
+    return not isinstance(cost, bool) and isinstance(cost, int | float) and math.isfinite(cost) and cost >= 0
+
+
+def _checked_usage(usage: object) -> tuple[Usage, str | None]:
+    """(usage to record, problem or None). Every field must be a finite number >= 0, tokens ints.
+
+    When only the token counts are bad, a valid cost is kept: that money was still spent,
+    and dropping it would understate the run's spend.
+    """
+    if not isinstance(usage, Usage):
+        return Usage(), f"usage is {type(usage).__name__}, not Usage"
+    problems = []
+    for name in _TOKEN_FIELDS:
+        value = getattr(usage, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            problems.append(f"{name} {value!r} is not an integer >= 0")
+    cost = usage.cost_usd
+    if not _is_valid_cost(cost):
+        problems.append(f"cost_usd {cost!r} is not a finite number >= 0")
+    if not problems:
+        return usage, None
+    kept = Usage(cost_usd=float(cost)) if _is_valid_cost(cost) else Usage()
+    return kept, "; ".join(problems)
 
 
 def _materialize_workspace(files: Mapping[str, str], workdir: Path) -> str | None:
@@ -384,8 +500,10 @@ def _materialize_workspace(files: Mapping[str, str], workdir: Path) -> str | Non
             return f"workspace path {relative!r} does not name a file inside the workdir"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(text)
-        except (OSError, TypeError) as error:
+            # UTF-8 per the Task contract, never the locale's encoding.
+            target.write_text(text, encoding="utf-8")
+        # ValueError covers UnicodeEncodeError, e.g. a lone surrogate from surrogateescape decoding.
+        except (OSError, TypeError, ValueError) as error:
             return f"could not write workspace file {relative!r}: {_describe(error)}"
     return None
 

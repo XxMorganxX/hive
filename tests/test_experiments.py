@@ -72,3 +72,10 @@ def test_dry_runs_spend_nothing():
             config = load_experiment(path)
             assert config.overseer_kind == "null"
             assert Candidate.load(config.seed_candidate).agent == "scripted"
+
+
+@pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda path: path.stem)
+def test_pi_experiments_fix_low_thinking_and_dry_runs_leave_it_unset(path):
+    # The reasoning-effort level is part of the frozen model (P3), so each config states it.
+    expected = "low" if path.stem.startswith("pi-") else None
+    assert load_experiment(path).model.thinking == expected

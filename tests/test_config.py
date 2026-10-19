@@ -81,6 +81,22 @@ def test_model_section_becomes_model_spec(tmp_path):
     assert config.model == ModelSpec(provider="openai", id="gpt-5-nano")
 
 
+def test_model_thinking_defaults_to_none(tmp_path):
+    assert load_experiment(write_config(tmp_path)).model.thinking is None
+
+
+def test_model_thinking_flows_into_the_model_spec(tmp_path):
+    config = load_experiment(write_config(tmp_path, {"model": {"thinking": '"low"'}}))
+    assert config.model == ModelSpec(provider="openai", id="gpt-5-nano", thinking="low")
+
+
+@pytest.mark.parametrize("value", ['""', '"  "', "1", "true"])
+def test_model_thinking_must_be_a_non_empty_string(tmp_path, value):
+    assert problems_for(write_config(tmp_path, {"model": {"thinking": value}})) == [
+        "[model] thinking must be a non-empty string"
+    ]
+
+
 def test_config_path_is_absolute(tmp_path, monkeypatch):
     path = write_config(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -379,8 +395,13 @@ def test_snapshot_records_resolved_paths_as_strings(tmp_path):
 def test_snapshot_records_model_and_plugin_choices(tmp_path):
     config = load_experiment(write_config(tmp_path, {"suite": {"limit": "3"}}))
     data = snapshot(config)
-    assert data["model"] == {"provider": "openai", "id": "gpt-5-nano"}
+    assert data["model"] == {"provider": "openai", "id": "gpt-5-nano", "thinking": None}
     assert (data["suite_name"], data["suite_settings"], data["overseer_kind"]) == ("exact_answer", {"limit": 3}, "null")
+
+
+def test_snapshot_records_model_thinking(tmp_path):
+    config = load_experiment(write_config(tmp_path, {"model": {"thinking": '"low"'}}))
+    assert snapshot(config)["model"]["thinking"] == "low"
 
 
 def test_snapshot_records_every_tunable(tmp_path):

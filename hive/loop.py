@@ -26,6 +26,13 @@ One run, in order:
 Every evaluation first re-hashes the candidate snapshot it is about to score. A snapshot
 that changed on disk raises `LoopError` instead of being scored under a stale id (P4).
 
+Spend is recorded trial by trial as `evaluate` reports it, so an evaluation cut short by
+Ctrl-C or a crash still shows its real cost in run_meta.json.
+
+Trial workdirs are agent-controlled, so the evidence copied into a brief skips anything that
+is not a regular file, directory or symlink, or that can't be read, and lists what it
+skipped in the evidence's SKIPPED_EVIDENCE_FILE instead of failing the run.
+
 The cap is estimate-gated, not exact: the loop never *starts* work it expects to push the
 spend past `max_usd`, but a run can still overshoot by the estimate's error, and the
 overseer's own spend is bounded only by the overseer's per-proposal limit.
@@ -56,7 +63,9 @@ import logging
 import math
 import platform
 import re
+import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Mapping
@@ -86,6 +95,9 @@ EVALS_DIR = "evals"
 OVERSEER_DIR = "overseer"
 HELDOUT_DIR = "heldout"
 WORKSPACE_DIR = "workspace"
+# Written into the brief's evidence dir when some trial files could not be copied. The space
+# keeps it from colliding with a task directory: safe_task_dirname never produces one.
+SKIPPED_EVIDENCE_FILE = "SKIPPED FILES.txt"
 
 SEED_ORIGIN = "seed"
 
@@ -299,9 +311,13 @@ class _Experiment:
             trials_per_task=self.config.trials_per_task,
             out_dir=out_dir,
             concurrency=self.config.concurrency,
+            # Per trial, not from the finished report: an aborted evaluation has still spent.
+            on_trial_cost=self._record_trial_cost,
         )
-        self.spent_usd += report.cost_usd
         return report
+
+    def _record_trial_cost(self, cost_usd: float) -> None:
+        self.spent_usd += cost_usd
 
     def _evaluate_search(self, candidate: Candidate, generation: int) -> _Evaluated:
         eval_dir = self.run_dir / EVALS_DIR / _generation_dirname(generation)
@@ -324,7 +340,15 @@ class _Experiment:
             shutil.copy2(incumbent.eval_dir / REPORT_FILE, bundle_dir / REPORT_FILE)
             evidence = incumbent.eval_dir / TRIALS_DIR
             if evidence.is_dir():
-                shutil.copytree(evidence, bundle_dir / TRIALS_DIR, symlinks=True)
+                skipped = _copy_evidence(evidence, bundle_dir / TRIALS_DIR)
+                if skipped:
+                    LOGGER.warning("generation %d: skipped %d evidence entries the brief can't carry", generation,
+                                   len(skipped))  # fmt: skip
+                    (bundle_dir / TRIALS_DIR).mkdir(exist_ok=True)
+                    note = "Not copied into this evidence (paths relative to this directory):\n\n"
+                    (bundle_dir / TRIALS_DIR / SKIPPED_EVIDENCE_FILE).write_text(
+                        note + "".join(f"{line}\n" for line in skipped)
+                    )
             brief = OverseerBrief(
                 incumbent=incumbent.candidate.copy_to(bundle_dir / "incumbent"),
                 metric=self.suite.metric(),
@@ -334,6 +358,7 @@ class _Experiment:
                 generation=generation,
                 incumbent_report=bundle_dir / REPORT_FILE,
                 evidence_dir=bundle_dir / TRIALS_DIR,
+                evidence_origin=incumbent.eval_dir / TRIALS_DIR,
                 history=[dict(row) for row in self.rows],
             )
             proposal, archived_candidate = self._propose(brief, record_dir)
@@ -412,8 +437,12 @@ class _Experiment:
             # Resolve against the live workspace before it is removed; afterwards only the archive exists.
             relative = _relative_inside(proposal.candidate_dir, workspace)
         finally:
-            # Kept even when the overseer crashed: the partial workspace is the evidence.
-            shutil.copytree(workspace, archive, symlinks=True)
+            # Kept even when the overseer crashed: the partial workspace is the evidence. Anything
+            # uncopyable it left behind (a FIFO, an unreadable file) is listed, never fatal.
+            skipped = _copy_evidence(workspace, archive)
+            if skipped:
+                (archive / SKIPPED_EVIDENCE_FILE).write_text("\n".join(skipped) + "\n")
+                LOGGER.warning("overseer workspace: %d entries not archived: %s", len(skipped), "; ".join(skipped))
             shutil.rmtree(workspace, ignore_errors=True)
 
         archived_candidate = archive / relative if relative is not None else None
@@ -536,6 +565,52 @@ def _checked_cost(proposal: Proposal, overseer_name: str) -> float:
     if isinstance(cost, bool) or not isinstance(cost, int | float) or not math.isfinite(cost) or cost < 0:
         raise ValueError(f"overseer {overseer_name!r} reported an invalid cost {cost!r}")
     return float(cost)
+
+
+def _copy_evidence(source: Path, destination: Path) -> list[str]:
+    """Copy trial evidence for a brief; return one "path: reason" line per entry left out.
+
+    Never raises for the evidence's contents: a FIFO, socket or chmod-000 file an agent left
+    in its workdir must not decide whether the run continues. Symlinks are copied as links,
+    so nothing outside the evidence is read through them. Reasons name paths relative to
+    `source`, so the note gives the overseer no absolute path into the run directory.
+    """
+    skipped: list[str] = []
+
+    def relative(path: str | Path) -> str:
+        resolved = Path(path)
+        return str(resolved.relative_to(source)) if resolved.is_relative_to(source) else resolved.name
+
+    def without_absolute_paths(reason: str) -> str:
+        for root in (source, destination):
+            reason = reason.replace(f"{root}{os.sep}", "")
+        return reason
+
+    def ignore_special(directory: str, names: list[str]) -> set[str]:
+        ignored: set[str] = set()
+        for name in names:
+            path = Path(directory) / name
+            try:
+                mode = path.lstat().st_mode
+            except OSError as error:
+                skipped.append(f"{relative(path)}: could not stat ({error.strerror or type(error).__name__})")
+                ignored.add(name)
+                continue
+            # Copying a FIFO would block or fail, a socket or device can't be copied at all.
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                skipped.append(f"{relative(path)}: not a regular file, directory or symlink")
+                ignored.add(name)
+        return ignored
+
+    try:
+        shutil.copytree(source, destination, symlinks=True, ignore=ignore_special)
+    except shutil.Error as error:
+        # copytree copies everything it can, then reports each failure (e.g. unreadable entries).
+        for failed_source, _failed_destination, reason in error.args[0]:
+            skipped.append(f"{relative(failed_source)}: {without_absolute_paths(str(reason))}")
+    except OSError as error:  # the evidence root itself could not be read
+        skipped.append(f".: {error.strerror or type(error).__name__}")
+    return skipped
 
 
 def _relative_inside(path: Path | None, root: Path) -> Path | None:
