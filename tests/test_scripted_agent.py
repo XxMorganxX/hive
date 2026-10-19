@@ -77,6 +77,14 @@ def test_describe_valves_says_responses_toml_is_the_only_valve_and_it_is_a_test_
     assert "test double" in text.lower()
 
 
+def test_adapter_has_no_extension_spec_because_the_scripted_agent_runs_no_extensions():
+    assert ScriptedAdapter().extension_spec() is None
+
+
+def test_describe_valves_says_extensions_are_not_supported():
+    assert "no extensions" in ScriptedAdapter().describe_valves().lower()
+
+
 # --- validate --------------------------------------------------------------
 
 

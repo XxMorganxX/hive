@@ -23,7 +23,17 @@ from typing import Any
 
 from hive.agents.scripted.adapter import ScriptedAdapter
 from hive.candidate import Candidate
-from hive.contracts import AgentResult, Grade, MetricSpec, OverseerBrief, Proposal, Task, Usage
+from hive.contracts import (
+    AgentResult,
+    ExtensionSpec,
+    Grade,
+    LifecyclePoint,
+    MetricSpec,
+    OverseerBrief,
+    Proposal,
+    Task,
+    Usage,
+)
 from hive.loop import SKIPPED_EVIDENCE_FILE
 from hive.overseers.claude_code.overseer import build_workspace
 from hive.suites.exact_answer.suite import BUNDLED_TASKS_FILE
@@ -363,3 +373,24 @@ class FifoLeavingOverseer(_BaseOverseer):
         child = self._copy(brief, workspace)
         os.mkfifo(Path(workspace) / "pipe")
         return Proposal(candidate_dir=child.root, rationale="left a pipe behind")
+
+
+# --- extensions ------------------------------------------------------------------------------
+
+EXTENSION_SPEC = ExtensionSpec(
+    language="python",
+    suffixes=(".py",),
+    entry_convention="define `def extension()`",
+    framework_version="9.9.9",
+    lifecycle=(LifecyclePoint("before_tool_call", "supported", "on_tool_call", "cancel the call"),),
+)
+
+
+class ExtensionScriptedAdapter(ScriptedAdapter):
+    """The scripted agent, declaring an extension spec it never honours: it loads nothing and
+    returns no load report, as an adapter that quietly skips a candidate's extensions would."""
+
+    name = "loop_fixtures:ExtensionScriptedAdapter"
+
+    def extension_spec(self) -> ExtensionSpec:
+        return EXTENSION_SPEC

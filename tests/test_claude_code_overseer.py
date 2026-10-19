@@ -20,6 +20,7 @@ VALVES = "## Valves\n- APPEND_SYSTEM.md: text appended to the system prompt."
 SELECTION_RULE = "Promote iff the child's selection score beats the incumbent's by more than 0.05."
 HISTORY = [{"generation": 1, "candidate": "abc123", "score": 0.4, "decision": "rejected"}]
 REPORT = {"candidate": "seed", "split": "search", "selection_score": 0.5}
+EXTENSION_GUIDE = "# Extensions\n\nExtensions are python files in `extensions/`.\n| `before_tool_call` | supported |\n"
 
 
 @pytest.fixture
@@ -150,6 +151,20 @@ def test_context_holds_a_copy_of_the_evidence(monkeypatch, fake_claude_bin, brie
     _, workspace = run(monkeypatch, fake_claude_bin, brief, tmp_path, mode="noop")
     copied = workspace / "context" / "evidence" / "q1" / "0" / "trace" / "session.jsonl"
     assert copied.read_text() == '{"event": "message_end"}\n'
+
+
+def with_extension_guide(brief: OverseerBrief, guide: str = EXTENSION_GUIDE) -> OverseerBrief:
+    return OverseerBrief(**{**brief.__dict__, "extension_guide": guide})
+
+
+def test_context_holds_the_extension_guide_when_the_framework_has_one(brief, tmp_path):
+    context = built_context(with_extension_guide(brief), tmp_path)
+    assert (context / "extensions.md").read_text() == EXTENSION_GUIDE
+
+
+def test_context_has_no_extension_guide_when_the_framework_has_none(brief, tmp_path):
+    context = built_context(brief, tmp_path)
+    assert not (context / "extensions.md").exists()
 
 
 def test_missing_evidence_dir_is_skipped_without_error(monkeypatch, fake_claude_bin, brief, tmp_path):
@@ -333,6 +348,33 @@ def test_prompt_points_at_every_context_file(monkeypatch, fake_claude_bin, brief
     prompt = flag_value(recorded_argv(record_path), "-p")
     for name in ("valves.md", "report.json", "history.json", "evidence/", "RATIONALE.md"):
         assert name in prompt
+
+
+def test_prompt_points_at_the_extension_guide_when_there_is_one(monkeypatch, fake_claude_bin, brief, tmp_path, record_path):
+    run(monkeypatch, fake_claude_bin, with_extension_guide(brief), tmp_path)
+    assert "context/extensions.md" in flag_value(recorded_argv(record_path), "-p")
+
+
+def test_prompt_does_not_mention_extensions_when_the_framework_has_none(
+    monkeypatch, fake_claude_bin, brief, tmp_path, record_path
+):
+    run(monkeypatch, fake_claude_bin, brief, tmp_path)
+    assert "extensions.md" not in flag_value(recorded_argv(record_path), "-p")
+
+
+def test_prompt_invites_an_extension_for_a_behavioural_fix(monkeypatch, fake_claude_bin, brief, tmp_path, record_path):
+    run(monkeypatch, fake_claude_bin, with_extension_guide(brief), tmp_path)
+    prompt = flag_value(recorded_argv(record_path), "-p").lower()
+    assert "candidate/extensions/" in prompt
+    for kind in ("gate", "rewrite", "retry", "verify"):
+        assert kind in prompt
+
+
+def test_prompt_keeps_one_isolated_change_per_candidate_when_extensions_are_offered(
+    monkeypatch, fake_claude_bin, brief, tmp_path, record_path
+):
+    run(monkeypatch, fake_claude_bin, with_extension_guide(brief), tmp_path)
+    assert "ONE isolated change" in flag_value(recorded_argv(record_path), "-p")
 
 
 # --- invocation -----------------------------------------------------------------------------

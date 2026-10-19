@@ -12,6 +12,11 @@ read or a write that escapes the workspace could leak answers or rig the grader.
 `build_command` for the flags and why each one is there (checked against Claude Code
 2.1.303's installed bundle).
 
+When the agent's framework runs extensions, the controller's extension guide is written to
+`context/extensions.md` and the prompt gains a section (extensions_prompt.md) inviting one:
+extensions are a primary lever (§5.2), and an overseer that never hears of them would only
+ever edit prompts. Without extensions, neither appears, so the prompt names no missing file.
+
 The copied evidence is rewritten so that no file in the workspace names a location
 outside it: paths into the incumbent's trials become relative to `context/evidence/`,
 and any other path into the run, the repo or the brief's temp dirs is redacted.
@@ -41,11 +46,13 @@ from hive.candidate import MANIFEST, Candidate, CandidateError
 from hive.contracts import OverseerBrief, Proposal
 
 PROMPT_TEMPLATE_PATH = Path(__file__).with_name("prompt.md")
+EXTENSIONS_PROMPT_PATH = Path(__file__).with_name("extensions_prompt.md")
 
 CANDIDATE_DIR = "candidate"
 CONTEXT_DIR = "context"
 EVIDENCE_DIR = "evidence"
 RATIONALE_FILE = "RATIONALE.md"
+EXTENSION_GUIDE_FILE = "extensions.md"
 STDOUT_FILE = "overseer_output.json"
 STDERR_FILE = "overseer_stderr.txt"
 
@@ -197,6 +204,8 @@ def build_workspace(brief: OverseerBrief, workspace: Path) -> None:
     (context / "metric.md").write_text(f"# Metric: {brief.metric.name}\n\n{brief.metric.description.rstrip()}\n")
     (context / "valves.md").write_text(brief.valves.rstrip() + "\n")
     (context / "selection_rule.md").write_text(brief.selection_rule.rstrip() + "\n")
+    if brief.extension_guide:
+        (context / EXTENSION_GUIDE_FILE).write_text(brief.extension_guide.rstrip() + "\n")
     history = [dict(row) for row in brief.history]
     (context / "history.json").write_text(json.dumps(history, indent=2, default=str) + "\n")
 
@@ -361,6 +370,8 @@ def render_prompt(brief: OverseerBrief) -> str:
         metric_description=brief.metric.description.rstrip(),
         suite_description=brief.suite_description.rstrip(),
         selection_rule=brief.selection_rule.rstrip(),
+        # Blank lines either way, so the sections around it stay separate in the markdown.
+        extensions_section=f"\n{EXTENSIONS_PROMPT_PATH.read_text().rstrip()}\n" if brief.extension_guide else "",
     )
 
 

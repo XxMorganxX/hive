@@ -43,7 +43,7 @@ Everything under `context/` is read-only evidence. Read what you need:
   led outside this workspace are shown as `<outside the workspace>/<file name>`.
 - `context/history.json`: earlier generations: what was tried, how it scored, and whether it was kept.
 - `context/suite.md`, `context/metric.md`, `context/selection_rule.md`: the sections above, as files.
-
+$extensions_section
 ## What to do
 
 1. Read `context/report.json` and find the tasks that failed or errored.

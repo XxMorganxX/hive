@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hive.candidate import Candidate, CandidateError
-from hive.contracts import AgentResult, ModelSpec, Task, Usage
+from hive.contracts import AgentResult, ExtensionSpec, ModelSpec, Task, Usage
 
 RESPONSES_FILE = "responses.toml"
 TRACE_FILE = "scripted.json"
@@ -184,3 +184,7 @@ class ScriptedAdapter:
 
     def describe_valves(self) -> str:
         return VALVES_DOC.read_text()
+
+    def extension_spec(self) -> ExtensionSpec | None:
+        # A replay has no agent loop to hook, so there is nothing an extension could change.
+        return None

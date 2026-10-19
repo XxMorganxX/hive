@@ -9,6 +9,7 @@ import loop_fixtures
 from hive.candidate import Candidate
 from hive.config import ExperimentConfig
 from hive.contracts import ModelSpec
+from hive.extensions import render_extension_guide
 from hive.loop import ExperimentSummary, LoopError, run_experiment
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -684,3 +685,38 @@ def test_a_fifo_left_in_the_overseer_workspace_does_not_stop_the_run(tmp_path):
     archive = summary.run_dir / "overseer" / "gen-001" / "workspace"
     assert (archive / "candidate" / "candidate.toml").is_file()
     assert not (archive / "pipe").exists()
+
+
+# --- extensions ------------------------------------------------------------------------------
+
+
+def test_brief_carries_the_extension_guide_rendered_from_the_adapters_spec(tmp_path):
+    seed_with_agent(tmp_path, fixture("ExtensionScriptedAdapter"))
+    run(tmp_path, overseer_kind=fixture("RecordingOverseer"))
+    [brief] = loop_fixtures.RecordingOverseer.briefs
+    assert brief.extension_guide == render_extension_guide(loop_fixtures.EXTENSION_SPEC)
+
+
+def test_brief_extension_guide_is_empty_for_an_adapter_without_extensions(tmp_path):
+    run(tmp_path, overseer_kind=fixture("RecordingOverseer"))
+    [brief] = loop_fixtures.RecordingOverseer.briefs
+    assert brief.extension_guide == ""
+
+
+def test_overseer_workspace_holds_the_extension_guide(tmp_path):
+    seed_with_agent(tmp_path, fixture("ExtensionScriptedAdapter"))
+    summary = run(tmp_path, overseer_kind=fixture("RecordingOverseer"))
+    archived = summary.run_dir / "overseer" / "gen-001" / "workspace" / "context" / "extensions.md"
+    assert archived.read_text() == render_extension_guide(loop_fixtures.EXTENSION_SPEC)
+
+
+def test_a_seed_whose_extensions_the_agent_never_loaded_scores_zero_with_harness_load_errors(tmp_path):
+    seed_with_agent(tmp_path, fixture("ExtensionScriptedAdapter"))
+    (tmp_path / "seed" / "extensions").mkdir()
+    (tmp_path / "seed" / "extensions" / "guard.py").write_text("def extension(): ...\n")
+    summary = run(tmp_path, generations=0)
+    assert summary.seed_search_score == 0.0
+    report = json.loads((summary.run_dir / "evals" / "gen-000" / "report.json").read_text())
+    trials = [trial for task in report["tasks"] for trial in task["trials"]]
+    assert {trial["error_class"] for trial in trials} == {"harness_load_error"}
+    assert all(trial["load_report"] is None for trial in trials)

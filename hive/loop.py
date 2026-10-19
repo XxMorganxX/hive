@@ -77,6 +77,7 @@ from hive.candidate import Candidate, CandidateError, content_hash
 from hive.config import ExperimentConfig, snapshot
 from hive.contracts import SPLITS, AgentAdapter, Overseer, OverseerBrief, Proposal, Split, Suite
 from hive.evaluate import REPORT_FILE, TRIALS_DIR, EvalReport, evaluate
+from hive.extensions import render_extension_guide
 from hive.registry import make_agent_adapter, make_overseer, make_suite
 from hive.selection import decide, describe_rule
 
@@ -360,6 +361,8 @@ class _Experiment:
                 evidence_dir=bundle_dir / TRIALS_DIR,
                 evidence_origin=incumbent.eval_dir / TRIALS_DIR,
                 history=[dict(row) for row in self.rows],
+                # Rendered here, not by the adapter, so it reads the same for every framework (§5.2).
+                extension_guide=render_extension_guide(self.adapter.extension_spec()),
             )
             proposal, archived_candidate = self._propose(brief, record_dir)
         overseer_cost = _checked_cost(proposal, self.overseer.name)

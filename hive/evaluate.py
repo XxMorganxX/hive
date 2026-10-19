@@ -19,6 +19,24 @@ overseer where the live run directory, the HIVE repo and earlier runs' held-out 
 Spend is reported trial by trial through `on_trial_cost`, not only in the finished
 report: an evaluation aborted by Ctrl-C or a crash has still spent money, and the caller's
 budget record must include it (P12).
+
+Extensions are checked here, not trusted to the adapter (§5.2, P8). Every extension file
+the adapter's ExtensionSpec matches in the candidate must appear loaded in the run's
+LoadReport, or the trial is `harness_load_error`; extension code that threw mid-run makes
+it `extension_error`. Both are errors, so they score 0 in selection. Precedence:
+
+- `model_mismatch` outranks everything: that run is not part of the experiment at all (P3).
+- A report that shows an extension not loaded replaces any other class: the candidate did
+  not run as written, so the agent's own account of what went wrong is not about it.
+- A missing report only matters for a completed run. A run that errored (a timeout kill,
+  a crash) may never have reached the point of writing one, and calling that a load
+  failure would point the overseer at the wrong cause.
+- `extension_error` replaces `completed` and `agent_error` (the throw is the likely cause
+  of the crash), but not `timeout`, `quota` or `provider_error`, which happen around the
+  candidate's code rather than in it.
+
+The load report is recorded in every trial's outcome, so the overseer's evidence shows
+what actually loaded.
 """
 
 from __future__ import annotations
@@ -40,13 +58,16 @@ from hive.contracts import (
     Agent,
     AgentAdapter,
     AgentResult,
+    ExtensionLoad,
     Grade,
+    LoadReport,
     ModelSpec,
     Split,
     Suite,
     Task,
     Usage,
 )
+from hive.extensions import expected_extension_files, load_problem
 
 if TYPE_CHECKING:
     from hive.candidate import Candidate
@@ -79,13 +100,31 @@ class TrialOutcome:
     usage: Usage
     wall_clock_s: float
     trial_dir: str  # relative to the evaluation's out_dir ("trials/<task>/<n>"); holds workdir/, trace/, outcome.json
+    # What the run reported loading, so the evidence shows which extensions ran. None when the
+    # run returned none (no extensions, or no usable result at all).
+    load_report: LoadReport | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "usage": asdict(self.usage)}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> TrialOutcome:
-        return cls(**{**data, "usage": Usage(**data["usage"])})
+        # Outcomes written before load reports existed have no key; they recorded none.
+        report = data.get("load_report")
+        return cls(**{**data, "usage": Usage(**data["usage"]), "load_report": _load_report_from_dict(report)})
+
+
+def _load_report_from_dict(data: Mapping[str, Any] | None) -> LoadReport | None:
+    if data is None:
+        return None
+    return LoadReport(
+        extensions=tuple(
+            ExtensionLoad(path=load["path"], loaded=load["loaded"], error=load["error"],
+                          registered=tuple(load["registered"]))  # fmt: skip
+            for load in data["extensions"]
+        ),
+        runtime_errors=tuple(data["runtime_errors"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -269,10 +308,16 @@ def evaluate(
         raise EvaluationError(f"{trials_root} already exists; evaluate into a fresh directory")
     trials_root.mkdir(parents=True)
 
+    # Once per evaluation: the candidate is fixed for its whole evaluation, and the controller,
+    # not the adapter, decides which of its files must load (P8).
+    expected_extensions = tuple(expected_extension_files(candidate, adapter.extension_spec()))
+
     agent = adapter.build(candidate, model, agent_settings)
 
     jobs = [(task, trial) for task in tasks for trial in range(1, trials_per_task + 1)]
-    outcomes = _run_all(jobs, agent, suite, trials_root, concurrency, on_trial_cost or _ignore_cost)
+    outcomes = _run_all(
+        jobs, agent, suite, trials_root, concurrency, on_trial_cost or _ignore_cost, expected_extensions
+    )
 
     report = EvalReport(
         candidate_id=candidate.id,
@@ -303,6 +348,7 @@ def _run_all(
     trials_root: Path,
     concurrency: int,
     on_trial_cost: Callable[[float], None],
+    expected_extensions: Sequence[str],
 ) -> dict[tuple[str, int], TrialOutcome]:
     """Run every job on a pool and return its outcomes keyed by (task id, trial).
 
@@ -323,7 +369,8 @@ def _run_all(
 
     try:
         for task, trial in jobs:
-            futures[pool.submit(_run_trial, agent, suite, task, trial, trials_root)] = (task.id, trial)
+            future = pool.submit(_run_trial, agent, suite, task, trial, trials_root, expected_extensions)
+            futures[future] = (task.id, trial)
         for future in as_completed(futures):
             report(future)
     except BaseException:
@@ -362,7 +409,9 @@ def _check_tasks(tasks: Sequence[Task], suite_name: str, split: Split) -> None:
         seen_dirnames[folded] = task.id
 
 
-def _run_trial(agent: Agent, suite: Suite, task: Task, trial: int, trials_root: Path) -> TrialOutcome:
+def _run_trial(
+    agent: Agent, suite: Suite, task: Task, trial: int, trials_root: Path, expected_extensions: Sequence[str]
+) -> TrialOutcome:
     relative_trial_dir = f"{TRIALS_DIR}/{safe_task_dirname(task.id)}/{trial}"
     trial_dir = trials_root.parent / relative_trial_dir
     workdir = trial_dir / "workdir"
@@ -370,7 +419,9 @@ def _run_trial(agent: Agent, suite: Suite, task: Task, trial: int, trials_root: 
     workdir.mkdir(parents=True)
     trace_dir.mkdir()
 
-    def outcome(status: TrialStatus, reward, error_class, detail, usage=Usage(), wall_clock_s=0.0) -> TrialOutcome:
+    def outcome(
+        status: TrialStatus, reward, error_class, detail, usage=Usage(), wall_clock_s=0.0, load_report=None
+    ) -> TrialOutcome:
         return TrialOutcome(
             task_id=task.id,
             trial=trial,
@@ -381,18 +432,21 @@ def _run_trial(agent: Agent, suite: Suite, task: Task, trial: int, trials_root: 
             usage=usage,
             wall_clock_s=wall_clock_s,
             trial_dir=relative_trial_dir,
+            load_report=load_report,
         )
 
     workspace_problem = _materialize_workspace(task.workspace_files, workdir)
     if workspace_problem is not None:
         result = outcome("errored", None, "workspace_error", workspace_problem)
     else:
-        result = _run_and_grade(agent, suite, task, workdir, trace_dir, outcome)
+        result = _run_and_grade(agent, suite, task, workdir, trace_dir, outcome, expected_extensions)
     _write_json(trial_dir / OUTCOME_FILE, result.to_dict())
     return result
 
 
-def _run_and_grade(agent: Agent, suite: Suite, task: Task, workdir: Path, trace_dir: Path, outcome) -> TrialOutcome:
+def _run_and_grade(
+    agent: Agent, suite: Suite, task: Task, workdir: Path, trace_dir: Path, outcome, expected_extensions: Sequence[str]
+) -> TrialOutcome:
     started = time.monotonic()
     try:
         result = agent.run(task, workdir, trace_dir)
@@ -408,7 +462,9 @@ def _run_and_grade(agent: Agent, suite: Suite, task: Task, workdir: Path, trace_
         )
 
     usage, usage_problem = _checked_usage(result.usage)
-    field_problem = _result_field_problem(result)
+    load_report, report_problem = _checked_load_report(result.load_report)
+    field_problems = [problem for problem in (_result_field_problem(result), report_problem) if problem]
+    field_problem = "; ".join(field_problems) or None
     if field_problem is not None:
         # Every field ends up in outcome.json and in the overseer's evidence, so a value that
         # can't be serialized or compared would abort the whole evaluation, not just this trial.
@@ -419,29 +475,61 @@ def _run_and_grade(agent: Agent, suite: Suite, task: Task, workdir: Path, trace_
         # Spend feeds the budget cap (P12): a negative cost would offset real spend and a NaN
         # would make every cap comparison False, so an unusable report can't be trusted at all.
         return outcome("errored", None, "agent_error", f"agent reported invalid usage: {usage_problem}", usage,
-                       result.wall_clock_s)  # fmt: skip
+                       result.wall_clock_s, load_report)  # fmt: skip
 
-    if result.status == "errored":
-        detail = result.error or ""
-        error_class = result.error_class
-        if error_class not in AGENT_ERROR_CLASSES:
-            # Keep the unknown class visible to readers, but only report classes the rest of HIVE knows.
-            if error_class is not None:
-                detail = f"[unknown error_class {error_class!r}] {detail}"
-            error_class = "agent_error"
-        return outcome("errored", None, error_class, detail, usage, result.wall_clock_s)
-    if result.status != "completed":
+    if result.status not in ("completed", "errored"):
         return outcome("errored", None, "agent_error", f"unknown agent status {result.status!r}", usage,
-                       result.wall_clock_s)  # fmt: skip
+                       result.wall_clock_s, load_report)  # fmt: skip
+    if result.status == "errored":
+        error_class, detail = _agent_error(result)
+    else:
+        error_class, detail = None, ""
+    error_class, detail = _apply_load_check(error_class, detail, expected_extensions, load_report)
+    if error_class is not None:
+        return outcome("errored", None, error_class, detail, usage, result.wall_clock_s, load_report)
 
     try:
         grade = suite.grade(task, result, workdir)
     except Exception as error:
-        return outcome("errored", None, "grader_error", _describe(error), usage, result.wall_clock_s)
+        return outcome("errored", None, "grader_error", _describe(error), usage, result.wall_clock_s, load_report)
     problem = _grade_problem(grade)
     if problem is not None:
-        return outcome("errored", None, "grader_error", problem, usage, result.wall_clock_s)
-    return outcome("scored", float(grade.reward), None, grade.detail, usage, result.wall_clock_s)
+        return outcome("errored", None, "grader_error", problem, usage, result.wall_clock_s, load_report)
+    return outcome("scored", float(grade.reward), None, grade.detail, usage, result.wall_clock_s, load_report)
+
+
+def _agent_error(result: AgentResult) -> tuple[str, str]:
+    """(error class, detail) of a run the agent itself reported as errored."""
+    detail = result.error or ""
+    error_class = result.error_class
+    if error_class not in AGENT_ERROR_CLASSES:
+        # Keep the unknown class visible to readers, but only report classes the rest of HIVE knows.
+        if error_class is not None:
+            detail = f"[unknown error_class {error_class!r}] {detail}"
+        error_class = "agent_error"
+    return error_class, detail
+
+
+def _apply_load_check(
+    error_class: str | None, detail: str, expected_extensions: Sequence[str], load_report: LoadReport | None
+) -> tuple[str | None, str]:
+    """The trial's (error class or None for completed, detail) after the controller's extension check."""
+    if error_class == "model_mismatch":  # P3 outranks everything
+        return error_class, detail
+    if error_class is not None and load_report is None:
+        # An errored run may have died before it could report (a timeout kill writes nothing);
+        # the absence is explained by its own error. A completed run has no such excuse.
+        return error_class, detail
+    problem = load_problem(expected_extensions, load_report)
+    if problem is None:
+        return error_class, detail
+    problem_class, problem_detail = problem
+    # A throw explains a crash, but a timeout, quota or provider error happens around the
+    # candidate's code rather than in it, and any other class is already the agent's own
+    # account of an extension or model problem.
+    if problem_class == "extension_error" and error_class not in (None, "agent_error"):
+        return error_class, detail
+    return problem_class, problem_detail
 
 
 _TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
@@ -459,6 +547,51 @@ def _result_field_problem(result: AgentResult) -> str | None:
     if isinstance(wall, bool) or not isinstance(wall, int | float) or not math.isfinite(wall) or wall < 0:
         problems.append(f"wall_clock_s {wall!r} is not a finite number >= 0")
     return "; ".join(problems) or None
+
+
+def _checked_load_report(report: object) -> tuple[LoadReport | None, str | None]:
+    """(load report to record, problem or None). Containers are normalized to tuples.
+
+    Checked field by field because the report is written to outcome.json and its paths are
+    used as keys by the load check: one bad value would abort the whole evaluation.
+    """
+    if report is None:
+        return None, None
+    if not isinstance(report, LoadReport):
+        return None, f"load_report is {type(report).__name__}, not LoadReport or None"
+    problems: list[str] = []
+    extensions = _as_tuple(report.extensions)
+    if extensions is None:
+        problems.append(f"load_report.extensions is {type(report.extensions).__name__}, not a tuple")
+        extensions = ()
+    loads: list[ExtensionLoad] = []
+    for index, load in enumerate(extensions):
+        where = f"load_report.extensions[{index}]"
+        if not isinstance(load, ExtensionLoad):
+            problems.append(f"{where} is {type(load).__name__}, not ExtensionLoad")
+            continue
+        registered = _as_tuple(load.registered)
+        if not isinstance(load.path, str):
+            problems.append(f"{where}.path is {type(load.path).__name__}, not str")
+        if not isinstance(load.loaded, bool):
+            problems.append(f"{where}.loaded is {type(load.loaded).__name__}, not bool")
+        if load.error is not None and not isinstance(load.error, str):
+            problems.append(f"{where}.error is {type(load.error).__name__}, not str or None")
+        if registered is None or not all(isinstance(entry, str) for entry in registered):
+            problems.append(f"{where}.registered is not a tuple of str")
+        else:
+            loads.append(ExtensionLoad(path=load.path, loaded=load.loaded, error=load.error, registered=registered))
+    runtime_errors = _as_tuple(report.runtime_errors)
+    if runtime_errors is None or not all(isinstance(error, str) for error in runtime_errors):
+        problems.append("load_report.runtime_errors is not a tuple of str")
+    if problems:
+        return None, "; ".join(problems)
+    return LoadReport(extensions=tuple(loads), runtime_errors=runtime_errors), None
+
+
+def _as_tuple(value: object) -> tuple[Any, ...] | None:
+    # A list is the same data; a str is a sequence too, but never a list of entries.
+    return tuple(value) if isinstance(value, tuple | list) else None
 
 
 def _is_valid_cost(cost: object) -> bool:

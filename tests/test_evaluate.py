@@ -9,7 +9,18 @@ from typing import Any
 import pytest
 
 from hive.candidate import Candidate
-from hive.contracts import AGENT_ERROR_CLASSES, AgentResult, Grade, ModelSpec, Task, Usage
+from hive.contracts import (
+    AGENT_ERROR_CLASSES,
+    AgentAdapter,
+    AgentResult,
+    ExtensionLoad,
+    ExtensionSpec,
+    Grade,
+    LoadReport,
+    ModelSpec,
+    Task,
+    Usage,
+)
 from hive.evaluate import (
     TRIAL_ERROR_CLASSES,
     EvalReport,
@@ -46,9 +57,15 @@ class FakeAgent:
 class FakeAdapter:
     name = "fake"
 
-    def __init__(self, behavior: RunBehavior | None = None, build_error: Exception | None = None):
+    def __init__(
+        self,
+        behavior: RunBehavior | None = None,
+        build_error: Exception | None = None,
+        spec: ExtensionSpec | None = None,
+    ):
         self.agent = FakeAgent(behavior or (lambda task, workdir, trace_dir: completed()))
         self.build_error = build_error
+        self.spec = spec
         self.build_calls: list[tuple[str, ModelSpec, Mapping[str, Any]]] = []
 
     def validate(self, candidate: Candidate) -> list[str]:
@@ -62,6 +79,9 @@ class FakeAdapter:
 
     def describe_valves(self) -> str:
         return "none"
+
+    def extension_spec(self) -> ExtensionSpec | None:
+        return self.spec
 
 
 class FakeSuite:
@@ -767,4 +787,246 @@ def test_malformed_agent_result_field_errors_one_trial_and_keeps_its_cost(candid
     assert trial.error_class == "agent_error"
     assert field in trial.detail
     assert trial.usage.cost_usd == pytest.approx(0.1)
+    assert (tmp_path / "out" / "report.json").is_file()
+
+
+# --- extensions: the controller's load check (P8) ----------------------------------------------
+
+EXTENSION_SPEC = ExtensionSpec(
+    language="python",
+    suffixes=(".py",),
+    entry_convention="define `def extension()`",
+    framework_version="0.0.0",
+    lifecycle=(),
+)
+EXTENSION_FILES = ("extensions/guard.py", "extensions/retry.py")
+SPENT = Usage(input_tokens=11, output_tokens=5, cost_usd=0.03)
+
+
+def all_loaded(*runtime_errors: str) -> LoadReport:
+    return LoadReport(
+        extensions=tuple(ExtensionLoad(path=path, loaded=True, registered=("before_tool_call",)) for path in EXTENSION_FILES),
+        runtime_errors=runtime_errors,
+    )
+
+
+def guard_failed() -> LoadReport:
+    return LoadReport(
+        extensions=(
+            ExtensionLoad(path="extensions/guard.py", loaded=False, error="SyntaxError: bad"),
+            ExtensionLoad(path="extensions/retry.py", loaded=True),
+        )
+    )
+
+
+@pytest.fixture
+def extended_candidate(tmp_path) -> Candidate:
+    root = tmp_path / "extended"
+    (root / "extensions").mkdir(parents=True)
+    (root / "candidate.toml").write_text('schema_version = 1\nagent = "fake"\n')
+    for path in EXTENSION_FILES:
+        (root / path).write_text("def extension(): ...\n")
+    (root / "extensions" / "README.md").write_text("not an extension: wrong suffix\n")
+    return Candidate.load(root)
+
+
+def returning(result: AgentResult) -> RunBehavior:
+    return lambda task, workdir, trace_dir: result
+
+
+def run_extended(candidate, result: AgentResult, tmp_path, suite: FakeSuite | None = None) -> TrialOutcome:
+    adapter = FakeAdapter(returning(result), spec=EXTENSION_SPEC)
+    return only_trial(run_eval(candidate, adapter, suite or FakeSuite([search_task("t1")]), tmp_path / "out"))
+
+
+def errored_result(error_class: str, report: LoadReport | None, error: str = "the agent's own message") -> AgentResult:
+    return AgentResult(status="errored", final_text="", usage=SPENT, wall_clock_s=4.0, error=error,
+                       error_class=error_class, load_report=report)  # fmt: skip
+
+
+def completed_with(report: LoadReport | None) -> AgentResult:
+    return AgentResult(status="completed", final_text="ok", usage=SPENT, wall_clock_s=4.0, load_report=report)
+
+
+def test_fake_adapter_satisfies_the_agent_adapter_protocol():
+    assert isinstance(FakeAdapter(spec=EXTENSION_SPEC), AgentAdapter)
+
+
+def test_run_whose_extensions_all_loaded_is_scored_and_records_the_load_report(extended_candidate, tmp_path):
+    trial = run_extended(extended_candidate, completed_with(all_loaded()), tmp_path)
+    assert (trial.status, trial.reward) == ("scored", 1.0)
+    assert trial.load_report == all_loaded()
+
+
+def test_completed_run_with_an_extension_that_failed_to_load_is_harness_load_error(extended_candidate, tmp_path):
+    suite = FakeSuite([search_task("t1")])
+    trial = run_extended(extended_candidate, completed_with(guard_failed()), tmp_path, suite)
+    assert (trial.status, trial.error_class, trial.reward) == ("errored", "harness_load_error", None)
+    assert "extensions/guard.py" in trial.detail and "SyntaxError: bad" in trial.detail
+    assert suite.grade_calls == []
+
+
+def test_harness_load_error_keeps_the_runs_usage_and_wall_clock(extended_candidate, tmp_path):
+    # The spend is real even though the run didn't measure the candidate as written (P12).
+    trial = run_extended(extended_candidate, completed_with(guard_failed()), tmp_path)
+    assert (trial.usage, trial.wall_clock_s) == (SPENT, 4.0)
+
+
+def test_completed_run_without_a_load_report_is_harness_load_error_when_extensions_are_expected(
+    extended_candidate, tmp_path
+):
+    trial = run_extended(extended_candidate, completed_with(None), tmp_path)
+    assert (trial.status, trial.error_class) == ("errored", "harness_load_error")
+    assert "no load report" in trial.detail
+
+
+def test_completed_run_whose_report_leaves_out_an_extension_is_harness_load_error(extended_candidate, tmp_path):
+    report = LoadReport(extensions=(ExtensionLoad(path="extensions/guard.py", loaded=True),))
+    trial = run_extended(extended_candidate, completed_with(report), tmp_path)
+    assert trial.error_class == "harness_load_error"
+    assert "extensions/retry.py" in trial.detail
+
+
+@pytest.mark.parametrize("error_class", ["timeout", "quota", "provider_error", "agent_error", "extension_error"])
+def test_a_failed_load_replaces_the_class_and_detail_of_an_errored_run(extended_candidate, tmp_path, error_class):
+    trial = run_extended(extended_candidate, errored_result(error_class, guard_failed()), tmp_path)
+    assert trial.error_class == "harness_load_error"
+    assert "extensions/guard.py" in trial.detail
+    assert "the agent's own message" not in trial.detail
+    assert (trial.usage, trial.wall_clock_s) == (SPENT, 4.0)
+
+
+def test_model_mismatch_outranks_a_failed_load(extended_candidate, tmp_path):
+    # P3: a run on another model is not part of the experiment at all, whatever it loaded.
+    trial = run_extended(extended_candidate, errored_result("model_mismatch", guard_failed(), "went to gpt-x"), tmp_path)
+    assert (trial.error_class, trial.detail) == ("model_mismatch", "went to gpt-x")
+
+
+def test_model_mismatch_outranks_extension_runtime_errors(extended_candidate, tmp_path):
+    trial = run_extended(extended_candidate, errored_result("model_mismatch", all_loaded("guard.py threw")), tmp_path)
+    assert trial.error_class == "model_mismatch"
+
+
+@pytest.mark.parametrize("error_class", ["timeout", "quota", "provider_error", "agent_error"])
+def test_an_errored_run_without_a_load_report_keeps_its_own_class(extended_candidate, tmp_path, error_class):
+    # A run killed on timeout never wrote its report: the missing report is explained by the
+    # error itself, and calling it a load failure would point the overseer at the wrong cause.
+    trial = run_extended(extended_candidate, errored_result(error_class, None), tmp_path)
+    assert (trial.error_class, trial.detail) == (error_class, "the agent's own message")
+
+
+def test_extension_code_that_threw_turns_a_completed_run_into_extension_error(extended_candidate, tmp_path):
+    suite = FakeSuite([search_task("t1")])
+    trial = run_extended(extended_candidate, completed_with(all_loaded("extensions/guard.py: KeyError 'x'")), tmp_path, suite)
+    assert (trial.status, trial.error_class, trial.reward) == ("errored", "extension_error", None)
+    assert "KeyError 'x'" in trial.detail
+    assert (trial.usage, trial.wall_clock_s) == (SPENT, 4.0)
+    assert suite.grade_calls == []
+
+
+def test_extension_code_that_threw_turns_an_agent_error_into_extension_error(extended_candidate, tmp_path):
+    trial = run_extended(extended_candidate, errored_result("agent_error", all_loaded("guard.py threw")), tmp_path)
+    assert trial.error_class == "extension_error"
+    assert "guard.py threw" in trial.detail
+
+
+def test_extension_code_that_threw_turns_an_unknown_error_class_into_extension_error(extended_candidate, tmp_path):
+    # An unknown class is recorded as agent_error, so it is treated as one.
+    trial = run_extended(extended_candidate, errored_result("weird", all_loaded("guard.py threw")), tmp_path)
+    assert trial.error_class == "extension_error"
+
+
+@pytest.mark.parametrize("error_class", ["timeout", "quota", "provider_error"])
+def test_extension_runtime_errors_do_not_replace_environment_failures(extended_candidate, tmp_path, error_class):
+    trial = run_extended(extended_candidate, errored_result(error_class, all_loaded("guard.py threw")), tmp_path)
+    assert (trial.error_class, trial.detail) == (error_class, "the agent's own message")
+
+
+def test_runtime_errors_are_checked_even_when_the_adapter_expects_no_extension_files(candidate, tmp_path):
+    adapter = FakeAdapter(returning(completed_with(LoadReport(runtime_errors=("hook threw",)))))
+    trial = only_trial(run_eval(candidate, adapter, FakeSuite([search_task("t1")]), tmp_path / "out"))
+    assert trial.error_class == "extension_error"
+
+
+def test_extension_files_are_not_expected_from_an_adapter_without_an_extension_spec(extended_candidate, tmp_path):
+    adapter = FakeAdapter(returning(completed_with(None)), spec=None)
+    trial = only_trial(run_eval(extended_candidate, adapter, FakeSuite([search_task("t1")]), tmp_path / "out"))
+    assert trial.status == "scored"
+    assert trial.load_report is None
+
+
+def test_the_load_report_is_written_to_outcome_json(extended_candidate, tmp_path):
+    run_extended(extended_candidate, completed_with(guard_failed()), tmp_path)
+    written = json.loads((tmp_path / "out" / "trials" / "t1" / "1" / "outcome.json").read_text())
+    assert written["load_report"]["extensions"][0] == {
+        "path": "extensions/guard.py",
+        "loaded": False,
+        "error": "SyntaxError: bad",
+        "registered": [],
+    }
+
+
+def test_the_load_report_is_kept_when_the_run_errored(extended_candidate, tmp_path):
+    trial = run_extended(extended_candidate, errored_result("timeout", all_loaded()), tmp_path)
+    assert trial.load_report == all_loaded()
+
+
+def test_a_report_with_a_load_report_loads_back_equal(extended_candidate, tmp_path):
+    adapter = FakeAdapter(returning(completed_with(all_loaded("x threw"))), spec=EXTENSION_SPEC)
+    report = run_eval(extended_candidate, adapter, FakeSuite([search_task("t1"), search_task("t2")]), tmp_path / "out")
+    assert EvalReport.from_dict(json.loads((tmp_path / "out" / "report.json").read_text())) == report
+
+
+def test_a_load_report_given_as_lists_is_recorded_as_tuples(extended_candidate, tmp_path):
+    loads = [ExtensionLoad(path=path, loaded=True, registered=["tool:search"]) for path in EXTENSION_FILES]
+    trial = run_extended(extended_candidate, completed_with(LoadReport(extensions=loads, runtime_errors=[])), tmp_path)
+    assert trial.status == "scored"
+    assert trial.load_report == LoadReport(
+        extensions=tuple(ExtensionLoad(path=path, loaded=True, registered=("tool:search",)) for path in EXTENSION_FILES)
+    )
+
+
+def test_trial_outcome_without_a_load_report_key_loads_as_none():
+    # Reports written before load reports existed must still load.
+    data = scored("t1", 1, 1.0).to_dict()
+    del data["load_report"]
+    assert TrialOutcome.from_dict(data).load_report is None
+
+
+def test_trial_outcome_round_trips_its_load_report_through_json():
+    outcome = TrialOutcome(
+        task_id="t1", trial=1, status="errored", reward=None, error_class="harness_load_error", detail="x",
+        usage=Usage(), wall_clock_s=1.0, trial_dir="trials/t1/1", load_report=guard_failed(),
+    )  # fmt: skip
+    assert TrialOutcome.from_dict(json.loads(json.dumps(outcome.to_dict()))) == outcome
+
+
+@pytest.mark.parametrize(
+    "bad_report",
+    [
+        {"extensions": []},
+        "loaded",
+        LoadReport(extensions=({"path": "extensions/guard.py", "loaded": True},)),
+        LoadReport(extensions=(ExtensionLoad(path=Path("extensions/guard.py"), loaded=True),)),
+        LoadReport(extensions=(ExtensionLoad(path="extensions/guard.py", loaded="yes"),)),
+        LoadReport(extensions=(ExtensionLoad(path="extensions/guard.py", loaded=False, error=ValueError("x")),)),
+        LoadReport(extensions=(ExtensionLoad(path="extensions/guard.py", loaded=True, registered=(1,)),)),
+        LoadReport(extensions=(ExtensionLoad(path="extensions/guard.py", loaded=True, registered="tool:x"),)),
+        LoadReport(runtime_errors=(object(),)),
+        LoadReport(runtime_errors="threw"),
+        LoadReport(extensions=None),
+    ],
+    ids=["dict", "str", "dict-load", "path-not-str", "loaded-not-bool", "error-not-str", "registered-not-str",
+         "registered-a-str", "runtime-error-not-str", "runtime-errors-a-str", "extensions-none"],
+)  # fmt: skip
+def test_a_malformed_load_report_makes_the_trial_an_agent_error_and_keeps_its_cost(
+    extended_candidate, tmp_path, bad_report
+):
+    suite = FakeSuite([search_task("t1")])
+    trial = run_extended(extended_candidate, completed_with(bad_report), tmp_path, suite)
+    assert (trial.status, trial.error_class) == ("errored", "agent_error")
+    assert "load_report" in trial.detail
+    assert trial.usage == SPENT
+    assert trial.load_report is None
+    assert suite.grade_calls == []
     assert (tmp_path / "out" / "report.json").is_file()

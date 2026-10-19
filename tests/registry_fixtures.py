@@ -28,6 +28,9 @@ class FakeAdapter:
     def describe_valves(self) -> str:
         return ""
 
+    def extension_spec(self):
+        return None
+
 
 class FakeSuite:
     name = "fake"

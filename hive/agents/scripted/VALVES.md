@@ -5,6 +5,8 @@ reasoning: it replays canned text and files. It exists so the loop can run end t
 end with zero model spend.
 
 `candidate.toml` must set `agent = "scripted"` and must not define any `[valves]`.
+It runs no extensions: a replay has no agent loop to hook, so files in `extensions/`
+are ignored.
 
 ## The only valve: `responses.toml`
 
