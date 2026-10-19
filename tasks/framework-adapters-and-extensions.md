@@ -52,6 +52,37 @@
   The scouts verified Deep Agents 0.7.28 (60 packages) and Strands 1.61.1 (54 packages) offline. Neither ships a tool-capable fake model, so the runners take a scripted test model. Strands defaults to Bedrock and silently probes AWS, so its runner must refuse Bedrock outright. Both leave orphan shell processes after a group kill.
 - 2026-10-19: Wrote the contract additions, `hive/extensions.py`, `hive/agents/process.py` and `hive/agents/runner_protocol.py` myself, test-first. Added a `_path` suffix to the path-setting rule, and `scripts/setup-framework-venvs.sh`.
 
+- 2026-10-19: Implementation fan-out landed: 4 implementers on disjoint files, all test-first.
+  - **Controller:**
+    - `evaluate` applies `load_problem` once per trial. `model_mismatch` outranks everything; a failed load replaces any other class but keeps usage and wall clock; a runtime throw replaces `completed`/`agent_error` but not timeout, quota or provider errors.
+    - **Refinement (accepted):** a *missing* report only fails a completed run. A timeout kill or crash leaves no `result.json`, and relabelling it "no load report" would point the overseer at the wrong cause. Both score 0, so it can't be gamed.
+    - `TrialOutcome` records the load report, so the overseer's evidence shows what loaded.
+    - The overseer gets `context/extensions.md`, and a prompt section (`extensions_prompt.md`) invites an extension when traces show a behavioral failure, still as one isolated change.
+  - **Pi:**
+    - The `ExtensionSpec` covers all 10 points: `after_model_call`, `wrap_model_call` and `after_run` are partial, the rest are supported. `EXTENSIONS_API.md` is about 400 lines excerpted from `types.d.ts`.
+    - **Load report by construction:** Pi 0.75.3 exits before the session header if any `-e` file fails, so "header seen ⇒ all loaded". Checked in `main.js` and on the binary.
+    - Runtime `Extension error (path)` lines are now `extension_error`, not `harness_load_error`.
+    - `registered` comes from static analysis of the `.ts` source.
+    - `validate` rejects a literal extension tool name missing from `[valves].tools`. This closes the silently-inactive-tool gap.
+  - **Deep Agents** (`deepagents==0.7.28`, `langchain-openai==1.7.2`):
+    - **Entry convention:** `def extension()` returns a list of `AgentMiddleware`/`BaseTool`.
+    - **HIVE guards** (call limit, tool allowlist, `ToolErrorMiddleware`) sit inside the extension middleware.
+    - **The general-purpose subagent is off by default,** because user middleware doesn't reach it. When the valve enables it, it gets HIVE's guards.
+    - **Usage** is summed per call by callback, since subagent tokens are missing from the final state.
+    - Shell children are reaped through a `LocalShellBackend` subclass.
+  - **Strands** (`strands-agents[openai]==1.61.1`, `openai==2.54.0`, no `strands-agents-tools`):
+    - **Entry convention:** `def extension()` returns a `strands.plugins.Plugin` named after its file stem.
+    - **Bedrock is refused outright,** and the AWS environment is scrubbed.
+    - **A recording OpenAI client** records the model the provider reported, which Strands ignores.
+    - **A model guard hook** catches `agent.model` swaps.
+    - **Hook throws** are attributed to their file and re-raised.
+    - **`validate` statically rejects obvious P3 breaches,** such as importing model SDKs or assigning `.model`.
+  - **Integration (me):**
+    - Registered `deepagents` and `strands` as built-ins.
+    - Fixed a bug both adapter builders hit independently: `Path.resolve()` on `python_path` followed the venv's `bin/python` symlink to the bare base interpreter, so the configs would have run without the framework installed. Path settings are now absolute but keep symlinks (test-first).
+    - **Observed:** 1098 tests pass, including real offline framework runs through the runners with the scripted provider.
+- 2026-10-19: Launched an adversarial review (5 lenses, two skeptics per finding).
+
 ## Open questions
 
 - Credentials. Pi's only credential is an OpenAI key in `~/.pi/agent/auth.json`. Deep Agents (`langchain-openai`) and Strands (OpenAI provider) read `OPENAI_API_KEY` from the environment, so a real smoke run needs that variable set.
