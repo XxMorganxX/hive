@@ -1,0 +1,10 @@
+[
+  {"args": ["I"], "kwargs": {}, "expected": 1},
+  {"args": ["IV"], "kwargs": {}, "expected": 4},
+  {"args": ["IX"], "kwargs": {}, "expected": 9},
+  {"args": ["XL"], "kwargs": {}, "expected": 40},
+  {"args": ["LVIII"], "kwargs": {}, "expected": 58},
+  {"args": ["CDXLIV"], "kwargs": {}, "expected": 444},
+  {"args": ["MCMXCIV"], "kwargs": {}, "expected": 1994},
+  {"args": ["MMMCMXCIX"], "kwargs": {}, "expected": 3999}
+]

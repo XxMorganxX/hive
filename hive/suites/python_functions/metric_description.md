@@ -1,0 +1,1 @@
+A task's reward is the fraction of its hidden test cases that the agent's `solution.py` passes, in [0, 1]. A missing, unimportable or timed-out solution scores 0. The suite score is the mean reward over tasks; higher is better.

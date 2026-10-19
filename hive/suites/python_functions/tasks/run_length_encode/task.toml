@@ -1,0 +1,11 @@
+id = "run_length_encode"
+split = "search"
+function = "run_length_encode"
+description = """
+`run_length_encode(text: str) -> list[tuple[str, int]]` run-length encodes a string.
+
+Return one `(character, count)` pair for every maximal run of identical consecutive characters, in the \
+order the runs appear. Comparison is case-sensitive (`"a"` and `"A"` are different characters), and \
+whitespace and digits are ordinary characters. The empty string returns an empty list. Pairs may be \
+tuples or two-element lists.
+"""

@@ -1,0 +1,12 @@
+id = "top_k_words"
+split = "heldout"
+function = "top_k_words"
+description = """
+`top_k_words(text: str, k: int) -> list[tuple[str, int]]` returns the `k` most frequent words with their counts.
+
+A word is a maximal run of ASCII letters `a`-`z` after lowercasing the text; every other character (digits, \
+apostrophes, punctuation, whitespace) separates words. Count each word, then sort by count descending, \
+breaking ties by the word in ascending alphabetical order, and return the first `k` as `(word, count)` pairs. \
+If there are fewer than `k` distinct words, return all of them. `k` is never negative, and `k == 0` returns an \
+empty list. Pairs may be tuples or two-element lists.
+"""

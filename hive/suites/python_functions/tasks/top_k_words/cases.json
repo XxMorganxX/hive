@@ -1,0 +1,10 @@
+[
+  {"args": ["the cat and the hat", 2], "kwargs": {}, "expected": [["the", 2], ["and", 1]]},
+  {"args": ["", 3], "kwargs": {}, "expected": []},
+  {"args": ["b a c b a", 5], "kwargs": {}, "expected": [["a", 2], ["b", 2], ["c", 1]]},
+  {"args": ["Hello hello HELLO world", 1], "kwargs": {}, "expected": [["hello", 3]]},
+  {"args": ["one, two; two! three? three three", 3], "kwargs": {}, "expected": [["three", 3], ["two", 2], ["one", 1]]},
+  {"args": ["x y z", 0], "kwargs": {}, "expected": []},
+  {"args": ["don't stop", 3], "kwargs": {}, "expected": [["don", 1], ["stop", 1], ["t", 1]]},
+  {"args": ["a1b2c a"], "kwargs": {"k": 2}, "expected": [["a", 2], ["b", 1]]}
+]

@@ -1,0 +1,13 @@
+id = "slugify"
+split = "search"
+function = "slugify"
+description = """
+`slugify(text: str) -> str` turns arbitrary text into a URL slug.
+
+1. Lowercase the text.
+2. Keep only the ASCII letters `a`-`z` and the digits `0`-`9`. Every maximal run of any other characters \
+(spaces, punctuation, underscores, hyphens, non-ASCII letters such as `é`) becomes a single hyphen `-`.
+3. Remove leading and trailing hyphens.
+
+An input with no ASCII letters or digits returns the empty string.
+"""

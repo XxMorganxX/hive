@@ -1,0 +1,9 @@
+[
+  {"args": ["aaabcc"], "kwargs": {}, "expected": [["a", 3], ["b", 1], ["c", 2]]},
+  {"args": [""], "kwargs": {}, "expected": []},
+  {"args": ["a"], "kwargs": {}, "expected": [["a", 1]]},
+  {"args": ["aAaa"], "kwargs": {}, "expected": [["a", 1], ["A", 1], ["a", 2]]},
+  {"args": ["abab"], "kwargs": {}, "expected": [["a", 1], ["b", 1], ["a", 1], ["b", 1]]},
+  {"args": ["   "], "kwargs": {}, "expected": [[" ", 3]]},
+  {"args": ["112223"], "kwargs": {}, "expected": [["1", 2], ["2", 3], ["3", 1]]}
+]

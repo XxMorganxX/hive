@@ -1,0 +1,10 @@
+id = "is_balanced"
+split = "heldout"
+function = "is_balanced"
+description = """
+`is_balanced(text: str) -> bool` reports whether the brackets in a string are balanced.
+
+The bracket pairs are `()`, `[]` and `{}`. Every other character is ignored. The text is balanced when every \
+closing bracket matches the most recent unmatched opening bracket of the same kind, and no opening bracket is \
+left unmatched at the end. The empty string is balanced. Return the `bool` `True` or `False`.
+"""

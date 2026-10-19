@@ -1,0 +1,10 @@
+[
+  {"args": ["Hello, World!"], "kwargs": {}, "expected": "hello-world"},
+  {"args": ["  Multiple   spaces  "], "kwargs": {}, "expected": "multiple-spaces"},
+  {"args": [""], "kwargs": {}, "expected": ""},
+  {"args": ["---"], "kwargs": {}, "expected": ""},
+  {"args": ["Already-slugged-123"], "kwargs": {}, "expected": "already-slugged-123"},
+  {"args": ["Café au lait"], "kwargs": {}, "expected": "caf-au-lait"},
+  {"args": ["snake_case and--dashes"], "kwargs": {}, "expected": "snake-case-and-dashes"},
+  {"args": [], "kwargs": {"text": "ABC 2024"}, "expected": "abc-2024"}
+]

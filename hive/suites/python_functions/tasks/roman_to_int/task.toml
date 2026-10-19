@@ -1,0 +1,10 @@
+id = "roman_to_int"
+split = "search"
+function = "roman_to_int"
+description = """
+`roman_to_int(s: str) -> int` converts a Roman numeral to an integer.
+
+The input is always a valid, uppercase, standard-form Roman numeral for a value from 1 to 3999, using the \
+symbols I=1, V=5, X=10, L=50, C=100, D=500, M=1000 and the six subtractive pairs IV=4, IX=9, XL=40, \
+XC=90, CD=400, CM=900. Return the value as an `int`.
+"""
