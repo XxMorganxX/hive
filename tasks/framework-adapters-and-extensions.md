@@ -43,7 +43,7 @@
 ## Progress log
 
 - 2026-10-19: Launched the exploration workflow.
-- 2026-10-19: Exploration landed; scratch reports are under scratchpad/explore. Contract gaps confirmed:
+- 2026-10-19: Exploration landed (the explorers' full reports were working notes, not kept in the repo). Contract gaps confirmed:
   - **Extensions aren't in the neutral contract.** Only the Pi adapter knows about them.
   - **Detection is negative-only.**
   - **An extension tool missing from `tools` is silently inactive.**
