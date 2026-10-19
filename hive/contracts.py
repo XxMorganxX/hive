@@ -157,7 +157,7 @@ class ExtensionSpec:
     entry_convention: str  # what each extension file must define or export
     framework_version: str  # the pinned version this spec was checked against (P13)
     lifecycle: tuple[LifecyclePoint, ...]
-    forbidden: tuple[str, ...] = ()  # native APIs an extension must not use, e.g. switching the model (P3)
+    forbidden: tuple[str, ...] = ()  # things an extension must not do (Markdown bullets), e.g. switching the model (P3)
     # The pinned API definitions themselves (e.g. the framework's extension type declarations),
     # as text: the overseer works in a sandbox that can't read the installed framework.
     api_reference: str = ""
@@ -194,8 +194,12 @@ class AgentResult:
 
 @runtime_checkable
 class Agent(Protocol):
-    def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
+    def run(self, task: Task, workdir: Path, trace_dir: Path, endpoint: ModelEndpoint | None = None) -> AgentResult:
         """Run one task with `workdir` as the working directory.
+
+        When `endpoint` is given (every real provider), ALL model traffic must go to it, with
+        its per-trial token: the gateway behind it enforces the frozen model and bills the run.
+        The controller passes it as a keyword argument, and only when it is not None.
 
         Must not raise for agent-side failures: return status="errored" instead.
         Must write its native trace files into `trace_dir`.
