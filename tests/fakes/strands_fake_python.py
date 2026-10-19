@@ -5,12 +5,13 @@ The adapter talks to its venv interpreter in exactly two ways, and this fake ans
 
 - `python -I -c <code>`: the version check. Prints the strands-agents version.
 - `python -I <runner.py> <trace_dir>/run_spec.json`: one trial. Instead of running the real
-  runner, it records how it was invoked (argv, cwd, environment, the credentials on stdin)
+  runner, it records how it was invoked (argv, cwd, environment, the model endpoint on stdin)
   to `<trace_dir>/fake_record.json`, then plays a canned scenario: it writes trace.jsonl,
   result.json and child_pgids.txt the way the runner protocol says a runner does.
 
-A credential is never written down as it is: the record says only whether OPENAI_API_KEY was
-in the environment, and gives a sha256 fingerprint of each credential that came on stdin.
+A secret is never written down as it is: the record says only whether OPENAI_API_KEY was in
+the environment, gives the endpoint's api_key (the per-trial token) as a sha256 fingerprint,
+and fingerprints the whole stdin line so a test can check what it did not contain.
 
 The adapter passes the subprocess an explicit, minimal environment, so the scenario can't
 travel in an environment variable. A test makes a small wrapper script that calls this file
@@ -87,16 +88,40 @@ def write_result(spec: dict, **fields) -> None:
 CREDENTIAL = "OPENAI_API_KEY"
 
 
-def stdin_credentials() -> dict[str, str] | str:
-    """Fingerprints of the credentials the adapter sent on stdin, or why they could not be read."""
+def fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def stdin_record() -> dict:
+    """What the adapter sent on stdin: its top-level keys, the endpoint with its token
+    fingerprinted, and a fingerprint of every string anywhere in it (to test for absences)."""
     text = sys.stdin.read()
     if not text:
-        return "no input"
+        return {"error": "no input"}
     try:
-        credentials = json.loads(text)["credentials"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return "malformed input"
-    return {name: hashlib.sha256(str(value).encode()).hexdigest() for name, value in credentials.items()}
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"error": "malformed input"}
+    if not isinstance(data, dict):
+        return {"error": "not an object"}
+
+    strings: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, str):
+            strings.append(fingerprint(value))
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(data)
+    endpoint = data.get("endpoint")
+    if isinstance(endpoint, dict):
+        endpoint = {name: fingerprint(str(value)) if name == "api_key" else value for name, value in endpoint.items()}
+    return {"keys": sorted(data), "endpoint": endpoint, "string_fingerprints": strings}
 
 
 def run_trial(spec_path: Path) -> int:
@@ -107,7 +132,7 @@ def run_trial(spec_path: Path) -> int:
         "cwd": os.getcwd(),
         "env": {name: value for name, value in os.environ.items() if name != CREDENTIAL},
         "env_has_openai_key": CREDENTIAL in os.environ,
-        "stdin_credentials": stdin_credentials(),
+        "stdin": stdin_record(),
         "spec": spec,
     }
     (trace_dir / "fake_record.json").write_text(json.dumps(record), encoding="utf-8")

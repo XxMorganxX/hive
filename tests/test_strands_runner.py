@@ -21,14 +21,13 @@ from hive.agents.process import run_process_group
 from hive.agents.strands import StrandsAdapter
 from hive.agents.strands.adapter import subprocess_env
 from hive.candidate import Candidate
-from hive.contracts import ModelSpec, Task
+from hive.contracts import ModelEndpoint, ModelSpec, Task
 from hive.extensions import expected_extension_files, load_problem
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STRANDS_PYTHON = REPO_ROOT / ".venvs" / "strands" / "bin" / "python"
 RUNNER_DIR = REPO_ROOT / "hive" / "agents" / "strands"
 MODEL = ModelSpec(provider="scripted", id="scripted-model")
-PRICES = {"input": 0.05, "output": 0.40, "cache_read": 0.005}
 TASK = Task(id="t1", split="search", instruction="Write solution.py, then answer.")
 
 pytestmark = pytest.mark.skipif(not STRANDS_PYTHON.exists(), reason="the Strands venv is not built (.venvs/strands)")
@@ -60,7 +59,7 @@ def run_script(tmp_path: Path, turns: list, candidate: Candidate | None = None, 
     agent = StrandsAdapter().build(
         candidate,
         MODEL,
-        {"python_path": str(STRANDS_PYTHON), "strands_version": "1.61.1", "prices": PRICES, "timeout_s": 60,
+        {"python_path": str(STRANDS_PYTHON), "strands_version": "1.61.1", "timeout_s": 60,
          "script_file": str(script), **settings},
     )
     workdir = tmp_path / "work"
@@ -458,17 +457,19 @@ def test_a_timeout_kills_the_run_and_its_shell_children(tmp_path):
             os.kill(pid, signal.SIGKILL)
 
 
-# --- the provider credential ------------------------------------------------------------
+# --- the model endpoint ----------------------------------------------------------------
 
+# Placeholders: the controller's provider key, and the per-trial gateway token.
 PLACEHOLDER_KEY = "sk-PLACEHOLDER-not-a-real-key-4701"
+PLACEHOLDER_TOKEN = "trial-token-PLACEHOLDER-4701"
+# Nothing listens here; these tests never send a model request.
+ENDPOINT = ModelEndpoint(base_url="http://127.0.0.1:9/v1", api_key=PLACEHOLDER_TOKEN)
 
 
-def test_the_api_key_appears_nowhere_under_the_trace_dir_even_when_the_agent_dumps_its_environment(
-    tmp_path, monkeypatch
-):
-    # The adapter hands the runner the key the way it would for a real openai run, but the
-    # model turns are scripted: the trial's model is relabelled openai after build, so the
-    # credential path is the real one and no request ever leaves the machine.
+def test_no_secret_appears_under_the_trace_dir_even_when_the_agent_dumps_its_environment(tmp_path, monkeypatch):
+    # The adapter hands the runner an endpoint the way it does for a real openai run, while the
+    # controller holds a provider key, but the model turns are scripted: the trial's model is
+    # relabelled openai after build, so the stdin path is the real one and no request is sent.
     monkeypatch.setenv("OPENAI_API_KEY", PLACEHOLDER_KEY)
     script = tmp_path / "script.json"
     script.write_text(json.dumps({"turns": [
@@ -478,20 +479,22 @@ def test_the_api_key_appears_nowhere_under_the_trace_dir_even_when_the_agent_dum
     ]}))  # fmt: skip
     candidate = write_candidate(tmp_path / "candidate", valves='tools = ["shell", "python_repl"]\n')
     built = StrandsAdapter().build(candidate, MODEL, {"python_path": str(STRANDS_PYTHON), "strands_version": "1.61.1",
-                                                     "prices": PRICES, "timeout_s": 60, "script_file": str(script)})  # fmt: skip
+                                                     "timeout_s": 60, "script_file": str(script)})  # fmt: skip
     agent = dataclasses.replace(built, model=ModelSpec(provider="openai", id=MODEL.id))
     workdir, trace_dir = tmp_path / "work", tmp_path / "trace"
     workdir.mkdir()
     trace_dir.mkdir()
-    result = agent.run(TASK, workdir, trace_dir)
+    result = agent.run(TASK, workdir, trace_dir, endpoint=ENDPOINT)
     assert result.status == "completed", result.error
     results = trace_lines(trace_dir, "tool_result")
     assert [line["status"] for line in results] == ["success", "success"]
     assert "PATH=" in results[0]["content"] and "PATH" in results[1]["content"]  # the dumps really ran
     assert "HIVE_TRIAL_ID=" in results[0]["content"]  # the trial marker survives the minimal shell env
-    leaked = [str(path.relative_to(trace_dir)) for path in trace_dir.rglob("*")
-              if path.is_file() and PLACEHOLDER_KEY in path.read_text(errors="replace")]  # fmt: skip
-    assert leaked == []
+    assert f"HOME={trace_dir.resolve() / 'home'}" in results[0]["content"]  # the trial's own HOME
+    for secret in (PLACEHOLDER_KEY, PLACEHOLDER_TOKEN):
+        leaked = [str(path.relative_to(trace_dir)) for path in trace_dir.rglob("*")
+                  if path.is_file() and secret in path.read_text(errors="replace")]  # fmt: skip
+        assert leaked == [], secret
 
 
 def run_in_strands_venv(tmp_path: Path, code: str, env: dict[str, str] | None = None) -> dict:
@@ -504,28 +507,32 @@ def run_in_strands_venv(tmp_path: Path, code: str, env: dict[str, str] | None = 
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
-def test_the_openai_client_gets_the_key_explicitly_and_the_environment_never_holds_it(tmp_path):
+def test_the_openai_client_is_pointed_at_the_endpoint_with_the_trial_token(tmp_path):
+    # An inherited key or base URL must never be what the client uses.
     probe = run_in_strands_venv(tmp_path, f"""
 from pathlib import Path
 trace = runner.Trace(Path({str(tmp_path / 't.jsonl')!r}))
 spec = {{"model": {{"provider": "openai", "id": "gpt-5-nano", "reasoning_effort": "low"}}}}
-model = runner.make_model(spec, trace, {{"OPENAI_API_KEY": {PLACEHOLDER_KEY!r}}})
-print(json.dumps({{"key": model._custom_client._client.api_key, "in_env": "OPENAI_API_KEY" in os.environ}}))
-""")
-    assert probe == {"key": PLACEHOLDER_KEY, "in_env": False}
+model = runner.make_model(spec, trace, {{"base_url": {ENDPOINT.base_url!r}, "api_key": {PLACEHOLDER_TOKEN!r}}})
+client = model._custom_client._client
+print(json.dumps({{"key": client.api_key, "base_url": str(client.base_url), "retries": client.max_retries,
+                  "recording": type(model._custom_client).__name__}}))
+""", env={"PATH": os.environ["PATH"], "OPENAI_API_KEY": PLACEHOLDER_KEY, "OPENAI_BASE_URL": "http://evil.invalid/v1"})
+    assert probe == {"key": PLACEHOLDER_TOKEN, "base_url": ENDPOINT.base_url + "/", "retries": 0,
+                     "recording": "RecordingOpenAIClient"}  # fmt: skip
 
 
-def test_a_missing_key_is_provider_error(tmp_path):
+def test_an_openai_run_without_an_endpoint_is_provider_error(tmp_path):
     probe = run_in_strands_venv(tmp_path, f"""
 from pathlib import Path
 trace = runner.Trace(Path({str(tmp_path / 't.jsonl')!r}))
 spec = {{"model": {{"provider": "openai", "id": "gpt-5-nano", "reasoning_effort": "low"}}}}
 try:
-    runner.make_model(spec, trace, {{}})
+    runner.make_model(spec, trace, None)
 except runner.RunnerError as error:
     print(json.dumps({{"class": error.error_class, "message": str(error)}}))
 """, env={"PATH": os.environ["PATH"], "OPENAI_API_KEY": PLACEHOLDER_KEY})  # an inherited key is never used
-    assert probe["class"] == "provider_error" and "OPENAI_API_KEY" in probe["message"]
+    assert probe["class"] == "provider_error" and "endpoint" in probe["message"]
 
 
 def run_runner_directly(tmp_path: Path, stdin_text: str, turns: list) -> dict:
@@ -533,27 +540,34 @@ def run_runner_directly(tmp_path: Path, stdin_text: str, turns: list) -> dict:
     script = tmp_path / "script.json"
     script.write_text(json.dumps({"turns": turns}))
     agent = StrandsAdapter().build(write_candidate(tmp_path / "candidate"), MODEL, {
-        "python_path": str(STRANDS_PYTHON), "strands_version": "1.61.1", "prices": PRICES, "script_file": str(script)})  # fmt: skip
+        "python_path": str(STRANDS_PYTHON), "strands_version": "1.61.1", "script_file": str(script)})  # fmt: skip
     workdir, trace_dir = (tmp_path / "work").resolve(), (tmp_path / "trace").resolve()
     workdir.mkdir()
     trace_dir.mkdir()
     spec_path = trace_dir / "run_spec.json"
     spec_path.write_text(json.dumps(agent.run_spec(TASK, workdir, trace_dir)))
     run_process_group([str(STRANDS_PYTHON), "-I", str(RUNNER_DIR / "runner.py"), str(spec_path)], cwd=workdir,
-                      env=subprocess_env(os.environ), timeout_s=60, stdout_path=trace_dir / "out.txt",
+                      env=subprocess_env(os.environ, home=trace_dir), timeout_s=60, stdout_path=trace_dir / "out.txt",
                       stderr_path=trace_dir / "err.txt", stdin_text=stdin_text)  # fmt: skip
     return json.loads((trace_dir / "result.json").read_text())
 
 
-def test_malformed_credentials_input_is_agent_error_with_no_load_report(tmp_path):
-    result = run_runner_directly(tmp_path, "not json\n", [[text("done")]])
+@pytest.mark.parametrize("stdin_text", [
+    "not json\n",
+    '{"credentials": {"OPENAI_API_KEY": "sk-PLACEHOLDER"}}\n',  # the retired format is refused, not half-read
+    '{"endpoint": {"base_url": "http://127.0.0.1:9/v1"}}\n',
+    '{"endpoint": {"base_url": 3, "api_key": "t"}}\n',
+], ids=["not_json", "old_credentials", "no_api_key", "bad_base_url"])  # fmt: skip
+def test_malformed_endpoint_input_is_agent_error_that_never_echoes_it(tmp_path, stdin_text):
+    result = run_runner_directly(tmp_path, stdin_text, [[text("done")]])
     assert (result["status"], result["error_class"]) == ("errored", "agent_error")
     assert "stdin" in result["error"]
+    assert "PLACEHOLDER" not in result["error"]
     assert "extensions" not in result  # the load phase never ran
 
 
 def test_a_result_after_the_load_phase_carries_the_extensions_key(tmp_path):
-    result = run_runner_directly(tmp_path, '{"credentials": {}}\n', [[text("done")]])
+    result = run_runner_directly(tmp_path, '{"endpoint": null}\n', [[text("done")]])
     assert result["status"] == "completed", result["error"]
     assert result["extensions"] == []
 

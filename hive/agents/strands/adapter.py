@@ -16,11 +16,26 @@ strands-agents 1.61.1:
   the runner lists their pgids in child_pgids.txt and run_process_group kills those too.
 
 What the runner gets is passed explicitly: a run_spec.json naming every candidate file, a
-minimal environment, and the provider credential as one JSON line on stdin. The key is never
-in the runner's environment, so no shell, tool or child process inherits it, and `env` in the
-agent's shell can't copy it into the trace. Strands silently defaults to Bedrock and boto3
-probes AWS metadata and credential files, so AWS discovery is switched off here and Bedrock is
-disabled in the runner.
+minimal environment (PATH, LANG and a fresh HOME under the trace dir, never the controller's
+HOME with its dotfiles and caches), and the model endpoint as one JSON line on stdin,
+`{"endpoint": {"base_url": ..., "api_key": <per-trial token>}}`, or `{"endpoint": null}` when
+the controller gives none (the offline scripted provider).
+
+The model gateway (hive/gateway). For every real provider the controller passes a
+ModelEndpoint: the gateway's loopback URL and a per-trial token. The runner points the OpenAI
+client at it, so every model request is authenticated, checked against the frozen model and
+effort (P3), counted and billed (P12) outside the trial process. The provider's real key stays
+in the controller: it is never sent to the runner, not even when OPENAI_API_KEY is set here.
+The token travels on stdin rather than in the environment, so no shell, tool or child process
+inherits it and `env` in the agent's shell can't copy it into the trace.
+
+Usage and cost. The gateway's ledger is the authority for both. This adapter reports the token
+counts the runner's recording client traced (a second line of evidence the controller can
+compare with the ledger) and prices nothing: cost_usd is 0 here, and the controller takes the
+dollars from the ledger, priced by `[model] prices`. Strands computes no cost of its own.
+
+Strands silently defaults to Bedrock and boto3 probes AWS metadata and credential files, so
+AWS discovery is switched off here and Bedrock is disabled in the runner.
 """
 
 from __future__ import annotations
@@ -38,10 +53,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hive.agents.process import ProcessOutcome, run_process_group
-from hive.agents.runner_protocol import RESULT_FILE, TRACE_FILE, Prices, interpret_runner, parse_prices
+from hive.agents.runner_protocol import RESULT_FILE, TRACE_FILE, interpret_runner
 from hive.candidate import MANIFEST, Candidate, content_files
-from hive.contracts import EXTENSIONS_DIR, AgentResult, ExtensionSpec, LifecyclePoint, ModelSpec, Task
+from hive.contracts import EXTENSIONS_DIR, AgentResult, ExtensionSpec, LifecyclePoint, ModelEndpoint, ModelSpec, Task
 from hive.extensions import expected_extension_files
+from hive.pricing import Prices
 
 PACKAGE_DIR = Path(__file__).parent
 RUNNER = PACKAGE_DIR / "runner.py"
@@ -91,7 +107,7 @@ DEFAULT_THINKING = "low"
 
 # --- settings ------------------------------------------------------------------------------
 
-REQUIRED_SETTINGS = ("python_path", "strands_version", "prices")
+REQUIRED_SETTINGS = ("python_path", "strands_version")
 DEFAULT_SETTINGS: Mapping[str, Any] = {
     "timeout_s": 600,
     "term_grace_s": 5.0,
@@ -103,13 +119,20 @@ DEFAULT_SETTINGS: Mapping[str, Any] = {
     "script_file": None,
 }
 SETTING_NAMES = (*REQUIRED_SETTINGS, *DEFAULT_SETTINGS)
+# Settings this adapter no longer takes, and where their job went.
+RETIRED_SETTINGS: Mapping[str, str] = {
+    "prices": "cost is computed once, by the model gateway, from the experiment's [model] prices; "
+    "remove 'prices' from the Strands settings",
+}
+# interpret_runner prices the traced tokens; the ledger is the authority for dollars, so none here.
+UNPRICED = Prices(input=0.0, output=0.0)
 RETRY_INITIAL_DELAY_S = 1
 RETRY_MAX_DELAY_S = 8
 
 # --- subprocess ----------------------------------------------------------------------------
 
-PASSED_ENV = ("PATH", "HOME", "LANG")
-PROVIDER_CREDENTIAL = {"openai": "OPENAI_API_KEY", "scripted": None}
+PASSED_ENV = ("PATH", "LANG")
+HOME_DIR = "home"  # the trial's own HOME, under its trace dir
 # Set for every run: no AWS metadata probe, no AWS config or credential files, no telemetry export.
 PINNED_ENV: Mapping[str, str] = {
     "AWS_EC2_METADATA_DISABLED": "true",
@@ -352,7 +375,6 @@ def valve_problems(valves: Mapping[str, Any]) -> list[str]:
 class StrandsSettings:
     python_path: str
     strands_version: str
-    prices: Prices
     timeout_s: float
     term_grace_s: float
     max_turns: int
@@ -362,6 +384,9 @@ class StrandsSettings:
 
 def resolve_settings(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) -> StrandsSettings:
     merged = {**DEFAULT_SETTINGS, **defaults, **overrides}
+    retired = [f"'{name}': {reason}" for name, reason in RETIRED_SETTINGS.items() if name in merged]
+    if retired:
+        raise ValueError("retired Strands adapter settings: " + "; ".join(retired))
     unknown = sorted(set(merged) - set(SETTING_NAMES))
     if unknown:
         raise ValueError(f"unknown Strands adapter settings: {', '.join(unknown)} (allowed: {', '.join(SETTING_NAMES)})")
@@ -371,7 +396,6 @@ def resolve_settings(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) 
     for name in ("python_path", "strands_version"):
         if not isinstance(merged[name], str) or not merged[name].strip():
             raise ValueError(f"Strands setting '{name}' must be a non-empty string")
-    prices = parse_prices(merged["prices"])
 
     def number(name: str, minimum: float, exclusive: bool) -> float:
         value = merged[name]
@@ -393,7 +417,6 @@ def resolve_settings(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) 
     return StrandsSettings(
         python_path=merged["python_path"],
         strands_version=merged["strands_version"],
-        prices=prices,
         timeout_s=number("timeout_s", 0, exclusive=True),
         term_grace_s=number("term_grace_s", 0, exclusive=False),
         max_turns=count("max_turns"),
@@ -420,21 +443,24 @@ def model_config(model: ModelSpec, script_file: str | None) -> dict[str, Any]:
     return {"provider": model.provider, "id": model.id, "reasoning_effort": effort}
 
 
-def subprocess_env(source: Mapping[str, str]) -> dict[str, str]:
+def subprocess_env(source: Mapping[str, str], home: Path | None) -> dict[str, str]:
     """The trial's whole environment, built explicitly: nothing else from the controller leaks in.
 
-    It never holds the provider credential; that goes on stdin (credentials_input)."""
+    HOME is `home` (a trial's own dir under its trace dir), never the controller's; with None
+    there is no HOME at all. It never holds a key or token; the endpoint goes on stdin."""
     env = {name: source[name] for name in PASSED_ENV if name in source}
+    if home is not None:
+        env["HOME"] = str(home)
     env.update(PINNED_ENV)
     return env
 
 
-def credentials_input(provider: str, source: Mapping[str, str]) -> str:
-    """The runner's stdin: one JSON line, {"credentials": {NAME: value}}. Empty when the provider
-    needs none or the controller has none; the runner then reports the missing key itself."""
-    credential = PROVIDER_CREDENTIAL.get(provider)
-    credentials = {credential: source[credential]} if credential and source.get(credential) else {}
-    return json.dumps({"credentials": credentials}) + "\n"
+def endpoint_input(endpoint: ModelEndpoint | None) -> str:
+    """The runner's stdin: one JSON line, {"endpoint": {"base_url", "api_key"}} or {"endpoint": null}.
+
+    Only the endpoint the controller gave: never a key from this process's environment."""
+    payload = None if endpoint is None else {"base_url": endpoint.base_url, "api_key": endpoint.api_key}
+    return json.dumps({"endpoint": payload}) + "\n"
 
 
 def check_strands_version(python_path: str, pinned: str) -> None:
@@ -444,7 +470,7 @@ def check_strands_version(python_path: str, pinned: str) -> None:
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
-            env=subprocess_env(os.environ),
+            env=subprocess_env(os.environ, home=None),
             timeout=VERSION_CHECK_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -503,7 +529,6 @@ class StrandsAdapter:
             python_path=resolved.python_path,
             timeout_s=resolved.timeout_s,
             term_grace_s=resolved.term_grace_s,
-            prices=resolved.prices,
             model=model,
             model_config=config,
             script_file=str(Path(resolved.script_file).resolve()) if resolved.script_file else None,
@@ -529,7 +554,6 @@ class StrandsAgent:
     python_path: str
     timeout_s: float
     term_grace_s: float
-    prices: Prices
     model: ModelSpec  # what every provider response must report (P3)
     model_config: Mapping[str, Any]
     script_file: str | None
@@ -542,7 +566,10 @@ class StrandsAgent:
     max_turns: int
     max_model_attempts: int
 
-    def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
+    def run(self, task: Task, workdir: Path, trace_dir: Path, endpoint: ModelEndpoint | None = None) -> AgentResult:
+        """One trial in its own runner process. With `endpoint` (every real provider), all model
+        traffic goes to it with its per-trial token; an openai run without one fails in the
+        runner as provider_error, since there is no key to fall back on."""
         workdir = Path(workdir).resolve()
         trace_dir = Path(trace_dir).resolve()
         started = time.monotonic()
@@ -551,13 +578,15 @@ class StrandsAgent:
             # A file left by an earlier run in this dir would be read as this run's result.
             for name in (RESULT_FILE, TRACE_FILE, CHILD_PGIDS_FILE, MESSAGES_FILE):
                 (trace_dir / name).unlink(missing_ok=True)
+            home = trace_dir / HOME_DIR
+            home.mkdir(exist_ok=True)
             spec_path = trace_dir / RUN_SPEC_FILE
             spec_path.write_text(json.dumps(self.run_spec(task, workdir, trace_dir), indent=2), encoding="utf-8")
             outcome = run_process_group(
                 [self.python_path, "-I", str(RUNNER), str(spec_path)],
                 cwd=workdir,
-                env=subprocess_env(os.environ),
-                stdin_text=credentials_input(self.model.provider, os.environ),
+                env=subprocess_env(os.environ, home=home),
+                stdin_text=endpoint_input(endpoint),
                 timeout_s=self.timeout_s,
                 stdout_path=trace_dir / RUNNER_STDOUT_FILE,
                 stderr_path=trace_dir / RUNNER_STDERR_FILE,
@@ -566,12 +595,13 @@ class StrandsAgent:
             )
         except OSError as error:  # the trace dir could not be written; the runner never ran
             outcome = ProcessOutcome(b"", b"", None, False, error)
+        # Token counts from the runner's trace; dollars are the gateway ledger's (module doc).
         return interpret_runner(
-            trace_dir, outcome, model=self.model, prices=self.prices, wall_clock_s=time.monotonic() - started
+            trace_dir, outcome, model=self.model, prices=UNPRICED, wall_clock_s=time.monotonic() - started
         )
 
     def run_spec(self, task: Task, workdir: Path, trace_dir: Path) -> dict[str, Any]:
-        """Everything the runner needs, explicitly. Never holds the API key (that goes on stdin)."""
+        """Everything the runner needs, explicitly. Never holds the endpoint's token (that goes on stdin)."""
         note = WORKDIR_NOTE_FILE.read_text(encoding="utf-8").strip().replace("{workdir}", str(workdir))
         system_prompt = f"{self.system_prompt.rstrip()}\n\n{note}" if self.system_prompt else note
         return {

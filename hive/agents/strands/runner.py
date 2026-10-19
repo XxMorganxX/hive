@@ -1,8 +1,9 @@
 """HIVE's Strands runner: one trial, run inside the Strands venv (.venvs/strands).
 
 hive/agents/strands/adapter.py starts it as `python -I runner.py <trace_dir>/run_spec.json`,
-with the trial workdir as the working directory and the provider credential as one JSON line
-on stdin, {"credentials": {"OPENAI_API_KEY": "..."}}. It imports only the standard library,
+with the trial workdir as the working directory and the model endpoint as one JSON line on
+stdin, {"endpoint": {"base_url": "...", "api_key": "<per-trial token>"}} or {"endpoint": null}.
+It imports only the standard library,
 strands and openai, never hive: it runs under the framework's interpreter, where hive is not
 installed, and candidate code must never share a process with the controller. What it owes
 the controller is the runner protocol (hive/agents/runner_protocol.py):
@@ -20,23 +21,29 @@ always writes result.json, unless it is killed (or run_spec.json, which names re
 unreadable). The "extensions" key is written only once the load phase has run, so a failure
 before it is never mistaken for every extension failing to load.
 
-The credential. The runner reads stdin to EOF first thing, before any candidate code is
-imported, then points fd 0 at /dev/null. The key goes to the OpenAI client's constructor and
-never into os.environ, and every shell and python_repl command runs under `env -i` with only
-SHELL_ENV_VARIABLES, so neither a child process nor `ps eww` of the runner shows it. Extension
-code shares this process, so it could still dig the key out of the client object: this keeps
-the key out of the trial's evidence, it is not a boundary.
+The endpoint. For the openai provider every model request goes to the controller's model
+gateway (hive/gateway): the OpenAI client is built with the endpoint's base_url and its
+per-trial token as api_key, and never sees the provider's real key, which stays in the
+controller. The gateway enforces the frozen model and effort (P3) and bills each call (P12);
+an openai run without an endpoint fails as provider_error rather than look for a key. The
+runner reads stdin to EOF first thing, before any candidate code is imported, then points fd 0
+at /dev/null. The token goes to the client's constructor and never into os.environ, and every
+shell and python_repl command runs under `env -i` with only SHELL_ENV_VARIABLES, so neither a
+child process nor `ps eww` of the runner shows it. Extension code shares this process and
+could dig the token out of the client object, but the token only reaches the gateway, which
+polices and bills whatever is sent with it, and it is revoked when the trial ends.
 
 Tools. Tool names are unique: an extension tool named like a vended tool or another
 extension's tool is harness_load_error, never a silent replacement. Once the agent is built its
 tool set is fixed, so a tool registered (or replaced) during the run is refused, and the run
 ends as extension_error.
 
-Model integrity (P3). Strands builds a BedrockModel whenever no model is given, and merely
-constructing one probes AWS, so BedrockModel is disabled outright. The OpenAI provider never
-reports which model answered (it ignores chunk.model), so the OpenAI client is wrapped to
-record it. Extensions run in this process and can replace agent.model, so a guard hook checks
-the model object and its config around every model call. This is detection, not a sandbox.
+Model integrity (P3). The gateway is the boundary; what follows is the in-process second line,
+detection rather than a sandbox. Strands builds a BedrockModel whenever no model is given, and
+merely constructing one probes AWS, so BedrockModel is disabled outright. The OpenAI provider
+never reports which model answered (it ignores chunk.model), so the OpenAI client is wrapped to
+record it, with its usage, in trace.jsonl. Extensions run in this process and can replace
+agent.model, so a guard hook checks the model object and its config around every model call.
 
 Extensions. Each extensions/<name>.py defines `extension()` returning a strands Plugin named
 <name>. Every hook callback an extension registers (via @hook, agent.add_hook or a
@@ -81,7 +88,6 @@ from typing import Any  # noqa: E402
 TEXT_LIMIT = 4000  # characters of a tool input, tool result or message kept in a trace line
 ERROR_TEXT_LIMIT = 2000
 COMPLETED_STOP_REASONS = ("end_turn", "stop_sequence")
-CREDENTIAL = {"openai": "OPENAI_API_KEY"}
 # The whole environment of every shell command. HIVE_TRIAL_ID is the process helper's trial
 # marker (hive/agents/process.py): a command that daemonizes is still found and killed by it.
 SHELL_ENV_VARIABLES = ("PATH", "HOME", "LANG", "HIVE_TRIAL_ID")
@@ -444,24 +450,30 @@ def read_stdin() -> str:
     return text
 
 
-def parse_credentials(text: str) -> dict[str, str]:
-    """{"credentials": {NAME: value}} from stdin; empty input means no credentials."""
+ENDPOINT_FIELDS = ("base_url", "api_key")
+
+
+def parse_endpoint(text: str) -> dict[str, str] | None:
+    """{"endpoint": {"base_url", "api_key"}} or {"endpoint": null} from stdin; empty input is no endpoint."""
     if not text.strip():
-        return {}
+        return None
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         data = None
-    credentials = data.get("credentials") if isinstance(data, dict) else None
-    if not isinstance(credentials, dict) or not all(
-        isinstance(name, str) and isinstance(value, str) for name, value in credentials.items()
-    ):
-        # Never echo the input: it may hold a key.
-        raise RunnerError("agent_error", 'the runner\'s stdin must be one JSON line {"credentials": {NAME: value}}')
-    return credentials
+    if isinstance(data, dict) and set(data) == {"endpoint"}:
+        endpoint = data["endpoint"]
+        if endpoint is None:
+            return None
+        if (isinstance(endpoint, dict) and set(endpoint) == set(ENDPOINT_FIELDS)
+                and all(isinstance(endpoint[name], str) and endpoint[name] for name in ENDPOINT_FIELDS)):  # fmt: skip
+            return dict(endpoint)
+    # Never echo the input: it holds a token.
+    raise RunnerError("agent_error", 'the runner\'s stdin must be one JSON line {"endpoint": {"base_url": ..., '
+                                     '"api_key": ...}} or {"endpoint": null}')  # fmt: skip
 
 
-def make_model(spec: dict[str, Any], trace: Trace, credentials: dict[str, str]) -> Any:
+def make_model(spec: dict[str, Any], trace: Trace, endpoint: dict[str, str] | None) -> Any:
     config = spec["model"]
     if config["provider"] == "scripted":
         return make_scripted_model(json.loads(Path(spec["script_file"]).read_text(encoding="utf-8")), config["id"], trace)
@@ -469,12 +481,15 @@ def make_model(spec: dict[str, Any], trace: Trace, credentials: dict[str, str]) 
         import openai
         from strands.models.openai import OpenAIModel
 
-        key = credentials.get(CREDENTIAL["openai"])
-        if not key:
-            raise RunnerError("provider_error", f"{CREDENTIAL['openai']} was not given; the openai provider needs it")
-        # The key is passed explicitly, never through os.environ, which every child would inherit.
+        if endpoint is None:
+            raise RunnerError("provider_error", "no model endpoint was given; the openai provider only talks to "
+                                                "HIVE's model gateway, never to the provider with a key of its own")  # fmt: skip
+        # Both are passed explicitly, never through os.environ, which every child would inherit
+        # (and which the client would otherwise read OPENAI_API_KEY / OPENAI_BASE_URL from).
         # max_retries=0: HIVE's retry strategy is the only retry layer, so attempts don't multiply.
-        client = RecordingOpenAIClient(openai.AsyncOpenAI(api_key=key, max_retries=0), trace)
+        client = RecordingOpenAIClient(
+            openai.AsyncOpenAI(base_url=endpoint["base_url"], api_key=endpoint["api_key"], max_retries=0), trace
+        )
         params = {"reasoning_effort": config["reasoning_effort"]} if config.get("reasoning_effort") else {}
         return OpenAIModel(client=client, model_id=config["id"], params=params)
     raise RunnerError("agent_error", f"unknown model provider {config['provider']!r}")
@@ -871,15 +886,15 @@ def run(spec: dict[str, Any], trace: Trace, records: list[ExtensionRecord], outc
         state: dict[str, Any], stdin_text: str) -> None:  # fmt: skip
     attribution = Attribution(records, trace)
     state["attribution"] = attribution
-    credentials = parse_credentials(stdin_text)
+    endpoint = parse_endpoint(stdin_text)
     install_guards(attribution)
 
     from strands import Agent
     from strands.agent.conversation_manager import SlidingWindowConversationManager
 
-    # The model is built before any candidate code runs, so a missing key fails before the load phase.
-    model = make_model(spec, trace, credentials)
-    del credentials
+    # The model is built before any candidate code runs, so a missing endpoint fails before the load phase.
+    model = make_model(spec, trace, endpoint)
+    del endpoint
 
     # Load phase: anything failing here means the candidate did not run as written.
     for index, record in enumerate(records):

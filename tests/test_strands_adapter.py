@@ -19,16 +19,19 @@ import hive.agents.strands.adapter as strands_adapter
 from hive.agents.strands import StrandsAdapter
 from hive.agents.strands.adapter import RUNNER, StrandsAgent, StrandsVersionMismatch, check_strands_version
 from hive.candidate import Candidate
-from hive.contracts import LIFECYCLE_POINTS, Agent, AgentAdapter, ExtensionSpec, ModelSpec, Task
+from hive.contracts import LIFECYCLE_POINTS, Agent, AgentAdapter, ExtensionSpec, ModelEndpoint, ModelSpec, Task
 from hive.extensions import render_extension_guide
 
 FAKE_PYTHON = Path(__file__).parent / "fakes" / "strands_fake_python.py"
 MODEL = ModelSpec(provider="openai", id="gpt-5-nano", thinking="low")
 TASK = Task(id="t1", split="search", instruction="What is 6 * 7? End with ANSWER: <x>.")
-PRICES = {"input": 0.05, "output": 0.40, "cache_read": 0.005}
 # Variables a shell or the interpreter adds on its own, not the adapter.
 INTERPRETER_NOISE = {"PWD", "SHLVL", "_", "OLDPWD", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+# The controller's provider key (a placeholder), which must never reach a trial.
 FAKE_KEY = "sk-test-not-a-real-key"
+# What the controller passes for every real provider: the model gateway and a per-trial token.
+# Nothing listens on it; the fake interpreter only records what it was given.
+ENDPOINT = ModelEndpoint(base_url="http://127.0.0.1:9/v1", api_key="trial-token-placeholder-0123456789")
 
 
 @pytest.fixture(autouse=True)
@@ -97,20 +100,21 @@ def fake_python(tmp_path):
 
 
 def settings(python_path: Path, **overrides) -> dict:
-    return {"python_path": str(python_path), "strands_version": "1.61.1", "prices": PRICES, "timeout_s": 30,
-            **overrides}  # fmt: skip
+    return {"python_path": str(python_path), "strands_version": "1.61.1", "timeout_s": 30, **overrides}
 
 
 def build_agent(candidate: Candidate, python_path: Path, model: ModelSpec = MODEL, **overrides) -> StrandsAgent:
     return StrandsAdapter().build(candidate, model, settings(python_path, **overrides))
 
 
-def run(agent: StrandsAgent, tmp_path: Path, task: Task = TASK):
+def run(agent: StrandsAgent, tmp_path: Path, task: Task = TASK, endpoint: ModelEndpoint | None = ENDPOINT):
+    """One trial, called the way the controller calls it: endpoint as a keyword, only when there is one."""
     workdir = tmp_path / "work"
     workdir.mkdir(exist_ok=True)
     trace_dir = tmp_path / "trace"
     trace_dir.mkdir(exist_ok=True)
-    return agent.run(task, workdir, trace_dir), workdir, trace_dir
+    extra = {"endpoint": endpoint} if endpoint is not None else {}
+    return agent.run(task, workdir, trace_dir, **extra), workdir, trace_dir
 
 
 def record(trace_dir: Path) -> dict:
@@ -350,19 +354,22 @@ def test_build_rejects_unknown_settings(tmp_path, fake_python):
 
 def test_build_requires_python_path(tmp_path):
     with pytest.raises(ValueError, match="python_path"):
-        StrandsAdapter().build(write_candidate(tmp_path / "c"), MODEL, {"strands_version": "1.61.1", "prices": PRICES})
+        StrandsAdapter().build(write_candidate(tmp_path / "c"), MODEL, {"strands_version": "1.61.1"})
 
 
 def test_build_requires_a_strands_version_pin(tmp_path, fake_python):
     with pytest.raises(ValueError, match="strands_version"):
-        StrandsAdapter().build(write_candidate(tmp_path / "c"), MODEL, {"python_path": str(fake_python()), "prices": PRICES})
+        StrandsAdapter().build(write_candidate(tmp_path / "c"), MODEL, {"python_path": str(fake_python())})
 
 
-def test_build_requires_prices(tmp_path, fake_python):
-    with pytest.raises(ValueError, match="prices"):
-        StrandsAdapter().build(
-            write_candidate(tmp_path / "c"), MODEL, {"python_path": str(fake_python()), "strands_version": "1.61.1"}
-        )
+def test_build_needs_no_prices(tmp_path, fake_python):
+    StrandsAdapter().build(write_candidate(tmp_path / "c"), MODEL,
+                           {"python_path": str(fake_python()), "strands_version": "1.61.1"})  # fmt: skip
+
+
+def test_build_rejects_the_retired_prices_setting_and_says_where_prices_live(tmp_path, fake_python):
+    with pytest.raises(ValueError, match=r"prices.*\[model\] prices"):
+        build_agent(write_candidate(tmp_path / "c"), fake_python(), prices={"input": 0.05, "output": 0.40})
 
 
 @pytest.mark.parametrize("key, value", [("timeout_s", 0), ("timeout_s", True), ("term_grace_s", -1),
@@ -447,20 +454,53 @@ def test_environment_holds_only_what_the_run_needs(tmp_path, fake_python, monkey
     assert set(env) - INTERPRETER_NOISE <= allowed
 
 
-def test_the_api_key_is_never_in_the_runners_environment(tmp_path, fake_python):
+def test_home_is_a_fresh_dir_under_the_trace_dir_not_the_controllers(tmp_path, fake_python, monkeypatch):
+    controller_home = tmp_path / "controller-home"
+    controller_home.mkdir()
+    monkeypatch.setenv("HOME", str(controller_home))
+    _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
+    home = Path(record(trace_dir)["env"]["HOME"])
+    assert home == trace_dir.resolve() / "home"
+    assert home.is_dir()
+
+
+def test_the_version_check_does_not_get_the_controllers_home(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs["env"])
+        return strands_adapter.subprocess.CompletedProcess(argv, 0, "1.61.1\n", "")
+
+    monkeypatch.setenv("HOME", str(tmp_path / "controller-home"))
+    monkeypatch.setattr(strands_adapter.subprocess, "run", fake_run)
+    check_strands_version("python", "1.61.1")
+    assert seen.get("HOME") != str(tmp_path / "controller-home")
+
+
+def test_the_providers_key_is_never_in_the_runners_environment(tmp_path, fake_python):
     _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
     assert record(trace_dir)["env_has_openai_key"] is False
 
 
-def test_the_openai_key_goes_to_the_runner_on_stdin(tmp_path, fake_python):
+def test_the_endpoint_goes_to_the_runner_on_stdin(tmp_path, fake_python):
     _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
-    assert record(trace_dir)["stdin_credentials"] == {"OPENAI_API_KEY": fingerprint(FAKE_KEY)}
+    stdin = record(trace_dir)["stdin"]
+    assert stdin["keys"] == ["endpoint"]
+    assert stdin["endpoint"] == {"base_url": ENDPOINT.base_url, "api_key": fingerprint(ENDPOINT.api_key)}
 
 
-def test_a_missing_key_sends_no_credentials(tmp_path, fake_python, monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY")
+def test_the_controllers_provider_key_is_never_sent_to_the_runner(tmp_path, fake_python):
+    # OPENAI_API_KEY is set in the controller (the autouse fixture): only the gateway may use it.
     _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
-    assert record(trace_dir)["stdin_credentials"] == {}
+    assert fingerprint(FAKE_KEY) not in record(trace_dir)["stdin"]["string_fingerprints"]
+
+
+def test_without_an_endpoint_the_runner_gets_none_and_still_no_key(tmp_path, fake_python):
+    _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path, endpoint=None)
+    stdin = record(trace_dir)["stdin"]
+    assert stdin["keys"] == ["endpoint"]
+    assert stdin["endpoint"] is None
+    assert fingerprint(FAKE_KEY) not in stdin["string_fingerprints"]
 
 
 def test_environment_blocks_aws_credential_discovery(tmp_path, fake_python):
@@ -471,25 +511,28 @@ def test_environment_blocks_aws_credential_discovery(tmp_path, fake_python):
     assert env["AWS_SHARED_CREDENTIALS_FILE"] == os.devnull
 
 
-def test_the_scripted_provider_gets_no_api_key(tmp_path, fake_python):
+def test_the_scripted_provider_gets_no_endpoint_and_no_key(tmp_path, fake_python):
     script = tmp_path / "script.json"
     script.write_text("{}")
     agent = build_agent(write_candidate(tmp_path / "c"), fake_python(), model=ModelSpec(provider="scripted", id="s"),
                         script_file=str(script))  # fmt: skip
-    _, _, trace_dir = run(agent, tmp_path)
+    _, _, trace_dir = run(agent, tmp_path, endpoint=None)
     assert record(trace_dir)["env_has_openai_key"] is False
-    assert record(trace_dir)["stdin_credentials"] == {}
+    assert record(trace_dir)["stdin"]["endpoint"] is None
+    assert fingerprint(FAKE_KEY) not in record(trace_dir)["stdin"]["string_fingerprints"]
 
 
-def test_the_api_key_never_reaches_argv_or_the_run_spec(tmp_path, fake_python):
+@pytest.mark.parametrize("secret", [FAKE_KEY, ENDPOINT.api_key], ids=["provider_key", "trial_token"])
+def test_no_secret_reaches_argv_or_the_run_spec(tmp_path, fake_python, secret):
     _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
-    assert FAKE_KEY not in json.dumps(record(trace_dir)["argv"])
-    assert FAKE_KEY not in (trace_dir / "run_spec.json").read_text()
+    assert secret not in json.dumps(record(trace_dir)["argv"])
+    assert secret not in (trace_dir / "run_spec.json").read_text()
 
 
-def test_the_api_key_is_written_nowhere_under_the_trace_dir(tmp_path, fake_python):
+@pytest.mark.parametrize("secret", [FAKE_KEY, ENDPOINT.api_key], ids=["provider_key", "trial_token"])
+def test_no_secret_is_written_anywhere_under_the_trace_dir(tmp_path, fake_python, secret):
     _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
-    leaked = [path.name for path in trace_dir.rglob("*") if path.is_file() and FAKE_KEY in path.read_text(errors="replace")]
+    leaked = [path.name for path in trace_dir.rglob("*") if path.is_file() and secret in path.read_text(errors="replace")]
     assert leaked == []
 
 
@@ -549,14 +592,18 @@ def test_run_spec_carries_limits(tmp_path, fake_python):
 # --- classification through the runner protocol ----------------------------------------
 
 
-def test_completed_run_reports_text_and_priced_usage(tmp_path, fake_python):
+def test_completed_run_reports_text_and_the_traced_token_counts(tmp_path, fake_python):
     result, _, _ = run(build_agent(write_candidate(tmp_path / "c"), fake_python("completed")), tmp_path)
     assert result.status == "completed"
     assert result.final_text == "ANSWER: 42"
     assert result.usage.input_tokens == 300
     assert result.usage.output_tokens == 60
     assert result.usage.cache_read_tokens == 30
-    assert result.usage.cost_usd == pytest.approx((300 * 0.05 + 60 * 0.40 + 30 * 0.005) / 1e6)
+
+
+def test_the_adapter_prices_nothing_because_the_gateway_ledger_bills_the_run(tmp_path, fake_python):
+    result, _, _ = run(build_agent(write_candidate(tmp_path / "c"), fake_python("completed")), tmp_path)
+    assert result.usage.cost_usd == 0.0
 
 
 def test_completed_run_carries_the_load_report(tmp_path, fake_python):
