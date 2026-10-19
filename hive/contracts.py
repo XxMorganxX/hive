@@ -39,6 +39,7 @@ AGENT_ERROR_CLASSES = (
     "quota",  # rate limit, usage cap or billing failure
     "harness_load_error",  # the candidate's own files failed to load (e.g. a broken extension)
     "model_mismatch",  # the run used a different model than the experiment fixed (P3)
+    "extension_error",  # a candidate extension loaded but threw while the run was going
 )
 
 
@@ -93,6 +94,78 @@ class Usage:
         )
 
 
+# --- extensions ---------------------------------------------------------------------------
+#
+# Extensions are candidate code that hooks the agent loop: Pi extensions (TypeScript), Deep
+# Agents middleware and Strands hooks (Python). They are a primary lever for harness
+# evolution, so the contract makes them first-class without pretending they are portable:
+# the code stays native to each framework, while the shape around it is shared:
+#   - every candidate keeps its extensions in EXTENSIONS_DIR;
+#   - every adapter declares how its extensions are written (ExtensionSpec), including a
+#     catalog of neutral lifecycle points mapped onto its native API, for the overseer (P11);
+#   - every run reports which extension files actually loaded (LoadReport), and the
+#     controller, not the adapter, fails a trial whose extensions did not all load (P8).
+
+EXTENSIONS_DIR = "extensions"
+
+# Neutral names for where an extension can hook in. Fixed here so overseer history, rationales
+# and analysis use the same words across frameworks; each adapter says how it supports each.
+LIFECYCLE_POINTS = (
+    "before_run",  # once, before the first model call
+    "system_prompt",  # read or rewrite the system prompt
+    "before_model_call",  # edit the context/messages for the next model call
+    "after_model_call",  # inspect a model response, or ask for a retry
+    "wrap_model_call",  # replace or route the model call itself
+    "before_tool_call",  # gate a tool call, rewrite its arguments or cancel it
+    "after_tool_call",  # rewrite a tool result
+    "register_tool",  # add a new tool
+    "compaction",  # control how the context is summarized when it grows too long
+    "after_run",  # inspect the end of the run, or continue it
+)
+
+Support = Literal["supported", "partial", "unsupported"]
+
+
+@dataclass(frozen=True)
+class LifecyclePoint:
+    id: str  # one of LIFECYCLE_POINTS
+    support: Support
+    native_api: str  # the framework's exact name for it, e.g. 'pi.on("tool_call")'
+    can_modify: str  # what a handler can change here
+    caveats: str = ""
+
+
+@dataclass(frozen=True)
+class ExtensionSpec:
+    """How extensions are written for one framework. Declared by its agent adapter."""
+
+    language: str  # "typescript" | "python"
+    suffixes: tuple[str, ...]  # files in the candidate's extensions/ directory that are extensions
+    entry_convention: str  # what each extension file must define or export
+    framework_version: str  # the pinned version this spec was checked against (P13)
+    lifecycle: tuple[LifecyclePoint, ...]
+    forbidden: tuple[str, ...] = ()  # native APIs an extension must not use, e.g. switching the model (P3)
+    # The pinned API definitions themselves (e.g. the framework's extension type declarations),
+    # as text: the overseer works in a sandbox that can't read the installed framework.
+    api_reference: str = ""
+
+
+@dataclass(frozen=True)
+class ExtensionLoad:
+    path: str  # relative to the candidate root, e.g. "extensions/guard.ts"
+    loaded: bool
+    error: str | None = None
+    registered: tuple[str, ...] = ()  # what it hooked: lifecycle point ids and "tool:<name>" entries
+
+
+@dataclass(frozen=True)
+class LoadReport:
+    """What a run actually loaded. Required whenever the candidate has extension files."""
+
+    extensions: tuple[ExtensionLoad, ...] = ()
+    runtime_errors: tuple[str, ...] = ()  # extension code that threw during the run, with its path when known
+
+
 @dataclass(frozen=True)
 class AgentResult:
     """What an agent run produced. `completed` means the run finished, not that it was correct."""
@@ -103,6 +176,7 @@ class AgentResult:
     wall_clock_s: float
     error: str | None = None
     error_class: str | None = None  # one of AGENT_ERROR_CLASSES when status == "errored"
+    load_report: LoadReport | None = None  # required when the candidate has extension files
 
 
 @runtime_checkable
@@ -138,6 +212,10 @@ class AgentAdapter(Protocol):
 
     def describe_valves(self) -> str:
         """Markdown listing every valve the overseer may edit, and how. Given to the overseer verbatim."""
+        ...
+
+    def extension_spec(self) -> ExtensionSpec | None:
+        """How this framework's extensions are written, or None if it has none."""
         ...
 
 
@@ -194,6 +272,9 @@ class OverseerBrief:
     # Where the evidence was recorded. Native traces name absolute paths under it; an overseer
     # maps those onto evidence_dir so its own workspace never names the run directory (P7).
     evidence_origin: Path | None = None
+    # How to write extensions for this candidate's framework, rendered by the controller from the
+    # adapter's ExtensionSpec so it reads the same for every framework; "" if it has none.
+    extension_guide: str = ""
 
 
 @dataclass(frozen=True)
