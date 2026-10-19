@@ -1,7 +1,8 @@
 """HIVE's Strands runner: one trial, run inside the Strands venv (.venvs/strands).
 
 hive/agents/strands/adapter.py starts it as `python -I runner.py <trace_dir>/run_spec.json`,
-with the trial workdir as the working directory. It imports only the standard library,
+with the trial workdir as the working directory and the provider credential as one JSON line
+on stdin, {"credentials": {"OPENAI_API_KEY": "..."}}. It imports only the standard library,
 strands and openai, never hive: it runs under the framework's interpreter, where hive is not
 installed, and candidate code must never share a process with the controller. What it owes
 the controller is the runner protocol (hive/agents/runner_protocol.py):
@@ -14,7 +15,22 @@ the controller is the runner protocol (hive/agents/runner_protocol.py):
 - child_pgids.txt: the process group of every shell the tools start, which Strands puts in
   sessions of its own; the controller kills them when the trial ends.
 
-It catches everything and always writes result.json, unless it is killed.
+It catches everything, SystemExit and other BaseExceptions from extension code included, and
+always writes result.json, unless it is killed (or run_spec.json, which names result.json, is
+unreadable). The "extensions" key is written only once the load phase has run, so a failure
+before it is never mistaken for every extension failing to load.
+
+The credential. The runner reads stdin to EOF first thing, before any candidate code is
+imported, then points fd 0 at /dev/null. The key goes to the OpenAI client's constructor and
+never into os.environ, and every shell and python_repl command runs under `env -i` with only
+SHELL_ENV_VARIABLES, so neither a child process nor `ps eww` of the runner shows it. Extension
+code shares this process, so it could still dig the key out of the client object: this keeps
+the key out of the trial's evidence, it is not a boundary.
+
+Tools. Tool names are unique: an extension tool named like a vended tool or another
+extension's tool is harness_load_error, never a silent replacement. Once the agent is built its
+tool set is fixed, so a tool registered (or replaced) during the run is refused, and the run
+ends as extension_error.
 
 Model integrity (P3). Strands builds a BedrockModel whenever no model is given, and merely
 constructing one probes AWS, so BedrockModel is disabled outright. The OpenAI provider never
@@ -46,6 +62,7 @@ import sys
 # -I ignores PYTHONDONTWRITEBYTECODE, so say it here before anything is imported.
 sys.dont_write_bytecode = True
 
+import asyncio  # noqa: E402
 import functools  # noqa: E402
 import importlib.util  # noqa: E402
 import inspect  # noqa: E402
@@ -65,6 +82,9 @@ TEXT_LIMIT = 4000  # characters of a tool input, tool result or message kept in 
 ERROR_TEXT_LIMIT = 2000
 COMPLETED_STOP_REASONS = ("end_turn", "stop_sequence")
 CREDENTIAL = {"openai": "OPENAI_API_KEY"}
+# The whole environment of every shell command. HIVE_TRIAL_ID is the process helper's trial
+# marker (hive/agents/process.py): a command that daemonizes is still found and killed by it.
+SHELL_ENV_VARIABLES = ("PATH", "HOME", "LANG", "HIVE_TRIAL_ID")
 
 # The neutral lifecycle ids (hive.contracts.LIFECYCLE_POINTS, copied: this file can't import
 # hive), in the contract's order, and the Strands events that hook each one.
@@ -100,6 +120,14 @@ class ModelSwitched(RuntimeError):
 
 class ScriptExhausted(RuntimeError):
     """The scripted model was asked for more turns than the script holds."""
+
+
+class ToolRefused(RuntimeError):
+    """HIVE refused a tool registration: a name already taken, or a tool added during the run."""
+
+    def __init__(self, message: str, record: ExtensionRecord | None = None):
+        super().__init__(message)
+        self.record = record  # the extension to blame, when one is known
 
 
 # --- trace -----------------------------------------------------------------------------------
@@ -174,7 +202,13 @@ class Attribution:
         self.trace = trace
         self.current: ExtensionRecord | None = None
         self.runtime_errors: list[str] = []
+        self.recorded: list[BaseException] = []  # each throw once, however many wrappers it passes
         self.by_file = {os.path.realpath(record.file): record for record in records}
+        # (id(registry), tool name) -> the extension that registered it, per registry, so a
+        # sub-agent's own registry never clashes with the agent's.
+        self.tool_owners: dict[tuple[int, str], ExtensionRecord] = {}
+        self.agent_registry: Any = None  # the built agent's ToolRegistry; set once the tools are fixed
+        self.allowed_tools: set[str] = set()
 
     def owner_of(self, callback: Any) -> ExtensionRecord | None:
         if self.current is not None:
@@ -182,21 +216,43 @@ class Attribution:
         return self.by_file.get(os.path.realpath(code_file(callback) or ""))
 
     def record_throw(self, record: ExtensionRecord, where: str, error: BaseException) -> None:
+        if any(error is seen for seen in self.recorded):
+            return
+        self.recorded.append(error)
         message = f"{record.path}: {where} raised {describe(error)}"
         if message not in self.runtime_errors:
             self.runtime_errors.append(message)
             self.trace.write("extension_error", path=record.path, where=where, error=describe(error),
                              traceback=clip("".join(traceback.format_exception(error)), ERROR_TEXT_LIMIT))  # fmt: skip
 
-    def file_on_stack(self, errors: list[BaseException]) -> ExtensionRecord | None:
-        """The extension whose code was running when one of these errors was raised, if any."""
+    def file_on_stack(self, errors: list[BaseException]) -> tuple[ExtensionRecord, BaseException] | None:
+        """The first of these errors (outermost first) whose traceback runs through extension code,
+        with that extension: the extension's own error, not whatever it was handling."""
         for error in errors:
-            frames = traceback.extract_tb(error.__traceback__)
-            for frame in reversed(frames):
+            for frame in reversed(traceback.extract_tb(error.__traceback__)):
                 record = self.by_file.get(os.path.realpath(frame.filename))
                 if record is not None:
-                    return record
+                    return record, error
         return None
+
+    def extension_running_now(self) -> ExtensionRecord | None:
+        for frame in reversed(traceback.extract_stack()):
+            record = self.by_file.get(os.path.realpath(frame.filename))
+            if record is not None:
+                return record
+        return None
+
+    def refuse_run_time_tool(self, name: str) -> None:
+        """Raise ToolRefused for a tool added to the built agent; record it against the extension."""
+        reason = (f"would replace the tool already named {name!r}" if name in self.allowed_tools
+                  else f"is not in the tools valve {sorted(self.allowed_tools)}")  # fmt: skip
+        record = self.extension_running_now()
+        error = ToolRefused(f"tool {name!r} was registered during the run and {reason}; the tools are fixed "
+                            "once the agent is built", record)  # fmt: skip
+        self.trace.write("tool_refused", name=name, path=record.path if record else None, reason=reason)
+        if record is not None:
+            self.record_throw(record, "registering a tool during the run", error)
+        raise error
 
 
 def code_file(callback: Any) -> str | None:
@@ -244,6 +300,8 @@ def install_guards(attribution: Attribution) -> None:
         where = f"{'/'.join(names)} hook {getattr(callback, '__qualname__', repr(callback))}"
 
         # Wrapped with functools.wraps, so Strands' own type-hint inference still sees the original.
+        # BaseException, not Exception: a CancelledError, SystemExit or bare BaseException from a
+        # hook is still the extension failing, and Strands' tool executor would swallow it unseen.
         if inspect.iscoroutinefunction(callback):
 
             @functools.wraps(callback)
@@ -252,8 +310,12 @@ def install_guards(attribution: Attribution) -> None:
                     return await callback(event)
                 except InterruptException:
                     raise  # Strands' human-in-the-loop control flow, not a failure
-                except Exception as error:
-                    attribution.record_throw(record, where, error)
+                except BaseException as error:  # noqa: BLE001 - recorded, then re-raised unchanged
+                    task = asyncio.current_task()
+                    # A CancelledError while the task is being cancelled is Strands stopping the
+                    # hook, not the hook failing; one raised by the hook itself is its own.
+                    if not (isinstance(error, asyncio.CancelledError) and task is not None and task.cancelling()):
+                        attribution.record_throw(record, where, error)
                     raise
         else:
 
@@ -263,7 +325,7 @@ def install_guards(attribution: Attribution) -> None:
                     return callback(event)
                 except InterruptException:
                     raise
-                except Exception as error:
+                except BaseException as error:  # noqa: BLE001 - recorded, then re-raised unchanged
                     attribution.record_throw(record, where, error)
                     raise
 
@@ -271,14 +333,38 @@ def install_guards(attribution: Attribution) -> None:
 
     HookRegistry.add_callback = add_callback
 
+    # Strands lets a @tool silently replace a same-named tool (it supports hot reload), and lets
+    # a hook register tools mid-run. HIVE allows neither: names are unique, and the built
+    # agent's tools are fixed, so the tools valve and the load report stay true.
     original_register_tool = ToolRegistry.register_tool
+    original_replace = ToolRegistry.replace
 
     def register_tool(self: Any, tool: Any) -> None:
+        name = tool.tool_name
+        if self is attribution.agent_registry:
+            attribution.refuse_run_time_tool(name)
+        record = attribution.current
+        owner = attribution.tool_owners.get((id(self), name))
+        if name in self.registry and (record is not None or owner is not None):
+            holder = owner.path if owner is not None else "a vended tool"
+            raise ToolRefused(f"the tool name {name!r} is already taken by {holder}; tool names must be unique "
+                              "across the vended tools and every extension", record or owner)  # fmt: skip
         original_register_tool(self, tool)
-        if attribution.current is not None:
-            attribution.current.tools.append(tool.tool_name)
+        if record is not None:
+            record.tools.append(name)
+            attribution.tool_owners[(id(self), name)] = record
+
+    def replace(self: Any, new_tool: Any) -> None:
+        name = new_tool.tool_name
+        if self is attribution.agent_registry:
+            attribution.refuse_run_time_tool(name)
+        record = attribution.current
+        if record is not None and attribution.tool_owners.get((id(self), name)) is not record:
+            raise ToolRefused(f"{record.path} may not replace the tool {name!r}; register a tool of its own name", record)
+        original_replace(self, new_tool)
 
     ToolRegistry.register_tool = register_tool
+    ToolRegistry.replace = replace
 
 
 # --- loading ---------------------------------------------------------------------------------
@@ -346,7 +432,36 @@ def end_of_extensions_plugin() -> Any:
 # --- models ----------------------------------------------------------------------------------
 
 
-def make_model(spec: dict[str, Any], trace: Trace) -> Any:
+def read_stdin() -> str:
+    """The adapter's input, read to EOF. fd 0 is then /dev/null, so no child inherits the pipe."""
+    try:
+        text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):  # no stdin at all, or it was already closed
+        text = ""
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    return text
+
+
+def parse_credentials(text: str) -> dict[str, str]:
+    """{"credentials": {NAME: value}} from stdin; empty input means no credentials."""
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
+    credentials = data.get("credentials") if isinstance(data, dict) else None
+    if not isinstance(credentials, dict) or not all(
+        isinstance(name, str) and isinstance(value, str) for name, value in credentials.items()
+    ):
+        # Never echo the input: it may hold a key.
+        raise RunnerError("agent_error", 'the runner\'s stdin must be one JSON line {"credentials": {NAME: value}}')
+    return credentials
+
+
+def make_model(spec: dict[str, Any], trace: Trace, credentials: dict[str, str]) -> Any:
     config = spec["model"]
     if config["provider"] == "scripted":
         return make_scripted_model(json.loads(Path(spec["script_file"]).read_text(encoding="utf-8")), config["id"], trace)
@@ -354,10 +469,12 @@ def make_model(spec: dict[str, Any], trace: Trace) -> Any:
         import openai
         from strands.models.openai import OpenAIModel
 
-        if not os.environ.get(CREDENTIAL["openai"]):
-            raise RunnerError("provider_error", f"{CREDENTIAL['openai']} is not set; the openai provider needs it")
+        key = credentials.get(CREDENTIAL["openai"])
+        if not key:
+            raise RunnerError("provider_error", f"{CREDENTIAL['openai']} was not given; the openai provider needs it")
+        # The key is passed explicitly, never through os.environ, which every child would inherit.
         # max_retries=0: HIVE's retry strategy is the only retry layer, so attempts don't multiply.
-        client = RecordingOpenAIClient(openai.AsyncOpenAI(max_retries=0), trace)
+        client = RecordingOpenAIClient(openai.AsyncOpenAI(api_key=key, max_retries=0), trace)
         params = {"reasoning_effort": config["reasoning_effort"]} if config.get("reasoning_effort") else {}
         return OpenAIModel(client=client, model_id=config["id"], params=params)
     raise RunnerError("agent_error", f"unknown model provider {config['provider']!r}")
@@ -525,7 +642,8 @@ def scripted_error(error: dict[str, Any]) -> Exception:
     kind = error.get("kind", "runtime")
     message = error.get("message", f"scripted {kind}")
     request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
-    body = {"message": message, "code": error.get("code")}
+    default_code = "context_length_exceeded" if kind == "context_overflow" else None
+    body = {"message": message, "code": error.get("code", default_code)}
 
     def status(cls: type, code: int) -> Exception:
         return cls(message=message, response=httpx.Response(code, request=request, json={"error": body}), body=body)
@@ -540,7 +658,11 @@ def scripted_error(error: dict[str, Any]) -> Exception:
     if kind == "connection":
         return openai.APIConnectionError(request=request)
     if kind == "context_overflow":
-        return ContextWindowOverflowException(message)
+        # OpenAIModel raises ContextWindowOverflowException(str(error)) from the provider's 400.
+        cause = status(openai.BadRequestError, 400)
+        overflow = ContextWindowOverflowException(str(cause))
+        overflow.__cause__ = cause
+        return overflow
     return RuntimeError(message)
 
 
@@ -626,17 +748,28 @@ def make_hive_hooks(trace: Trace, guard_state: dict[str, Any]) -> Any:
 
 def make_sandbox(pgids_file: Path) -> Any:
     from strands.sandbox.not_a_sandbox_local_environment import NotASandboxLocalEnvironment
+    from strands.sandbox.posix_shell import validate_env_keys
+
+    shell_env = {name: os.environ[name] for name in SHELL_ENV_VARIABLES if name in os.environ}
 
     class PgidRecordingSandbox(NotASandboxLocalEnvironment):
-        """The host sandbox Strands uses by default, plus a record of every shell it starts.
+        """The host sandbox Strands uses by default, plus a record of every shell it starts, and an
+        explicit environment for every command.
 
         Each command runs as `sh -c` in a new session, so the shell's pid ($$) is its process
         group; the shell appends it to child_pgids.txt before running the command. Killing the
         runner's own group never reaches these, so the controller kills each listed group.
+        That shell then execs `env -i <SHELL_ENV_VARIABLES> sh -c <command>` (same pid, so
+        the same group): the command sees only those variables, plus any `env` the tool passes,
+        never the runner's own environment. python_repl comes through here too.
         """
 
-        async def execute_streaming(self, command: str, **kwargs: Any) -> AsyncGenerator[Any, None]:
-            recorded = f"printf '%s\\n' \"$$\" >> {shlex.quote(str(pgids_file))}; {command}"
+        async def execute_streaming(self, command: str, *, env: dict[str, str] | None = None,
+                                    **kwargs: Any) -> AsyncGenerator[Any, None]:  # fmt: skip
+            validate_env_keys(env or {})
+            assignments = " ".join(shlex.quote(f"{name}={value}") for name, value in {**shell_env, **(env or {})}.items())
+            recorded = (f"printf '%s\\n' \"$$\" >> {shlex.quote(str(pgids_file))}; "
+                        f"exec env -i {assignments} sh -c {shlex.quote(command)}")  # fmt: skip
             async for chunk in super().execute_streaming(recorded, **kwargs):
                 yield chunk
 
@@ -689,7 +822,7 @@ def quota_exhausted(error: BaseException) -> bool:
 def classify(error: BaseException, attribution: Attribution, guard_state: dict[str, Any]) -> tuple[str, str]:
     """(error_class, message) for an exception that ended the run, worst breach first."""
     import openai
-    from strands.types.exceptions import EventLoopException, ModelThrottledException
+    from strands.types.exceptions import ContextWindowOverflowException, EventLoopException, ModelThrottledException
 
     chain = exception_chain(error)
     root = next((item for item in reversed(chain) if not isinstance(item, EventLoopException)), error)
@@ -703,8 +836,16 @@ def classify(error: BaseException, attribution: Attribution, guard_state: dict[s
         return "extension_error", "extension code threw during the run: " + "; ".join(attribution.runtime_errors)
     on_stack = attribution.file_on_stack(chain)
     if on_stack is not None:
-        attribution.record_throw(on_stack, "extension code", root)
+        record, own_error = on_stack
+        attribution.record_throw(record, "extension code", own_error)
         return "extension_error", "extension code threw during the run: " + "; ".join(attribution.runtime_errors)
+    # Ahead of the provider check: the real provider chains its 400 to the overflow, but the
+    # conversation outgrowing the context (the conversation_window valve, compaction) is the
+    # agent's doing, not the provider failing. The scripted provider raises the same chain.
+    overflows = [item for item in chain if isinstance(item, ContextWindowOverflowException)]
+    if overflows:
+        detail = describe(overflows[0]) + (f" (from {describe(overflows[-1])})" if len(overflows) > 1 else "")
+        return "agent_error", f"the conversation no longer fits the model's context window: {detail}"
     if any(isinstance(item, ModelThrottledException | openai.RateLimitError) or getattr(item, "status_code", None) == 429
            for item in chain):  # fmt: skip
         detail = " (insufficient_quota: the account is out of credit)" if quota_exhausted(error) else ""
@@ -727,18 +868,24 @@ class Outcome:
 
 
 def run(spec: dict[str, Any], trace: Trace, records: list[ExtensionRecord], outcome: Outcome,
-        state: dict[str, Any]) -> None:  # fmt: skip
+        state: dict[str, Any], stdin_text: str) -> None:  # fmt: skip
     attribution = Attribution(records, trace)
     state["attribution"] = attribution
+    credentials = parse_credentials(stdin_text)
     install_guards(attribution)
 
     from strands import Agent
     from strands.agent.conversation_manager import SlidingWindowConversationManager
 
+    # The model is built before any candidate code runs, so a missing key fails before the load phase.
+    model = make_model(spec, trace, credentials)
+    del credentials
+
     # Load phase: anything failing here means the candidate did not run as written.
     for index, record in enumerate(records):
         load_extension(record, index)
         trace.write("extension_import", path=record.path, loaded=record.loaded, error=record.error)
+    state["load_phase_ran"] = True
     plugins = []
     for record in records:
         if record.loaded:
@@ -748,7 +895,6 @@ def run(spec: dict[str, Any], trace: Trace, records: list[ExtensionRecord], outc
     attach_window(closing, None, attribution)
     plugins.append(closing)
 
-    model = make_model(spec, trace)
     guard_state = state["guard"]
     try:
         skills = load_skills(spec["skills"])
@@ -765,10 +911,13 @@ def run(spec: dict[str, Any], trace: Trace, records: list[ExtensionRecord], outc
             load_tools_from_directory=False,
             sandbox=make_sandbox(Path(spec["child_pgids_file"])),
         )
-    except Exception as error:
+    except BaseException as error:  # noqa: BLE001 - init_agent may raise anything, SystemExit included
+        if isinstance(error, KeyboardInterrupt):
+            raise
         # Building the agent runs every extension's init_agent and registers its hooks and tools,
         # and loads the skills: a failure here is the candidate's files not loading.
-        failed = attribution.current
+        refused = next((item for item in exception_chain(error) if isinstance(item, ToolRefused)), None)
+        failed = attribution.current or (refused.record if refused is not None else None)
         attribution.current = None
         if failed is not None:
             failed.loaded, failed.error, failed.plugin = False, describe(error), None
@@ -783,6 +932,8 @@ def run(spec: dict[str, Any], trace: Trace, records: list[ExtensionRecord], outc
         agent.tool_registry.dynamic_tools.pop(name, None)
     active = set(agent.tool_registry.registry)
     state["active_tools"] = active
+    attribution.allowed_tools = active
+    attribution.agent_registry = agent.tool_registry  # from here on, any registration is refused
     for record in records:
         if record.loaded and type(agent.conversation_manager).__module__ == getattr(record.plugin, "__module__", None):
             record.points.add("compaction")
@@ -831,14 +982,15 @@ def dump_messages(agent: Any, path: Path) -> None:
 def write_result(path: Path, outcome: Outcome, records: list[ExtensionRecord], state: dict[str, Any]) -> None:
     attribution: Attribution | None = state.get("attribution")
     active = state.get("active_tools", set())
-    result = {
+    result: dict[str, Any] = {
         "status": outcome.status,
         "final_text": outcome.final_text,
         "error": outcome.error,
         "error_class": outcome.error_class,
-        "extensions": [record.as_json(active) for record in records],
-        "runtime_errors": list(attribution.runtime_errors) if attribution else [],
     }
+    if state.get("load_phase_ran"):  # absent: the run never reached the point of loading anything
+        result["extensions"] = [record.as_json(active) for record in records]
+    result["runtime_errors"] = list(attribution.runtime_errors) if attribution else []
     # Written to a temporary name and renamed, so a kill mid-write never leaves half a result.
     partial = path.with_name(path.name + ".partial")
     partial.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -846,19 +998,27 @@ def write_result(path: Path, outcome: Outcome, records: list[ExtensionRecord], s
 
 
 def main(argv: list[str]) -> int:
+    stdin_text = read_stdin()  # first thing: before any candidate code can be imported
     spec = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
     trace = Trace(Path(spec["trace_file"]))
     records = [ExtensionRecord(path=entry["path"], file=entry["file"]) for entry in spec["extensions"]]
     outcome = Outcome()
     state: dict[str, Any] = {"guard": {"model": None, "config": None, "problems": []}}
     try:
-        run(spec, trace, records, outcome, state)
-    except Exception as error:
+        run(spec, trace, records, outcome, state, stdin_text)
+    except BaseException as error:  # noqa: BLE001 - extension code may raise anything; the result is still written
         attribution = state.get("attribution") or Attribution(records, trace)
         state["attribution"] = attribution
-        outcome.error_class, outcome.error = classify(error, attribution, state["guard"])
+        try:
+            outcome.error_class, outcome.error = classify(error, attribution, state["guard"])
+        except Exception as classify_error:  # a bug here must not cost the controller its result
+            outcome.error_class = "agent_error"
+            outcome.error = f"{describe(error)} (and classifying it failed: {describe(classify_error)})"
         trace.write("run_error", error_class=outcome.error_class, error=outcome.error,
                     traceback=clip("".join(traceback.format_exception(error)), ERROR_TEXT_LIMIT * 4))  # fmt: skip
+        if isinstance(error, KeyboardInterrupt):
+            write_result(Path(spec["result_file"]), outcome, records, state)
+            raise
     write_result(Path(spec["result_file"]), outcome, records, state)
     return 0
 

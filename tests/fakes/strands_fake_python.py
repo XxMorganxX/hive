@@ -5,9 +5,12 @@ The adapter talks to its venv interpreter in exactly two ways, and this fake ans
 
 - `python -I -c <code>`: the version check. Prints the strands-agents version.
 - `python -I <runner.py> <trace_dir>/run_spec.json`: one trial. Instead of running the real
-  runner, it records how it was invoked (argv, cwd, environment) to
-  `<trace_dir>/fake_record.json`, then plays a canned scenario: it writes trace.jsonl,
+  runner, it records how it was invoked (argv, cwd, environment, the credentials on stdin)
+  to `<trace_dir>/fake_record.json`, then plays a canned scenario: it writes trace.jsonl,
   result.json and child_pgids.txt the way the runner protocol says a runner does.
+
+A credential is never written down as it is: the record says only whether OPENAI_API_KEY was
+in the environment, and gives a sha256 fingerprint of each credential that came on stdin.
 
 The adapter passes the subprocess an explicit, minimal environment, so the scenario can't
 travel in an environment variable. A test makes a small wrapper script that calls this file
@@ -17,6 +20,7 @@ those two are stripped before anything is recorded.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -80,10 +84,32 @@ def write_result(spec: dict, **fields) -> None:
     Path(spec["result_file"]).write_text(json.dumps(result), encoding="utf-8")
 
 
+CREDENTIAL = "OPENAI_API_KEY"
+
+
+def stdin_credentials() -> dict[str, str] | str:
+    """Fingerprints of the credentials the adapter sent on stdin, or why they could not be read."""
+    text = sys.stdin.read()
+    if not text:
+        return "no input"
+    try:
+        credentials = json.loads(text)["credentials"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return "malformed input"
+    return {name: hashlib.sha256(str(value).encode()).hexdigest() for name, value in credentials.items()}
+
+
 def run_trial(spec_path: Path) -> int:
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     trace_dir = Path(spec["trace_dir"])
-    record = {"argv": ARGV, "cwd": os.getcwd(), "env": dict(os.environ), "spec": spec}
+    record = {
+        "argv": ARGV,
+        "cwd": os.getcwd(),
+        "env": {name: value for name, value in os.environ.items() if name != CREDENTIAL},
+        "env_has_openai_key": CREDENTIAL in os.environ,
+        "stdin_credentials": stdin_credentials(),
+        "spec": spec,
+    }
     (trace_dir / "fake_record.json").write_text(json.dumps(record), encoding="utf-8")
     trace = Path(spec["trace_file"])
     model_id = spec["model"]["id"]

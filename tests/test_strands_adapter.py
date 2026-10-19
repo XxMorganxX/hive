@@ -5,6 +5,7 @@ the version check and plays canned runner scenarios (trace.jsonl, result.json, c
 The real runner is covered by tests/test_strands_runner.py.
 """
 
+import hashlib
 import json
 import os
 import signal
@@ -27,6 +28,17 @@ TASK = Task(id="t1", split="search", instruction="What is 6 * 7? End with ANSWER
 PRICES = {"input": 0.05, "output": 0.40, "cache_read": 0.005}
 # Variables a shell or the interpreter adds on its own, not the adapter.
 INTERPRETER_NOISE = {"PWD", "SHLVL", "_", "OLDPWD", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+FAKE_KEY = "sk-test-not-a-real-key"
+
+
+@pytest.fixture(autouse=True)
+def fake_api_key(monkeypatch):
+    """Every test runs with a placeholder key, so a developer's real key can never reach a trace dir."""
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
+
+
+def fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 def write_candidate(root: Path, valves: str = "", files: dict[str, str] | None = None, agent: str = "strands") -> Candidate:
@@ -266,6 +278,27 @@ def test_validate_rejects_extension_code_that_could_switch_the_model(tmp_path, s
     assert any("extensions/guard.py" in problem and needle in problem and "P3" in problem for problem in problems)
 
 
+@pytest.mark.parametrize(
+    "source",
+    ["def f(agent):\n    agent.model = None\n", "def f(self):\n    self.agent.model = None\n",
+     "def f(self):\n    self._agent._model_router = None\n", "def f(sub_agent):\n    sub_agent._aux_model = None\n"],
+)
+def test_validate_rejects_assigning_the_model_of_an_agent(tmp_path, source):
+    files = {"extensions/guard.py": source + "\ndef extension():\n    return None\n"}
+    problems = StrandsAdapter().validate(write_candidate(tmp_path / "c", files=files))
+    assert any("P3" in problem for problem in problems)
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["class P:\n    def init_agent(self, agent):\n        self.model = agent.model.get_config().get('model_id')\n",
+     "def f(stats):\n    stats.model = 'gpt-5-nano'\n"],
+)
+def test_validate_allows_a_plugins_own_attribute_named_model(tmp_path, source):
+    files = {"extensions/guard.py": source + "\ndef extension():\n    return None\n"}
+    assert StrandsAdapter().validate(write_candidate(tmp_path / "c", files=files)) == []
+
+
 def test_validate_allows_reading_the_model(tmp_path):
     source = "def f(event):\n    return event.agent.model.get_config()\n\ndef extension():\n    return None\n"
     problems = StrandsAdapter().validate(write_candidate(tmp_path / "c", files={"extensions/guard.py": source}))
@@ -404,19 +437,30 @@ def test_runs_in_the_trial_workdir(tmp_path, fake_python):
 def test_environment_holds_only_what_the_run_needs(tmp_path, fake_python, monkeypatch):
     for name, value in {"AWS_ACCESS_KEY_ID": "AKIA", "AWS_PROFILE": "prod", "SECRET_THING": "x",
                         "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector", "OPENAI_BASE_URL": "http://evil",
-                        "PYTHONPATH": "/evil", "OPENAI_API_KEY": "sk-test-key"}.items():  # fmt: skip
+                        "PYTHONPATH": "/evil"}.items():  # fmt: skip
         monkeypatch.setenv(name, value)
     _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
     env = record(trace_dir)["env"]
-    allowed = {"PATH", "HOME", "LANG", "OPENAI_API_KEY", "AWS_EC2_METADATA_DISABLED", "AWS_CONFIG_FILE",
-               "AWS_SHARED_CREDENTIALS_FILE", "OTEL_SDK_DISABLED"}  # fmt: skip
+    allowed = {"PATH", "HOME", "LANG", "AWS_EC2_METADATA_DISABLED", "AWS_CONFIG_FILE",
+               "AWS_SHARED_CREDENTIALS_FILE", "OTEL_SDK_DISABLED",
+               "HIVE_TRIAL_ID"}  # the process helper's trial marker, not the adapter's  # fmt: skip
     assert set(env) - INTERPRETER_NOISE <= allowed
 
 
-def test_environment_passes_the_openai_key_for_openai(tmp_path, fake_python, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+def test_the_api_key_is_never_in_the_runners_environment(tmp_path, fake_python):
     _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
-    assert record(trace_dir)["env"]["OPENAI_API_KEY"] == "sk-test-key"
+    assert record(trace_dir)["env_has_openai_key"] is False
+
+
+def test_the_openai_key_goes_to_the_runner_on_stdin(tmp_path, fake_python):
+    _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
+    assert record(trace_dir)["stdin_credentials"] == {"OPENAI_API_KEY": fingerprint(FAKE_KEY)}
+
+
+def test_a_missing_key_sends_no_credentials(tmp_path, fake_python, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY")
+    _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
+    assert record(trace_dir)["stdin_credentials"] == {}
 
 
 def test_environment_blocks_aws_credential_discovery(tmp_path, fake_python):
@@ -427,21 +471,26 @@ def test_environment_blocks_aws_credential_discovery(tmp_path, fake_python):
     assert env["AWS_SHARED_CREDENTIALS_FILE"] == os.devnull
 
 
-def test_the_scripted_provider_gets_no_api_key(tmp_path, fake_python, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+def test_the_scripted_provider_gets_no_api_key(tmp_path, fake_python):
     script = tmp_path / "script.json"
     script.write_text("{}")
     agent = build_agent(write_candidate(tmp_path / "c"), fake_python(), model=ModelSpec(provider="scripted", id="s"),
                         script_file=str(script))  # fmt: skip
     _, _, trace_dir = run(agent, tmp_path)
-    assert "OPENAI_API_KEY" not in record(trace_dir)["env"]
+    assert record(trace_dir)["env_has_openai_key"] is False
+    assert record(trace_dir)["stdin_credentials"] == {}
 
 
-def test_the_api_key_never_reaches_argv_or_the_run_spec(tmp_path, fake_python, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key-123")
+def test_the_api_key_never_reaches_argv_or_the_run_spec(tmp_path, fake_python):
     _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
-    assert "sk-test-key-123" not in json.dumps(record(trace_dir)["argv"])
-    assert "sk-test-key-123" not in (trace_dir / "run_spec.json").read_text()
+    assert FAKE_KEY not in json.dumps(record(trace_dir)["argv"])
+    assert FAKE_KEY not in (trace_dir / "run_spec.json").read_text()
+
+
+def test_the_api_key_is_written_nowhere_under_the_trace_dir(tmp_path, fake_python):
+    _, _, trace_dir = run(build_agent(write_candidate(tmp_path / "c"), fake_python()), tmp_path)
+    leaked = [path.name for path in trace_dir.rglob("*") if path.is_file() and FAKE_KEY in path.read_text(errors="replace")]
+    assert leaked == []
 
 
 # --- the run spec -----------------------------------------------------------------------

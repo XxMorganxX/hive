@@ -60,7 +60,10 @@ def hook(func: HookCallback | None = None)   # @hook or @hook(); event type(s) i
 ```
 
 Attachment order per plugin (`plugins/registry.py` `add_and_init`): duplicate-name check, `init_agent(agent)`,
-then the `@hook` methods, then the `@tool` methods. A duplicate plugin or tool name raises `ValueError`.
+then the `@hook` methods, then the `@tool` methods. A duplicate plugin name raises `ValueError`. Strands itself
+lets a `@tool` silently replace a same-named tool; HIVE does not: a tool name already taken by a vended tool or
+another extension is `harness_load_error`. `agent.tool_registry.register_tool(...)` or `.replace(...)` once the
+run has started is refused (`ToolRefused`) and ends the run as `extension_error`.
 
 ### `strands.tool`
 

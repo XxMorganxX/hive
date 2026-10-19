@@ -15,9 +15,12 @@ strands-agents 1.61.1:
   only killing the process enforces a timeout. Shell children run in sessions of their own;
   the runner lists their pgids in child_pgids.txt and run_process_group kills those too.
 
-What the runner gets is passed explicitly: a run_spec.json naming every candidate file, and a
-minimal environment. Strands silently defaults to Bedrock and boto3 probes AWS metadata and
-credential files, so AWS discovery is switched off here and Bedrock is disabled in the runner.
+What the runner gets is passed explicitly: a run_spec.json naming every candidate file, a
+minimal environment, and the provider credential as one JSON line on stdin. The key is never
+in the runner's environment, so no shell, tool or child process inherits it, and `env` in the
+agent's shell can't copy it into the trace. Strands silently defaults to Bedrock and boto3
+probes AWS metadata and credential files, so AWS discovery is switched off here and Bedrock is
+disabled in the runner.
 """
 
 from __future__ import annotations
@@ -71,6 +74,9 @@ MAX_SKILL_NAME_LENGTH = 64
 # still check at run time; this only rejects the obvious cases before any money is spent.
 FORBIDDEN_MODULES = ("strands.models", "strands._middleware", "openai", "boto3", "botocore", "anthropic")
 FORBIDDEN_STRANDS_NAMES = ("BedrockModel", "ModelRouter")
+# Agent attributes an extension must not assign. Only an assignment through a receiver that
+# names an agent counts (agent.model, event.agent.model, self._agent.model, sub_agent.model):
+# a plugin's own `self.model` switches nothing, and the runtime guard checks agent.model anyway.
 FORBIDDEN_ASSIGNED_ATTRIBUTES = ("model", "_model_router", "_aux_model")
 FORBIDDEN_CALLS = ("update_config",)
 
@@ -261,11 +267,23 @@ def _forbidden_uses(tree: ast.AST) -> list[str]:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 for element in ast.walk(target):
-                    if isinstance(element, ast.Attribute) and element.attr in FORBIDDEN_ASSIGNED_ATTRIBUTES:
-                        findings.append(f"line {line}: assigning .{element.attr}")
+                    if (isinstance(element, ast.Attribute) and element.attr in FORBIDDEN_ASSIGNED_ATTRIBUTES
+                            and _names_an_agent(element.value)):  # fmt: skip
+                        findings.append(f"line {line}: assigning .{element.attr} of an agent")
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in FORBIDDEN_CALLS:
             findings.append(f"line {line}: calling .{node.func.attr}()")
     return findings
+
+
+def _names_an_agent(receiver: ast.expr) -> bool:
+    """Whether `receiver` reads as an agent: a name or attribute like agent, sub_agent, event.agent."""
+    if isinstance(receiver, ast.Name):
+        name = receiver.id
+    elif isinstance(receiver, ast.Attribute):
+        name = receiver.attr
+    else:
+        return False
+    return name.lstrip("_").lower().endswith("agent")
 
 
 def skill_problems(skill_dir: Path) -> list[str]:
@@ -402,14 +420,21 @@ def model_config(model: ModelSpec, script_file: str | None) -> dict[str, Any]:
     return {"provider": model.provider, "id": model.id, "reasoning_effort": effort}
 
 
-def subprocess_env(provider: str, source: Mapping[str, str]) -> dict[str, str]:
-    """The trial's whole environment, built explicitly: nothing else from the controller leaks in."""
+def subprocess_env(source: Mapping[str, str]) -> dict[str, str]:
+    """The trial's whole environment, built explicitly: nothing else from the controller leaks in.
+
+    It never holds the provider credential; that goes on stdin (credentials_input)."""
     env = {name: source[name] for name in PASSED_ENV if name in source}
-    credential = PROVIDER_CREDENTIAL.get(provider)
-    if credential and credential in source:
-        env[credential] = source[credential]
     env.update(PINNED_ENV)
     return env
+
+
+def credentials_input(provider: str, source: Mapping[str, str]) -> str:
+    """The runner's stdin: one JSON line, {"credentials": {NAME: value}}. Empty when the provider
+    needs none or the controller has none; the runner then reports the missing key itself."""
+    credential = PROVIDER_CREDENTIAL.get(provider)
+    credentials = {credential: source[credential]} if credential and source.get(credential) else {}
+    return json.dumps({"credentials": credentials}) + "\n"
 
 
 def check_strands_version(python_path: str, pinned: str) -> None:
@@ -419,7 +444,7 @@ def check_strands_version(python_path: str, pinned: str) -> None:
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
-            env=subprocess_env("scripted", os.environ),  # no credential: the check needs none
+            env=subprocess_env(os.environ),
             timeout=VERSION_CHECK_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -531,7 +556,8 @@ class StrandsAgent:
             outcome = run_process_group(
                 [self.python_path, "-I", str(RUNNER), str(spec_path)],
                 cwd=workdir,
-                env=subprocess_env(self.model.provider, os.environ),
+                env=subprocess_env(os.environ),
+                stdin_text=credentials_input(self.model.provider, os.environ),
                 timeout_s=self.timeout_s,
                 stdout_path=trace_dir / RUNNER_STDOUT_FILE,
                 stderr_path=trace_dir / RUNNER_STDERR_FILE,
@@ -545,7 +571,7 @@ class StrandsAgent:
         )
 
     def run_spec(self, task: Task, workdir: Path, trace_dir: Path) -> dict[str, Any]:
-        """Everything the runner needs, explicitly. Never holds the API key (that is in the env)."""
+        """Everything the runner needs, explicitly. Never holds the API key (that goes on stdin)."""
         note = WORKDIR_NOTE_FILE.read_text(encoding="utf-8").strip().replace("{workdir}", str(workdir))
         system_prompt = f"{self.system_prompt.rstrip()}\n\n{note}" if self.system_prompt else note
         return {

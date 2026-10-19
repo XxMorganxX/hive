@@ -84,7 +84,7 @@ id = "register_tool"
 support = "supported"
 native_api = "@tool methods on the Plugin (from strands import tool)"
 can_modify = "adds a tool with the method's name, docstring (description) and typed arguments (schema)"
-caveats = "A tool is offered to the model only if its name is in the tools valve; otherwise it is dropped and missing from the load report. Names must be unique across the vended tools and every extension. A tool that raises becomes an error result and the run goes on (not extension_error)."
+caveats = "A tool is offered to the model only if its name is in the tools valve; otherwise it is dropped and missing from the load report. Names must be unique across the vended tools and every extension: a tool named like a vended tool or another extension's tool is harness_load_error, never a replacement. Tools are registered while the agent is built (init_agent or @tool); one registered or replaced once the run has started is refused and ends the run as extension_error. A tool that raises becomes an error result and the run goes on (not extension_error)."
 
 [[lifecycle]]
 id = "compaction"
