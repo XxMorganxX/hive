@@ -338,3 +338,59 @@ class Outcome:
     error_class: str | None       # INFRA_TIMEOUT | INFRA_QUOTA | INFRA_OOM | INFRA_MISSING | MEASUREMENT_LOST
 ```
 
+## 6. The optimizer loop
+
+```
+measure noise floor (seed × k on search)                         ← P1, once per experiment
+for generation in 1..G:
+    optimizer reads experience store → writes N proposals         ← P10
+    controller: validate → smoke (1 task) → score on search × k   ← P2, P8
+    controller: classify → rank (Wilson LB) → promote if margin   ← P9
+    controller: append everything to experience store             ← P6
+    stop on: dollar cap | ≥50% quota/infra errors | seed unmeasurable
+score final best + seed on validation (choose) and held-out (report once)   ← P7
+```
+
+### 6.1 Experience store layout
+
+Modeled on the Meta-Harness paper's proposer filesystem: every prior candidate's code, scores and raw traces, which the optimizer reads selectively with grep and cat.
+
+```
+experience/<experiment>/
+  noise_floor.json                       # seed SD, MDE, k used
+  gen-NNN/
+    candidates/<id>/                     # full harness spec + lineage.json
+    scores/<id>.json                     # per-task Outcomes + aggregates
+    traces/<id>/<task>/trial-<k>/        # trajectory.json, native session, load_report
+    flips/<id>.json                      # per-task change vs. parent and vs. seed
+  frontier.json
+  evolution.jsonl                        # one row per generation
+```
+
+- **`flips/`** records, per task, what changed versus the parent and versus the seed. Aggregate pass rates hide which valve did what.
+- Held-out results go to `runs/<experiment>/heldout/`. They never go here.
+
+### 6.2 The optimizer contract
+
+The optimizer runs headless: `claude -p` with Read, Grep, Glob and Write, scoped to the experience store, and a proposals file as its only output.
+
+Its prompt contains:
+- the adapter's `describe_schema()`;
+- the experience store layout;
+- **the real selection rule**;
+- the fact that a hidden held-out set exists;
+- the noise floor;
+- the valves explored so far, so it can be pushed toward unexplored ones (P11).
+
+### 6.3 Arms every experiment runs
+
+| Arm | What it is | Why |
+|---|---|---|
+| **Single-agent seed** | Stock Pi plus our adapter | The baseline the proposal names |
+| **Fixed topologies** | Hand-written hierarchical, peer-to-peer and manager-worker specs | The "human managers" MGH predicts the optimizer should beat |
+| **Self-decomposing** | One agent that can spawn sub-agents at runtime with no fixed roles | MGH's "let the model manage itself" contrast |
+| **HIVE optimizer** | The loop above, starting from the seed | The thing under test |
+| **Null optimizer** | The same loop, but proposals are unchanged copies | Shows how much "improvement" pure noise produces (P9) |
+
+Other optimizers worth comparing against at the same evaluation budget, if time allows: scores-only (no traces), GEPA, and the `better-harness` or Strands `harness-optimizer` approaches.
+
