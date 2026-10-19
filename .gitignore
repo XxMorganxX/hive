@@ -33,3 +33,6 @@ experience/
 
 # Per-framework virtualenvs (Deep Agents, Strands); recreate with scripts/setup-framework-venvs.sh
 .venvs/
+
+# Personal Claude Code settings and plugins
+.claude/
