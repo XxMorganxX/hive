@@ -49,6 +49,15 @@ Spec lives in `docs/FOUNDING_PRINCIPLES.md` §5–§8. The code-level source of 
   - **Rewritten sections:** §5 (contracts), §6 (loop + experience store) and §8 (layout).
 - 2026-10-19: Wrote `hive/contracts.py` and `hive/candidate.py` myself, since every module depends on them. Candidate was test-first: 13 tests, red then green. Added a contract clause: `Agent.run` may be called concurrently with distinct workdirs, because the evaluator uses a thread pool.
 - 2026-10-19: Launched wave 1 as a workflow: seven implementers in parallel on disjoint files, test-first. The modules are evaluate+selection, the Pi adapter, the scripted agent + null overseer, the `exact_answer` suite, the `python_functions` suite, the Claude Code overseer, and registry+config. Implementers don't commit; I commit per module after checking their tests myself.
+- 2026-10-19: Wave 1 landed. **Observed:** 456 tests pass in the full suite. Committed one module per commit. What the implementers found in Pi 0.75.3's source that the docs had wrong:
+  - **A failed extension load** exits 1 at startup with `Failed to load extension`. It does not continue, so both forms map to `harness_load_error`.
+  - **Global SYSTEM.md / APPEND_SYSTEM.md leak in** unless both flags are always passed. The adapter passes an empty string when the candidate has none.
+  - **Instructions starting with `-` or `@` get parsed as flags,** so they go on stdin.
+  - **Pi reads piped stdin,** so stdin must be `DEVNULL` or it hangs.
+- 2026-10-19: Fixed a hole the overseer implementer flagged. `Candidate.copy_to` copied hidden files that the content hash ignores, so an overseer could ship a hidden payload without changing the id. Now copy == hashed set + lineage (test-first).
+- 2026-10-19: **Decision: the overseer runs in a temp workspace outside any git checkout,** then the workspace is copied into the run dir for the record. Why: Claude Code walks up from its working directory loading CLAUDE.md and project settings. Inside the HIVE repo, the overseer would read instructions written for HIVE's developers.
+- 2026-10-19: Known limitation, recorded rather than fixed. Pi trials run on the host, and the `python_functions` hidden cases live in the repo, so an agent with bash could read them. This is fine for a scaffold, but it must close before real experiments (Docker / Harbor verifier, P7).
+- 2026-10-19: Launched wave 2 (loop, CLI, experiment configs, dry-run seeds) with an independent checker agent that tries to break it.
 
 ## Open questions
 
