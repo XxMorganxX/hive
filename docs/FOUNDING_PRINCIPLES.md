@@ -182,7 +182,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 
 **Rule:**
 - Pin exact versions of the framework (Pi, Deep Agents), Harbor and the model id. Pi is pinned at the installed 0.75.3, with `[agent] pi_version` checked at build. Upgrading to 1.3.x is a deliberate change that means re-verifying the adapter against Pi's source.
-- Run Pi with `--offline` so its model catalog (and with it the cost numbers) can't change between runs.
+- Run Pi against a per-run agent dir: symlinked `auth.json`, a pinned `settings.json`, and no `models.json`. That way neither the user's global Pi config nor a refreshed model catalog (and with it the cost numbers) can change between runs. `--offline` skips startup network calls.
 - Every run writes a `run_meta.json` with versions, the candidate id, the suite split, k, seeds and cost, written even when the run crashes.
 - Resuming a run reloads paid evaluations by candidate id.
 
@@ -281,7 +281,7 @@ class AgentResult:
 
 **Pi adapter obligations:**
 - **Isolate from the user's global Pi config.** Pass `--no-extensions --no-skills --no-prompt-templates --no-context-files`, then pass the candidate's own files explicitly (`--system-prompt`, `--append-system-prompt`, `-e`, `--skill`).
-- **Freeze the model catalog** with `--offline`.
+- **Run against a fresh agent dir per run:** `PI_CODING_AGENT_DIR` points at a temp dir holding symlinks to the real `auth.json` and `bin/`, a pinned `settings.json`, and no `models.json`. Run with `--offline`.
 - **Check the pinned Pi version.**
 - **Ignore the exit code.** JSON mode exits 0 on provider errors. Status comes from the last assistant `message_end.stopReason`, and usage is summed over every assistant `message_end`.
 - **Catch failed extension loads.** An extension error on stderr makes the trial `errored`, with class `harness_load_error`.
@@ -496,7 +496,7 @@ Each item is documented behavior of the tools or a standard failure mode of eval
 - [ ] Exit codes don't mean success. **Count completed trials.** Pi `--mode json` doesn't signal failure through its exit code, so **parse `stopReason`**.
 - [ ] Pi silently skips project `.pi/` resources in headless mode. **Install into `PI_CODING_AGENT_DIR` and check `load_report.json`.**
 - [ ] Pi's reference subagent extension runs children with `--no-session`. **Turn on child sessions and link them in ATIF.**
-- [ ] Pi refreshes its model catalog at runtime, which can change cost numbers. **Run with `--offline`.**
+- [ ] Pi's global `settings.json` and `models.json`, and its runtime catalog refresh, can change behavior and cost numbers. **The adapter runs Pi against a per-run agent dir with pinned settings and no `models.json`, plus `--offline`.**
 - [ ] Extension TypeScript isn't typechecked when it loads. **Run `tsc --noEmit` and a real load check in `validate`.**
 - [ ] Harbor forces an old Pi (0.85.1) when MCP servers are configured. **Avoid MCP in harness specs, or override the pin.**
 - [ ] Usage caps and quotas look like task failures. **The Pi adapter classifies them as `quota` (errored, not failed). Next: stop a generation when ≥50% of trials hit it.**

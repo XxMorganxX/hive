@@ -41,7 +41,7 @@ Every tunable lives in the experiment file, including the model, trials per task
 
 ## Plugging something in
 
-Each role has one contract in [`hive/contracts.py`](hive/contracts.py). A new implementation is one class. Name it in a config, either by a built-in short name from [`hive/registry.py`](hive/registry.py) or by an import path such as `my_package.module:MyClass`. The controller does not change.
+Each role has one contract in [`hive/contracts.py`](hive/contracts.py). A new implementation is one class. Name it in a config, either by a built-in short name from [`hive/registry.py`](hive/registry.py) or by an import path such as `my_package.module:MyClass`. The controller does not change. An agent adapter's `name` attribute must equal the string candidates use (`agent = "my_package.module:MyAdapter"`), and the registry checks it.
 
 | Role | Implement | Selected by | Built-ins |
 |---|---|---|---|
