@@ -435,3 +435,19 @@ docs/  tasks/
 - **Single source of truth.** Every tunable (model id, k, generations, promotion margin, dollar cap, τ) lives in `experiments/<name>.toml`. Every prompt the controller sends lives in `hive/optimizer/`. Nothing is inlined in loop code.
 - **Write fences.** The optimizer may write only inside proposed candidates. `hive/controller/` and `suites/` are off-limits to it, and the controller enforces this.
 
+## 9. Known pitfalls (checklist)
+
+Each item is documented behavior of the tools or a standard failure mode of evaluation loops. Each one should be guarded by a controller check or a test.
+
+- [ ] Exit codes don't mean success. **Count completed trials.** Pi `--mode json` doesn't signal failure through its exit code, so **parse `stopReason`**.
+- [ ] Pi silently skips project `.pi/` resources in headless mode. **Install into `PI_CODING_AGENT_DIR` and check `load_report.json`.**
+- [ ] Pi's reference subagent extension runs children with `--no-session`. **Turn on child sessions and link them in ATIF.**
+- [ ] Pi refreshes its model catalog at runtime, which can change cost numbers. **Run with `--offline`.**
+- [ ] Extension TypeScript isn't typechecked when it loads. **Run `tsc --noEmit` and a real load check in `validate`.**
+- [ ] Harbor forces an old Pi (0.85.1) when MCP servers are configured. **Avoid MCP in harness specs, or override the pin.**
+- [ ] Usage caps and quotas look like task failures. **Classify them as `INFRA_QUOTA`, and stop the generation if ≥50% hit it.**
+- [ ] A broken judge (bad key, model outage) quietly collapses rewards. **Run a judge health check before each generation; an abstaining judge is null, never 0.**
+- [ ] A task that never ran can look like a cheap failure. **Flag trials with zero tokens or zero cost.**
+- [ ] A coding-agent optimizer fixates on one idea. **Track explored valves and push toward unexplored ones.**
+- [ ] Best-of-population rises with noise alone. **Use the null-optimizer arm and promotion margins.**
+
