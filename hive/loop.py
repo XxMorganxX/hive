@@ -54,7 +54,6 @@ import datetime
 import json
 import logging
 import math
-import os
 import platform
 import re
 import shutil
@@ -439,11 +438,8 @@ class _Experiment:
         if archived_candidate is None:
             # The write fence is the workspace (P10): a child anywhere else is not the overseer's to propose.
             return STATUS_INVALID, None, f"proposed candidate {proposal.candidate_dir} is outside the overseer workspace"
-        links = _symlinks_under(archived_candidate)
-        if links:
-            # A link could make the candidate read or ship files from outside its own directory.
-            return STATUS_INVALID, None, f"candidate contains symlinks: {', '.join(links)}"
-        try:
+        try:  # Candidate.load also refuses symlinks, which could reach outside the candidate
+
             child = Candidate.load(archived_candidate)
         except (CandidateError, OSError) as error:
             return STATUS_INVALID, None, f"candidate does not load: {error}"
@@ -548,18 +544,6 @@ def _relative_inside(path: Path | None, root: Path) -> Path | None:
         return None
     resolved = Path(path).resolve()
     return resolved.relative_to(root) if resolved.is_relative_to(root) else None
-
-
-def _symlinks_under(root: Path) -> list[str]:
-    if root.is_symlink():
-        return [root.name]
-    links = []
-    for directory, dirnames, filenames in os.walk(root):  # does not follow symlinked directories
-        for name in dirnames + filenames:
-            path = Path(directory) / name
-            if path.is_symlink():
-                links.append(path.relative_to(root).as_posix())
-    return sorted(links)
 
 
 def _generation_dirname(generation: int) -> str:

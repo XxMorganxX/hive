@@ -88,6 +88,24 @@ def test_copy_to_refuses_existing_destination(tmp_path):
         original.copy_to(tmp_path / "taken")
 
 
+def test_a_symlink_inside_a_candidate_is_an_error(tmp_path):
+    # A link would let a candidate read or ship files from outside its own directory.
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret")
+    root = write_candidate(tmp_path / "c")
+    (root / "SYSTEM.md").symlink_to(outside)
+    with pytest.raises(CandidateError, match="symlink"):
+        Candidate.load(root)
+
+
+def test_a_symlinked_candidate_root_is_an_error(tmp_path):
+    real = write_candidate(tmp_path / "real")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(CandidateError, match="symlink"):
+        Candidate.load(link)
+
+
 def test_missing_manifest_is_an_error(tmp_path):
     (tmp_path / "empty").mkdir()
     with pytest.raises(CandidateError, match="candidate.toml"):

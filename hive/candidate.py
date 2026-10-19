@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -43,6 +44,16 @@ def content_files(root: Path) -> list[Path]:
     return sorted(files, key=lambda p: p.as_posix())
 
 
+def _symlinks_under(root: Path) -> list[str]:
+    links = []
+    for directory, dirnames, filenames in os.walk(root):  # does not descend into symlinked directories
+        for name in dirnames + filenames:
+            path = Path(directory) / name
+            if path.is_symlink():
+                links.append(path.relative_to(root).as_posix())
+    return sorted(links)
+
+
 def content_hash(root: Path) -> str:
     """Hash of every content file's relative path and bytes. Renames and edits both change it."""
     digest = hashlib.sha256()
@@ -63,7 +74,14 @@ class Candidate:
 
     @classmethod
     def load(cls, root: Path) -> Candidate:
+        # A link would let a candidate read or ship files from outside its own directory,
+        # and the hash would cover the target's bytes without the target being part of it.
+        if Path(root).is_symlink():
+            raise CandidateError(f"{root} is a symlink; a candidate must be a real directory")
         root = Path(root).resolve()
+        links = _symlinks_under(root)
+        if links:
+            raise CandidateError(f"{root} contains symlinks: {', '.join(links)}")
         manifest_path = root / MANIFEST
         if not manifest_path.is_file():
             raise CandidateError(f"{root} has no {MANIFEST}")
