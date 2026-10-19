@@ -412,3 +412,26 @@ The proposal compares arms on task performance, cost, latency and consistency. E
 - Suites that need graded quality may add LLM judges. A judge that can't score abstains, and that's recorded as null, never as 0.
 - Every judge must pass the P2 checks before its scores count.
 
+## 8. Repository layout
+
+Organized by role, so the trust boundary is visible in the tree.
+
+```
+hive/
+  controller/        # TRUSTED: loop, validation gate, selection, stats, experience writer
+  optimizer/         # optimizer prompt template + headless invocation
+adapters/
+  pi/                # Harness impl, HivePi Harbor agent, topology → Pi extension compiler
+suites/
+  <use-case>/        # Suite impl, Harbor dataset ref, splits, judges
+harnesses/           # hand-written seeds: single, hierarchical, peer, manager-worker, self-decomposing
+experiments/
+  <name>.toml        # ONE file per experiment: model, suite, splits, k, G, N, margin, $ cap
+experience/          # gitignored: the optimizer's read-only world
+runs/  jobs/         # gitignored: raw Harbor output
+docs/  tasks/
+```
+
+- **Single source of truth.** Every tunable (model id, k, generations, promotion margin, dollar cap, τ) lives in `experiments/<name>.toml`. Every prompt the controller sends lives in `hive/optimizer/`. Nothing is inlined in loop code.
+- **Write fences.** The optimizer may write only inside proposed candidates. `hive/controller/` and `suites/` are off-limits to it, and the controller enforces this.
+
