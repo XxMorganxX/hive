@@ -43,6 +43,12 @@ Spec lives in `docs/FOUNDING_PRINCIPLES.md` §5–§8. The code-level source of 
 ## Progress log
 
 - 2026-10-19: Verified the CLIs locally. Pi 0.75.3 is at `/opt/homebrew/bin/pi`; the flags confirmed via `--help` and the JSON event and usage shapes via installed type defs. Claude Code is 2.1.303, with `-p --output-format json --tools --permission-mode acceptEdits --setting-sources --max-budget-usd --no-session-persistence`. Pi's only credential is OpenAI (`auth.json`), so the demo experiments use `openai/gpt-5-nano`.
+- 2026-10-19: Revised the principles doc to match:
+  - **Terminology:** the "optimizer" role is now the **overseer**.
+  - **P5:** HIVE owns three contracts, and Harbor sits behind them.
+  - **Rewritten sections:** §5 (contracts), §6 (loop + experience store) and §8 (layout).
+- 2026-10-19: Wrote `hive/contracts.py` and `hive/candidate.py` myself, since every module depends on them. Candidate was test-first: 13 tests, red then green. Added a contract clause: `Agent.run` may be called concurrently with distinct workdirs, because the evaluator uses a thread pool.
+- 2026-10-19: Launched wave 1 as a workflow: seven implementers in parallel on disjoint files, test-first. The modules are evaluate+selection, the Pi adapter, the scripted agent + null overseer, the `exact_answer` suite, the `python_functions` suite, the Claude Code overseer, and registry+config. Implementers don't commit; I commit per module after checking their tests myself.
 
 ## Open questions
 
