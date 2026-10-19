@@ -58,6 +58,24 @@ Spec lives in `docs/FOUNDING_PRINCIPLES.md` §5–§8. The code-level source of 
 - 2026-10-19: **Decision: the overseer runs in a temp workspace outside any git checkout,** then the workspace is copied into the run dir for the record. Why: Claude Code walks up from its working directory loading CLAUDE.md and project settings. Inside the HIVE repo, the overseer would read instructions written for HIVE's developers.
 - 2026-10-19: Known limitation, recorded rather than fixed. Pi trials run on the host, and the `python_functions` hidden cases live in the repo, so an agent with bash could read them. This is fine for a scaffold, but it must close before real experiments (Docker / Harbor verifier, P7).
 - 2026-10-19: Launched wave 2 (loop, CLI, experiment configs, dry-run seeds) with an independent checker agent that tries to break it.
+- 2026-10-19: Wave 2 landed. **Observed:** 534 tests pass, and both dry runs exit 0. The checker found two medium issues, fixed test-first:
+  - **The overseer was briefed with the live incumbent snapshot,** so it could forge held-out scores. Now it gets copies in temp dirs, and every evaluation re-hashes its snapshot first.
+  - **The cap was checked only between generations** (it overshot by 60%). Now it is estimate-gated from the seed's cost per trial.
+
+  Also fixed:
+  - `*_file` / `*_dir` settings now resolve against the config file.
+  - `Candidate.load` rejects symlinks.
+  - `run_meta` records `git_dirty`.
+  - A temp dir inside a git checkout is refused.
+- 2026-10-19: Adversarial review: 6 lenses, 74 agents, and every finding had to survive 2 skeptics. 25 confirmed, 9 refuted, and no prior-work references found.
+  - **Highs:**
+    - The overseer's `--allowedTools Edit,Write` had no path scope, so it could write and read anywhere, including held-out answers. The report it got also carried absolute paths into the repo.
+    - The thinking level was a candidate valve. That breaks P3, because more reasoning buys accuracy with spend.
+    - `pi --version` prints to stderr, so the version pin would fail every real run.
+    - Ctrl-C mid-evaluation kept paying for queued trials, and the spend went unrecorded.
+  - **Decision: thinking moves into `ModelSpec` / `[model] thinking`.** The Pi adapter checks every response's provider and model (`model_mismatch`).
+  - **Decision: an adapter's `name` must equal the string candidates use in `agent`.** The registry enforces this.
+  - Fixes fanned out to four fixers on disjoint files, with an independent recheck. I reconciled the spec myself.
 
 ## Open questions
 
