@@ -23,10 +23,16 @@ dist/core/sdk.js, dist/core/skills.js, dist/modes/print-mode.js, pi-agent-core a
 - JSON mode exits 0 on provider errors, so the exit code is not a verdict (P8). What is:
   a normal run always ends its stream with `agent_end`, after the last assistant message.
   A run killed by a signal, or one whose stream stops early, crashed.
-- Every assistant message carries the `provider` and `model` it went to. Extensions can
-  call setModel / setThinkingLevel, and Pi's model resolver fuzzy-matches ids without a
+- Every assistant message carries a `provider` and `model`, filled in from the model Pi was
+  configured with, never from the provider's response (pi-ai openai-responses.js). Extensions
+  can call setModel / setThinkingLevel, and Pi's model resolver fuzzy-matches ids without a
   warning, so the adapter checks those fields, and the session file's model and thinking
-  entries, against the experiment's ModelSpec (P3).
+  entries, against the experiment's ModelSpec (P3). A rewrite of the request payload itself
+  (`before_provider_request`) would not show in those fields, so validation rejects any
+  extension that hooks it.
+- Usage comes from each assistant message's `usage`. Compaction's summary call is the
+  exception: it emits no message and Pi keeps no usage for it, only a `compaction` entry in
+  the session file, so the adapter adds an upper-bound estimate per entry (compaction_usage).
 - Extensions (see extension_spec() and EXTENSIONS_API.md). Pi loads every `-e` file, and if
   any failed it prints `Error: Failed to load extension "<path>": ...` per failure and exits
   1 before the session header (main.js reportDiagnostics; core/extensions/loader.js). So
@@ -37,7 +43,9 @@ dist/core/sdk.js, dist/core/skills.js, dist/modes/print-mode.js, pi-agent-core a
   file. A tool's execute() that throws, and a `tool_call` handler that throws, become error
   tool results the model sees, with nothing on stderr (runner.js emitToolCall has no catch).
 - Bash tool commands run detached, in their own session. Pi kills them on SIGTERM, not on
-  SIGKILL, so a timeout sends SIGTERM first.
+  SIGKILL, so a timeout sends SIGTERM first. A command that daemonizes, or a process an
+  extension starts, can outlive even that, so every run carries a trial marker and what it
+  left behind is killed afterwards (hive.agents.process.TrialProcesses).
 """
 
 from __future__ import annotations
@@ -56,6 +64,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from hive.agents.process import TRIAL_MARKER_ENV, TrialProcesses, new_trial_marker
 from hive.candidate import MANIFEST, Candidate, content_files
 from hive.contracts import (
     EXTENSIONS_DIR,
@@ -95,6 +104,16 @@ LINKED_AGENT_ENTRIES = ("auth.json", "bin")
 # The settings.json every run gets: Pi's own defaults for the pinned version, whatever the
 # user's settings say, so retry, compaction, shell and thinking-budget settings can't drift.
 PINNED_SETTINGS: Mapping[str, Any] = {}
+
+# Compaction's summary call, under those pinned defaults (Pi 0.75.3 settings-manager.js:
+# compaction.reserveTokens = 16384; compaction.js caps the history summary at 0.8 of it and a
+# split turn's prefix summary at 0.5). Pi records no usage for the call, so these caps are
+# what the adapter charges for its output: an upper bound, so the budget errs high (P12).
+COMPACTION_RESERVE_TOKENS = 16384
+COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS = int(0.8 * COMPACTION_RESERVE_TOKENS)
+COMPACTION_TURN_PREFIX_MAX_OUTPUT_TOKENS = int(0.5 * COMPACTION_RESERVE_TOKENS)
+# compaction.js joins a split turn's two summaries with this heading.
+SPLIT_TURN_SUMMARY_MARKER = "**Turn Context (split turn):**"
 
 # Pi's own extension diagnostics on stderr (see module doc).
 LOAD_ERROR_LINE = re.compile(r'Failed to load extension "([^"]+)": ?(.*)$')
@@ -311,11 +330,12 @@ PI_LIFECYCLE = (
     ),
     LifecyclePoint(
         id="wrap_model_call",
-        support="partial",
+        support="unsupported",
         native_api='pi.on("before_provider_request")',
-        can_modify="return a value to replace the serialized provider payload",
-        caveats="There is no wrapper that receives the model call itself. Changing the payload's model "
-        "breaks the fixed model (P3) and is forbidden.",
+        can_modify="nothing: validation rejects an extension that hooks before_provider_request",
+        caveats="There is no wrapper that receives the model call itself. before_provider_request can replace "
+        "the serialized payload, model included, and Pi would still report the configured model (P3), so "
+        "HIVE forbids it. Use context (before_model_call) to change the messages a call sends.",
     ),
     LifecyclePoint(
         id="before_tool_call",
@@ -349,7 +369,10 @@ PI_LIFECYCLE = (
         native_api='pi.on("session_before_compact"), pi.on("session_compact"), ctx.compact()',
         can_modify="session_before_compact returns {cancel: true}, or {compaction: {summary, firstKeptEntryId, "
         "tokensBefore}} to supply your own summary; session_compact observes the result",
-        caveats="Fires only when the context grows past Pi's threshold, whose settings the experiment pins.",
+        caveats="Fires only when the context grows past Pi's threshold (Pi's defaults; the experiment pins them), "
+        "or when an extension calls ctx.compact(). Pi's own summary is a model call with no usage record, so "
+        "HIVE charges an upper-bound estimate for it; supplying {compaction} from session_before_compact "
+        "makes no call and costs nothing.",
     ),
     LifecyclePoint(
         id="after_run",
@@ -362,13 +385,16 @@ PI_LIFECYCLE = (
     ),
 )
 
+# Markdown: each entry carries its own code spans (hive.extensions renders them as bullets).
 PI_FORBIDDEN = (
-    "pi.setModel",
-    "pi.setThinkingLevel",
-    "pi.registerProvider",
-    "pi.unregisterProvider",
-    'pi.on("before_provider_request") returning a payload with a different model',
+    "`pi.setModel`",
+    "`pi.setThinkingLevel`",
+    "`pi.registerProvider`",
+    "`pi.unregisterProvider`",
+    '`pi.on("before_provider_request")`: validation rejects any extension that hooks it, since a payload '
+    "rewrite can change the model unseen (P3)",
 )
+FORBIDDEN_EVENTS = ("before_provider_request",)
 
 PI_ENTRY_CONVENTION = (
     "default export the factory `(pi: ExtensionAPI) => void | Promise<void>`. Pi calls it once at "
@@ -395,7 +421,10 @@ PI_EVENT_POINTS: Mapping[str, tuple[str, ...]] = {
     "turn_end": ("after_run",),
 }
 
-ON_CALL = re.compile(r"""\.on\(\s*(["'`])([A-Za-z_]+)\1""")
+# Matched against source whose comments and string contents are blanked (see code_views), so
+# text inside a string never counts as a call. An optional type argument may follow `.on`.
+ON_CALL = re.compile(r"""\.on\s*(?:<[^<>]*>\s*)?\(\s*(?=["'`])""")
+EVENT_NAME = re.compile(r"[A-Za-z_]+")
 REGISTER_TOOL_CALL = re.compile(r"\.registerTool\s*\(\s*")
 NAME_KEY = re.compile(r"name\s*:\s*")
 LITERAL_STRING = re.compile(r"""^(?:"([^"\\\n]*)"|'([^'\\\n]*)'|`([^`\\$]*)`)""")
@@ -418,23 +447,35 @@ def registered_by(source: str) -> tuple[str, ...]:
 
     Static and best effort: Pi records nothing about what an extension registered, and running
     the code to find out would mean running candidate code in the controller. Calls inside
-    comments are ignored; calls built dynamically (a computed event name, a tool object passed
-    by variable) are missed, though any registerTool call still counts as "register_tool".
+    comments or string literals are ignored; calls built dynamically (a computed event name, a
+    tool object passed by variable) are missed, though any registerTool call still counts as
+    "register_tool".
     """
-    code = without_comments(source)
-    registered = {point for match in ON_CALL.finditer(code) for point in PI_EVENT_POINTS.get(match.group(2), ())}
-    if REGISTER_TOOL_CALL.search(code):
+    _, skeleton = code_views(source)
+    registered = {point for event in hooked_events(source) for point in PI_EVENT_POINTS.get(event, ())}
+    if REGISTER_TOOL_CALL.search(skeleton):
         registered.add("register_tool")
     registered.update(f"tool:{name}" for name in literal_tool_names(source))
     return tuple(sorted(registered))
 
 
+def hooked_events(source: str) -> tuple[str, ...]:
+    """Event names passed as a string literal to `.on(...)`, in source order."""
+    code, skeleton = code_views(source)
+    events: list[str] = []
+    for match in ON_CALL.finditer(skeleton):
+        name = code[match.end() + 1 : string_end(code, match.end()) - 1]
+        if EVENT_NAME.fullmatch(name) and name not in events:
+            events.append(name)
+    return tuple(events)
+
+
 def literal_tool_names(source: str) -> tuple[str, ...]:
     """Names in `registerTool({ name: "<literal>", ... })` calls, in source order. A name that is a
     variable, an expression or an interpolated template can't be known statically and is skipped."""
-    code = without_comments(source)
+    code, skeleton = code_views(source)
     names: list[str] = []
-    for match in REGISTER_TOOL_CALL.finditer(code):
+    for match in REGISTER_TOOL_CALL.finditer(skeleton):
         if code.startswith("{", match.end()):
             name = object_literal_name(code, match.end())
             if name is not None and name not in names:
@@ -483,27 +524,75 @@ def string_end(code: str, start: int) -> int:
     return len(code)
 
 
-def without_comments(source: str) -> str:
-    """The source with `//` and `/* */` comments blanked out, string literals kept intact."""
-    kept: list[str] = []
+def code_views(source: str) -> tuple[str, str]:
+    """Two views of the source, each the same length as it, so an offset in one is the same
+    place in the other: `code` has comments blanked, and `skeleton` has string-literal
+    contents blanked too (quotes kept). Search the skeleton for calls; read literals from code."""
+    code: list[str] = []
+    skeleton: list[str] = []
     index = 0
     while index < len(source):
         char = source[index]
         if char in "'\"`":
             end = string_end(source, index)
-            kept.append(source[index:end])
+            literal = source[index:end]
+            code.append(literal)
+            closed = end - index >= 2 and literal[-1] == char
+            inner = literal[1:-1] if closed else literal[1:]
+            skeleton.append(char + blank(inner) + (char if closed else ""))
             index = end
-        elif source.startswith("//", index):
+            continue
+        if source.startswith("//", index):
             newline = source.find("\n", index)
-            index = len(source) if newline == -1 else newline
+            end = len(source) if newline == -1 else newline
         elif source.startswith("/*", index):
             close = source.find("*/", index + 2)
-            kept.append(" ")
-            index = len(source) if close == -1 else close + 2
+            end = len(source) if close == -1 else close + 2
         else:
-            kept.append(char)
+            code.append(char)
+            skeleton.append(char)
             index += 1
-    return "".join(kept)
+            continue
+        blanked = blank(source[index:end])
+        code.append(blanked)
+        skeleton.append(blanked)
+        index = end
+    return "".join(code), "".join(skeleton)
+
+
+def blank(text: str) -> str:
+    """Spaces in place of text, newlines kept."""
+    return re.sub(r"[^\n]", " ", text)
+
+
+def string_literals(source: str) -> Iterator[str]:
+    """The contents of every string literal outside comments."""
+    code, skeleton = code_views(source)
+    index = 0
+    while index < len(skeleton):
+        if skeleton[index] in "'\"`":
+            end = string_end(code, index)
+            yield code[index + 1 : end - 1]
+            index = end
+        else:
+            index += 1
+
+
+def forbidden_hook_problems(extensions: Sequence[Path], root: Path) -> list[str]:
+    """Extensions that hook an event HIVE forbids (P3). Static: an `.on("<event>")` call, or the
+    event name as a whole string literal (so a constant passed to `.on` is caught too). A name
+    assembled at runtime is not caught; the guide forbids it all the same."""
+    problems = []
+    for path in extensions:
+        source = path.read_text(encoding="utf-8", errors="replace")
+        named = set(hooked_events(source)) | set(string_literals(source))
+        for event in FORBIDDEN_EVENTS:
+            if event in named:
+                problems.append(
+                    f"'{path.relative_to(root).as_posix()}' hooks {event}, which is forbidden: it can rewrite the "
+                    "request payload's model, and Pi would still report the configured model (P3)"
+                )
+    return problems
 
 
 def extension_tool_problems(extensions: Sequence[Path], root: Path, valves: Mapping[str, Any]) -> list[str]:
@@ -597,6 +686,7 @@ class PiAdapter:
             layout = read_layout(candidate.root)
             problems.extend(layout.problems)
             problems.extend(extension_tool_problems(layout.extensions, candidate.root, candidate.valves))
+            problems.extend(forbidden_hook_problems(layout.extensions, candidate.root))
             return problems
         except Exception as error:  # validate must never raise; an unreadable candidate is a problem
             return [f"could not inspect candidate at {candidate.root}: {error}"]
@@ -714,9 +804,9 @@ class PiAgent:
         (trace_dir / "stderr.txt").write_bytes(outcome.stderr)
 
         if outcome.launch_error is not None:
+            # Nothing loaded or failed: there is no load report (see load_report_of).
             message = f"could not start Pi ({self.pi_bin}): {outcome.launch_error}"
-            report = LoadReport(tuple(unknown_load(e, "Pi did not start") for e in self.extensions))
-            return errored("agent_error", message, Usage(), wall_clock_s, report)
+            return errored("agent_error", message, Usage(), wall_clock_s, None)
         raw = RawRun(
             stdout=outcome.stdout.decode(errors="replace"),
             stderr=outcome.stderr.decode(errors="replace"),
@@ -728,6 +818,8 @@ class PiAgent:
         return interpret_run(raw, model=self.model, extensions=self.extensions, timeout_s=self.timeout_s)
 
     def _execute(self, argv: list[str], workdir: Path, stdin_text: str | None, env: Mapping[str, str]) -> ProcessOutcome:
+        marker = new_trial_marker()
+        env = {**env, TRIAL_MARKER_ENV: marker}
         try:
             # A new session makes Pi the leader of its own process group, so a timeout reaches
             # Pi and its plain children. Bash tool commands run detached in sessions of their
@@ -743,6 +835,10 @@ class PiAgent:
             )
         except OSError as error:
             return ProcessOutcome(b"", b"", None, False, error)
+        # What a daemonizing bash command or an extension's own child leaves behind, outside
+        # every group Pi or we would signal (see module doc).
+        tracked = TrialProcesses(process.pid, marker)
+        tracked.start()
 
         stdin_bytes = stdin_text.encode() if stdin_text is not None else None
         try:
@@ -759,6 +855,7 @@ class PiAgent:
         finally:
             if process.poll() is None:  # e.g. KeyboardInterrupt mid-run: never leak a Pi process
                 stop_process_group(process)
+            tracked.kill_all()
 
 
 @contextmanager
@@ -824,7 +921,8 @@ def interpret_run(
     """Turn Pi's event stream, session file and stderr into one result.
 
     The checks run from "this run is not the experiment" to "the provider failed", so a run
-    that broke P3 is never reported as an ordinary error. Every result carries a load report.
+    that broke P3 is never reported as an ordinary error. Every result carries a load report,
+    except one from a Pi that stopped before loading anything (see load_report_of).
     """
     events = parse_events(raw.stdout)
     assistant_indexes = [
@@ -836,6 +934,8 @@ def interpret_run(
     ]
     assistant_messages = [events[index]["message"] for index in assistant_indexes]
     usage = sum((usage_of(message) for message in assistant_messages), Usage())
+    input_rate, output_rate = token_rates(assistant_messages)
+    usage += compaction_usage(raw.session_entries, input_rate=input_rate, output_rate=output_rate)
     wall_clock_s = raw.wall_clock_s
     tail = raw.stderr.strip()[-STDERR_TAIL_CHARS:] or "(no stderr)"
     report, report_is_evidence = load_report_of(raw, events, extensions)
@@ -915,14 +1015,15 @@ def model_mismatch(
 
 def load_report_of(
     raw: RawRun, events: Sequence[Mapping[str, Any]], extensions: Sequence[ExtensionFile]
-) -> tuple[LoadReport, bool]:
+) -> tuple[LoadReport | None, bool]:
     """What this run loaded, and whether that is evidence about the extensions at all.
 
     Pi has no positive load report, but it exits at startup when any `-e` file fails to load,
-    so a run that got as far as its session header loaded them all (see module doc). It is not
-    evidence when Pi stopped before the run for a reason that names no extension (no model, a
-    bad flag): then each file's status is unknown, and the run's failure is Pi's, not the
-    candidate's.
+    so a run that got as far as its session header loaded them all (see module doc). There is
+    no evidence when Pi stopped before the run for a reason that names no extension (no model,
+    a bad flag, a timeout before the header): then the report is None, as for a Pi that never
+    started, and the run's failure is Pi's, not the candidate's. The controller keeps an
+    errored run's own class when it has no report (hive.extensions.load_problem).
     """
     stderr = ANSI_ESCAPE.sub("", raw.stderr)
     by_path = extension_paths(extensions)
@@ -958,8 +1059,7 @@ def load_report_of(
             for e in extensions
         ]
         return LoadReport(tuple(loads), tuple(runtime_errors)), True
-    loads = [unknown_load(e, "Pi exited before the run started") for e in extensions]
-    return LoadReport(tuple(loads), tuple(runtime_errors)), False
+    return None, False
 
 
 def unknown_load(extension: ExtensionFile, why: str) -> ExtensionLoad:
@@ -1063,6 +1163,52 @@ def usage_of(message: Mapping[str, Any]) -> Usage:
         cache_write_tokens=int(number(usage.get("cacheWrite"))),
         cost_usd=number(cost.get("total")) if isinstance(cost, dict) else 0.0,
     )
+
+
+def token_rates(assistant_messages: Sequence[Mapping[str, Any]]) -> tuple[float, float]:
+    """(USD per input token, USD per output token), from what Pi charged this run's own messages.
+    Pi prices every call from the configured model, so its summary call costs the same rates."""
+    totals = {"input": [0.0, 0.0], "output": [0.0, 0.0]}  # kind -> [tokens, dollars]
+    for message in assistant_messages:
+        usage = message.get("usage")
+        cost = usage.get("cost") if isinstance(usage, dict) else None
+        if not isinstance(cost, dict):
+            continue
+        for kind, total in totals.items():
+            tokens, dollars = number(usage.get(kind)), number(cost.get(kind))
+            if tokens > 0:
+                total[0] += tokens
+                total[1] += dollars
+    (input_tokens, input_dollars), (output_tokens, output_dollars) = totals["input"], totals["output"]
+    input_rate = input_dollars / input_tokens if input_tokens else 0.0
+    output_rate = output_dollars / output_tokens if output_tokens else 0.0
+    return input_rate, output_rate
+
+
+def compaction_usage(
+    session_entries: Sequence[Mapping[str, Any]], *, input_rate: float, output_rate: float
+) -> Usage:
+    """An upper-bound estimate of compaction's summary calls, which Pi makes but never reports.
+
+    Each `compaction` entry in the session file is one compaction. Unless an extension supplied
+    the summary (`fromHook`), Pi made one summary call, or two for a split turn, over at most
+    the context it recorded (`tokensBefore`), each capped at its maximum output. A compaction
+    cut short (a timeout mid-summary) writes no entry, so its call is not counted.
+    """
+    total = Usage()
+    for entry in session_entries:
+        if entry.get("type") != "compaction" or entry.get("fromHook") is True:
+            continue
+        input_tokens = int(number(entry.get("tokensBefore")))
+        output_tokens = COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS
+        if SPLIT_TURN_SUMMARY_MARKER in str(entry.get("summary", "")):
+            output_tokens += COMPACTION_TURN_PREFIX_MAX_OUTPUT_TOKENS
+        total += Usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=input_tokens * input_rate + output_tokens * output_rate,
+        )
+    return total
 
 
 def number(value: Any) -> float:

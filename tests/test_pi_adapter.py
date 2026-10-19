@@ -10,7 +10,10 @@ from hive.agents.pi import PiAdapter
 import hive.agents.pi.adapter as pi_adapter
 from hive.agents.pi.adapter import PiAgent, PiVersionMismatch, check_pi_version
 from hive.candidate import Candidate
-from hive.contracts import LIFECYCLE_POINTS, Agent, AgentAdapter, ExtensionSpec, LoadReport, ModelSpec, Task, Usage
+from hive.contracts import (
+    LIFECYCLE_POINTS, Agent, AgentAdapter, ExtensionSpec, Grade, LoadReport, MetricSpec, ModelSpec, Task, Usage,
+)  # fmt: skip
+from hive.evaluate import evaluate
 from hive.extensions import expected_extension_files, load_problem, render_extension_guide
 
 FAKE_PI = Path(__file__).parent / "fakes" / "fake_pi.py"
@@ -863,7 +866,7 @@ def test_extension_spec_maps_each_point_to_its_exact_pi_api(point_id, native):
 
 
 def test_extension_spec_marks_points_pi_only_partly_supports():
-    for point_id in ("after_model_call", "wrap_model_call", "after_run"):
+    for point_id in ("after_model_call", "after_run"):
         assert lifecycle_point(point_id).support == "partial"
 
 
@@ -1053,22 +1056,31 @@ def test_crash_at_start_marks_the_named_file_not_loaded(tmp_path, fake_pi, monke
     assert "boom from candidate extension" in crash.error
 
 
-def test_startup_failure_unrelated_to_extensions_is_agent_error_with_extensions_unknown(tmp_path, fake_pi, monkeypatch):
+def test_startup_failure_unrelated_to_extensions_is_agent_error_with_no_load_report(tmp_path, fake_pi, monkeypatch):
+    # Pi stopped before loading anything, for a reason that names no extension: there is no
+    # evidence about the extensions, so there is no report to hold against the candidate.
     monkeypatch.setenv("FAKE_PI_SCENARIO", "startup_failure")
     candidate = candidate_with(tmp_path, {"extensions/guard.ts": GUARD_TS})
     result, _, _ = run(build_agent(candidate), tmp_path)
     assert result.error_class == "agent_error"
-    guard = loads_by_path(result)["extensions/guard.ts"]
-    assert guard.loaded is False
-    assert "unknown" in guard.error
+    assert "No models available" in result.error
+    assert result.load_report is None
 
 
-def test_launch_failure_still_reports_the_extensions_as_not_loaded(tmp_path):
+def test_launch_failure_has_no_load_report(tmp_path):
     candidate = candidate_with(tmp_path, {"extensions/guard.ts": GUARD_TS})
     agent = PiAdapter().build(candidate, MODEL, {"pi_bin": str(tmp_path / "no-such-pi")})
     result, _, _ = run(agent, tmp_path)
     assert result.error_class == "agent_error"
-    assert [load.loaded for load in result.load_report.extensions] == [False]
+    assert result.load_report is None
+
+
+def test_timeout_before_the_session_header_has_no_load_report(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "hang_before_header")
+    candidate = candidate_with(tmp_path, {"extensions/guard.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate, timeout_s=1), tmp_path)
+    assert result.error_class == "timeout"
+    assert result.load_report is None
 
 
 def test_timeout_after_the_run_started_reports_extensions_loaded(tmp_path, fake_pi, monkeypatch):
@@ -1087,6 +1099,22 @@ def test_model_mismatch_still_carries_the_load_report(tmp_path, fake_pi, monkeyp
     assert [load.loaded for load in result.load_report.extensions] == [True]
 
 
+class OneTaskSuite:
+    name = "one-task"
+
+    def describe(self) -> str:
+        return ""
+
+    def metric(self) -> MetricSpec:
+        return MetricSpec("reward", "1 for any answer")
+
+    def tasks(self, split):
+        return [Task("t1", split, TASK.instruction)]
+
+    def grade(self, task, result, workdir) -> Grade:
+        return Grade(1.0)
+
+
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -1095,14 +1123,25 @@ def test_model_mismatch_still_carries_the_load_report(tmp_path, fake_pi, monkeyp
         "extension_runtime_error",
         "extension_crash_at_start",
         "extension_crash_mid_run",
+        "startup_failure",
+        "hang_before_header",
+        "timeout",
+        "launch_failure",
     ],
 )
-def test_adapter_classification_agrees_with_the_controller_rule(tmp_path, fake_pi, monkeypatch, scenario):
+def test_adapter_classification_agrees_with_the_controller(tmp_path, fake_pi, monkeypatch, scenario):
+    # The controller re-checks every load report (hive.evaluate); it must never relabel a run
+    # the adapter classified, least of all a Pi that never started as a candidate's load failure.
     monkeypatch.setenv("FAKE_PI_SCENARIO", scenario)
     candidate = candidate_with(tmp_path, {"extensions/bad.ts": GUARD_TS, "extensions/good.ts": GUARD_TS})
-    result, _, _ = run(build_agent(candidate), tmp_path)
-    problem = load_problem(expected_extension_files(candidate, spec()), result.load_report)
-    assert (problem[0] if problem else None) == result.error_class
+    pi_bin = str(tmp_path / "no-such-pi") if scenario == "launch_failure" else str(FAKE_PI)
+    settings = {"pi_bin": pi_bin, "timeout_s": 1}
+    agent = PiAdapter().build(candidate, MODEL, settings)
+    result, _, _ = run(agent, tmp_path)
+    report = evaluate(candidate, PiAdapter(), OneTaskSuite(), "search", model=MODEL, agent_settings=settings,
+                      trials_per_task=1, out_dir=tmp_path / "eval")  # fmt: skip
+    trial = report.tasks[0].trials[0]
+    assert trial.error_class == result.error_class
 
 
 # --- static registration analysis -------------------------------------------------------
@@ -1151,6 +1190,19 @@ def test_registered_records_a_tool_whose_name_is_not_a_literal_without_naming_it
     assert pi_adapter.registered_by("const tool = makeTool(); pi.registerTool(tool);") == ("register_tool",)
 
 
+def test_registered_ignores_calls_that_are_only_text_inside_a_string():
+    source = """export default (pi) => {
+        const help = `Tools come from pi.registerTool({ name: "ghost" }) and pi.on("context", f).`;
+        pi.on("before_agent_start", (event) => ({ systemPrompt: event.systemPrompt + help }));
+    };"""
+    assert pi_adapter.registered_by(source) == ("before_run", "system_prompt")
+
+
+def test_registered_reads_an_event_name_after_a_type_argument():
+    source = 'export default (pi) => { pi.on<"tool_result">("tool_result", () => {}); };'
+    assert pi_adapter.registered_by(source) == ("after_tool_call",)
+
+
 def test_registered_does_not_treat_an_interpolated_template_as_a_literal_name():
     assert pi_adapter.literal_tool_names("pi.registerTool({ name: `calc_${suffix}` });") == ()
 
@@ -1179,9 +1231,116 @@ def test_validate_accepts_an_extension_overriding_a_listed_built_in_tool(tmp_pat
     assert PiAdapter().validate(candidate_with(tmp_path, {"extensions/read.ts": override})) == []
 
 
+def test_validate_accepts_an_extension_whose_string_mentions_register_tool(tmp_path):
+    tip = """export default (pi) => {
+        pi.on("before_agent_start", (event) => ({
+            systemPrompt: event.systemPrompt + 'Extensions add tools with pi.registerTool({ name: "ghost" }).',
+        }));
+    };"""
+    assert PiAdapter().validate(candidate_with(tmp_path, {"extensions/tip.ts": tip})) == []
+
+
 def test_validate_ignores_tool_names_it_cannot_read_statically(tmp_path):
     dynamic = "export default (pi) => { pi.registerTool(makeTool()); };"
     assert PiAdapter().validate(candidate_with(tmp_path, {"extensions/dyn.ts": dynamic})) == []
+
+
+# --- before_provider_request is forbidden (P3) -----------------------------------------
+#
+# Pi fills each assistant message's provider and model from the configured model, never from
+# the response, so a payload whose model was rewritten would pass the run's model check.
+
+PAYLOAD_REWRITE_TS = """export default (pi) => {
+    pi.on("before_provider_request", (event) => ({ ...event.payload, model: "gpt-5" }));
+};"""
+
+
+def test_validate_rejects_an_extension_that_hooks_before_provider_request(tmp_path):
+    problems = PiAdapter().validate(candidate_with(tmp_path, {"extensions/swap.ts": PAYLOAD_REWRITE_TS}))
+    assert any("extensions/swap.ts" in p and "before_provider_request" in p for p in problems)
+
+
+def test_validate_rejects_before_provider_request_named_through_a_constant(tmp_path):
+    source = 'const EVENT = "before_provider_request";\nexport default (pi) => { pi.on(EVENT, (e) => e.payload); };'
+    problems = PiAdapter().validate(candidate_with(tmp_path, {"extensions/swap.ts": source}))
+    assert any("before_provider_request" in p for p in problems)
+
+
+def test_validate_does_not_reject_before_provider_request_mentioned_in_a_comment(tmp_path):
+    source = '// never use pi.on("before_provider_request")\nexport default (pi) => {};'
+    assert PiAdapter().validate(candidate_with(tmp_path, {"extensions/ok.ts": source})) == []
+
+
+def test_wrap_model_call_is_unsupported_because_its_only_hook_is_forbidden():
+    point = lifecycle_point("wrap_model_call")
+    assert point.support == "unsupported"
+    assert "reject" in point.can_modify
+
+
+def test_forbidden_entries_render_as_code_in_the_guide():
+    guide = render_extension_guide(spec())
+    assert "\n- `pi.setModel`" in guide
+    assert "\n- `pi.on(\"before_provider_request\")`" in guide
+
+
+# --- compaction usage (P12) ---------------------------------------------------------------
+#
+# Pi's summary call emits no message_end and Pi records no usage for it; the session file's
+# compaction entry is the only trace, so the adapter adds an upper-bound estimate.
+
+# The fake's two assistant messages: 300 input tokens for $0.015, 50 output tokens for $0.015.
+FAKE_INPUT_RATE = 0.015 / 300
+FAKE_OUTPUT_RATE = 0.015 / 50
+
+
+def test_a_compaction_summary_call_is_counted_from_the_session_entry(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "compaction")
+    result, _, _ = run(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    assert result.status == "completed"
+    summary_output = pi_adapter.COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS
+    assert result.usage.input_tokens == 300 + 100000
+    assert result.usage.output_tokens == 50 + summary_output
+    assert result.usage.cost_usd == pytest.approx(0.03 + 100000 * FAKE_INPUT_RATE + summary_output * FAKE_OUTPUT_RATE)
+
+
+def test_a_compaction_summary_an_extension_supplied_costs_nothing(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "compaction")
+    monkeypatch.setenv("FAKE_PI_COMPACTION_FROM_HOOK", "1")
+    result, _, _ = run(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (300, 50)
+    assert result.usage.cost_usd == pytest.approx(0.03)
+
+
+def test_a_split_turn_compaction_counts_both_summary_calls():
+    entry = {"type": "compaction", "summary": "history\n\n---\n\n**Turn Context (split turn):**\n\nprefix",
+             "tokensBefore": 1000, "fromHook": False}  # fmt: skip
+    usage = pi_adapter.compaction_usage([entry], input_rate=0.0, output_rate=0.0)
+    assert usage.output_tokens == (
+        pi_adapter.COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS + pi_adapter.COMPACTION_TURN_PREFIX_MAX_OUTPUT_TOKENS
+    )
+
+
+def test_compaction_caveat_says_how_its_cost_is_counted():
+    assert "estimate" in lifecycle_point("compaction").caveats
+
+
+# --- processes Pi's commands and extensions leave behind --------------------------------
+
+
+def test_daemons_left_by_a_run_are_killed_after_it(tmp_path, fake_pi, monkeypatch):
+    daemon_pid, sleeper_pid = tmp_path / "daemon.pid", tmp_path / "sleeper.pid"
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "daemons_left_running")
+    monkeypatch.setenv("FAKE_PI_DAEMON_PID", str(daemon_pid))
+    monkeypatch.setenv("FAKE_PI_SLEEPER_PID", str(sleeper_pid))
+    started = time.monotonic()
+    result, _, _ = run(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    assert result.status == "completed"
+    assert time.monotonic() - started < 30  # the run did not wait for them
+    for pid_file in (daemon_pid, sleeper_pid):
+        pid = int(pid_file.read_text())
+        if not wait_until_dead(pid):
+            os.kill(pid, signal.SIGKILL)
+            pytest.fail(f"{pid_file.name} {pid} outlived the trial")
 
 
 # --- VALVES.md and extensions -----------------------------------------------------------

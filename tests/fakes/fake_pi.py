@@ -185,6 +185,28 @@ def spawn_sleepers() -> None:
                 handle.write(str(pid))
 
 
+def spawn_daemons() -> None:
+    daemon_code = (
+        "import os, sys, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    if os.fork() == 0:\n"
+        "        open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+        "        time.sleep(60)\n"
+        "    os._exit(0)\n"
+    )
+    daemon_pid_path = os.environ.get("FAKE_PI_DAEMON_PID", os.devnull)
+    # Pi gives its bash commands pipes of its own, so neither holds Pi's stdout open.
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    subprocess.run([sys.executable, "-c", daemon_code, daemon_pid_path], check=True, **quiet)
+    sleeper = subprocess.Popen(["sleep", "60"], start_new_session=True, **quiet)
+    pid_path = os.environ.get("FAKE_PI_SLEEPER_PID")
+    if pid_path:
+        with open(pid_path, "w") as handle:
+            handle.write(str(sleeper.pid))
+    time.sleep(1.2)  # long enough for the adapter to see the sleeper as Pi's child
+
+
 def failing_extensions() -> list[str]:
     """The -e files a failure scenario blames: FAKE_PI_FAILING_EXTENSION when set, else those
     named bad*, else the first, else a placeholder."""
@@ -303,6 +325,22 @@ def main() -> int:
         sys.stderr.write("partial stderr before hang\n")
         sys.stderr.flush()
         time.sleep(60)
+    elif scenario == "hang_before_header":
+        # Pi stuck at startup (a slow provider lookup, say): nothing on stdout before the kill.
+        time.sleep(60)
+    elif scenario == "compaction":
+        # Pi compacted the context after the run: the summary call is in no event, only its
+        # entry in the session file (agent-session.js _runAutoCompaction).
+        from_hook = os.environ.get("FAKE_PI_COMPACTION_FROM_HOOK") == "1"
+        write_session([{"type": "compaction", "id": "e3", "parentId": "e2", "summary": "## Goal\nfind 6 * 7",
+                        "firstKeptEntryId": "e1", "tokensBefore": 100000, "fromHook": from_hook}])
+        emit(SUCCESS_EVENTS)
+        emit([{"type": "compaction_start", "reason": "threshold"}])
+    elif scenario == "daemons_left_running":
+        # A bash command that daemonized (fork + setsid) and an extension's own detached child,
+        # neither in any process group the adapter knows of.
+        spawn_daemons()
+        emit(SUCCESS_EVENTS)
     elif scenario == "timeout_ignores_sigterm":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         emit([HEADER])
