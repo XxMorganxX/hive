@@ -83,6 +83,50 @@
     - **Observed:** 1098 tests pass, including real offline framework runs through the runners with the scripted provider.
 - 2026-10-19: Launched an adversarial review (5 lenses, two skeptics per finding).
 
+- 2026-10-19: Adapter review: 5 lenses, 81 agents. 34 findings confirmed, 4 refuted. The highs share one root cause: the provider key, the model check and the spend count all live in the same process as candidate extension code, so they were *detection*, not a boundary.
+  - **The key leaks:** the agent's shell reads it from the runner's exec environment (`ps eww $PPID`), and it lands in traces the overseer reads.
+  - **Calls escape the checks:** an extension can call another model or change effort through the client object.
+  - **Spend can be erased:** an extension can rewrite `trace.jsonl` so the run reads $0.
+
+  The 20 findings that don't depend on the fix are being fixed in parallel: key via stdin, call limits, name and tool collisions, load-report precedence, attribution, validators, Pi compaction usage, setsid escapes.
+- 2026-10-19: **Decision (user): build a controller-side model gateway now.** **Decision (user): no real Deep Agents / Strands runs by me;** the user will export `OPENAI_API_KEY`.
+
+## Model gateway (spec)
+
+**Why.** Model access is where P3 (frozen model), P12 (spend) and key secrecy are decided. Today all three are decided inside the trial process, next to candidate code, so they can only be detected. Moving them into the controller makes them a boundary, the same for every framework.
+
+**What.** `hive/gateway/` is trusted, stdlib-only, controller-side code. It is a threaded HTTP server on `127.0.0.1:<ephemeral>` that speaks the OpenAI-compatible API.
+- **Per-trial grants.**
+  - `open_trial()` mints a random per-trial token and returns a `ModelEndpoint(base_url, api_key=<token>)`.
+  - `close_trial()` revokes the token and returns the trial's `TrialLedger`.
+  - The real provider key is read once from the controller's environment (`OPENAI_API_KEY` for provider `openai`) and never leaves the gateway.
+- **Each request** (`POST /v1/chat/completions`, `POST /v1/responses`; anything else is refused):
+  - **Auth:** an unknown or revoked token gets 401.
+  - **Model and effort (P3):** `model` must equal the experiment's model id. The effort (`reasoning_effort` for chat, `reasoning.effort` for responses) must equal `[model] thinking`; if absent, the gateway sets it. A mismatch gets 403 and is recorded as a violation.
+  - **Cost-changing parameters:** `service_tier` other than default/auto and `n > 1` get 403 and a violation.
+  - **Call limit:** past `max_model_calls_per_trial`, requests get 403 and `limit_reached` is set.
+  - **Forwarding:** requests go upstream with the real key. Streaming is passed through as it arrives, and usage is parsed on the way: chat `include_usage` is injected if missing and the final chunk read; responses use the `response.completed` event.
+  - **Billing:** the gateway reads the upstream response to the end even if the client disconnected (bounded), so a killed trial is still billed.
+  - **Recording:** every call is logged with the requested and provider-reported model, normalized usage (`input` excludes cache reads), the HTTP status and any error code (e.g. `insufficient_quota`).
+- **The controller.** `evaluate()` opens a grant per trial, passes the endpoint to `Agent.run(..., endpoint)`, closes the grant after the run, and applies the ledger.
+  - **Usage and cost come from the ledger** (`[model] prices`), not from the adapter.
+  - **Any violation or reported-model mismatch** makes the trial `model_mismatch`.
+  - **The call limit** makes it `agent_error`, with the reason stated.
+  - **An upstream quota code** makes an errored run `quota`.
+  - The ledger is written to `trial_dir/gateway.json` as evidence.
+- **Contract.**
+  - `Agent.run(task, workdir, trace_dir, endpoint: ModelEndpoint | None)`. Every adapter must send ALL model traffic to the endpoint when one is given.
+  - `ModelSpec` is unchanged.
+  - Prices move from `[agent]` to `[model] prices`, because cost is a property of the model and is now computed in one place.
+  - `[evaluation] max_model_calls_per_trial`.
+- **Adapters.**
+  - **Pi:** a `models.json` in its per-run agent dir points the provider at the endpoint, with the token as key.
+  - **Deep Agents:** `ChatOpenAI(base_url=…, api_key=token)`.
+  - **Strands:** `AsyncOpenAI(base_url=…, api_key=token)`.
+  - The token travels on stdin, as the credential convention already does.
+- **Offline / test.** Provider `scripted` gets no gateway (`endpoint=None`). Gateway tests use a fake upstream server, a local HTTP server that streams canned SSE.
+- **Limits that stay.** The gateway can't stop a trial from opening its own connection to the internet with a key it doesn't have. Without the key, though, there is nothing to bill, and the in-process checks remain as a second line of detection.
+
 ## Open questions
 
 - Credentials. Pi's only credential is an OpenAI key in `~/.pi/agent/auth.json`. Deep Agents (`langchain-openai`) and Strands (OpenAI provider) read `OPENAI_API_KEY` from the environment, so a real smoke run needs that variable set.
