@@ -216,3 +216,125 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 
 Full comparisons: [pi-harness](research/pi-harness.md), [langchain-deep-agents](research/langchain-deep-agents.md), [aws-strands](research/aws-strands.md).
 
+## 5. The standard interface
+
+Plugging in a new framework or harness means writing **one adapter**. Nothing else changes. The interface has three layers, and each has exactly one owner.
+
+```
+            ┌───────────────────── controller (trusted, Python) ─────────────────────┐
+optimizer → │ proposals → Harness.validate → smoke → Harbor run → Suite.classify → select │
+            └───────────┬──────────────────────────────┬──────────────────────────────┘
+                        │ Harness protocol             │ Suite protocol
+                        ▼                              ▼
+              adapters/<framework>/          suites/<use-case>/
+              (only code that knows Pi,      (tasks, splits, verifier,
+               Strands, Deep Agents)          scoring rule, metrics)
+                        │
+                        ▼  Harbor execution contract
+              Harbor agent class (module:Class) running in a sandbox
+```
+
+### 5.1 The harness spec (what a candidate is)
+
+A framework-neutral envelope around framework-native files. The candidate id is the content hash of everything except `lineage.json`.
+
+```
+<candidate>/
+  hive.toml          # manifest: framework, pinned framework_version, adapter, schema_version
+  topology.yaml      # roles, edges, limits, coordination rules (neutral; see 5.2)
+  roles/<role>.md    # one per role: frontmatter (name, tools, description) + role prompt
+  native/            # framework-native valves, opaque to everything but the adapter
+                     #   Pi: SYSTEM.md, APPEND_SYSTEM.md, AGENTS.md, settings.json,
+                     #       extensions/*.ts, skills/*/SKILL.md, prompts/
+  lineage.json       # parents, origin, rationale (excluded from the hash)
+```
+
+The **model is not in the harness spec.** It lives in the experiment config and is injected by the controller (P3).
+
+### 5.2 The topology spec (the research variable)
+
+Topology is described neutrally, so the same organization can be compiled into any framework and compared across frameworks.
+
+```yaml
+kind: manager-worker        # single | hierarchical | manager-worker | peer
+entry: manager              # role that receives the task instruction
+edges:                      # who may reach whom, and how
+  - { from: manager, to: coder,    mode: delegate }   # delegate = call and await result
+  - { from: manager, to: reviewer, mode: delegate }
+  - { from: coder,   to: reviewer, mode: message }    # message = peer channel
+limits: { max_depth: 2, max_fanout: 3, max_agents_total: 8, max_turns_per_agent: 40 }
+coordination:
+  handoff: summary          # summary | full_context: what a child sees from its parent
+  parallel_children: true
+  termination: entry_decides   # entry_decides | vote | first_success
+```
+
+- **Adapters compile this.** Pi compiles it into a subagent extension. Strands compiles it into agents-as-tools or a Graph. Deep Agents compiles it into `task`-tool subagents.
+- **Unsupported shapes are rejected.** If a framework can't express an edge mode, the adapter's `validate` rejects it with a reason. It never quietly approximates.
+- **This schema is v0.** It will change once the Pi compiler exists. Changes are versioned through `schema_version`.
+
+### 5.3 Harness protocol (the controller ↔ adapter seam)
+
+```python
+class Harness(Protocol):
+    framework: str                                    # "pi", "strands", "deepagents"
+
+    def seed(self, topology: str = "single") -> Candidate: ...
+        # stock baseline for this framework and topology kind
+
+    def validate(self, candidate: Candidate) -> Verdict: ...
+        # never raises; schema + typecheck + real load check; reasons on failure
+
+    def build(self, candidate: Candidate, dest: Path) -> Path: ...
+        # materialize the native layout the framework will load
+
+    def agent_ref(self, built: Path, run: RunConfig) -> HarborAgentRef: ...
+        # import path + kwargs for `harbor run -a module:Class`; model injected from run
+
+    def describe_schema(self) -> str: ...
+        # every valve the optimizer may edit; embedded verbatim in the optimizer prompt
+```
+
+### 5.4 Harbor execution contract (what every adapter's agent must do)
+
+The adapter's Harbor agent class (for Pi, a `HivePi` subclass of Harbor's built-in `pi` agent) must:
+
+1. **Load the harness spec exactly.** Pi skips project `.pi/` resources in headless mode unless told otherwise, so install the spec into a dedicated `PI_CODING_AGENT_DIR`.
+2. **Write `hive/load_report.json`,** listing what actually loaded: prompt sections, tools, extensions, roles. The controller compares it with the spec, and any mismatch counts as `errored`. Without this, an extension that failed to load looks like a harness that doesn't work.
+3. **Fill `AgentContext`:** input, cached and output tokens, and `cost_usd`.
+4. **Emit ATIF `trajectory.json`** with **`subagent_trajectories` for every child agent.** Keep native traces (Pi session JSONL plus the event stream) next to it.
+5. **Classify its own exit:** parse `stopReason` and never infer success from the exit code.
+
+### 5.5 Suite protocol (the controller ↔ use case seam)
+
+```python
+class Suite(Protocol):
+    name: str
+    dataset: str                                     # Harbor dataset path or registry ref, pinned
+    def tasks(self, split: Split) -> list[TaskId]: ...   # search | validation | heldout; disjoint
+    def classify(self, task: TaskId, trials: list[TrialResult]) -> Outcome: ...
+        # the ONLY place the pass rule and reward composition live
+    def metrics(self) -> list[MetricSpec]: ...       # primary reward + secondary metrics
+```
+
+Every use case is one suite. A use case's evaluation metrics are defined in `classify` and `metrics`, and nowhere else.
+
+### 5.6 Outcome (the one result type)
+
+```python
+Status = Literal["passed", "failed", "errored", "noop", "incomplete"]
+
+@dataclass(frozen=True)
+class Outcome:
+    task: TaskId
+    status: Status
+    reward: float                 # mean over measured trials, in [0, 1]
+    trial_rewards: tuple[float, ...]
+    cost_usd: float
+    tokens: TokenUsage            # input, cached, output, reasoning
+    wall_clock_s: float
+    agents_spawned: int           # 1 for single-agent
+    trace_ref: Mapping[str, str]  # paths to trajectory.json, native traces, load_report
+    error_class: str | None       # INFRA_TIMEOUT | INFRA_QUOTA | INFRA_OOM | INFRA_MISSING | MEASUREMENT_LOST
+```
+
