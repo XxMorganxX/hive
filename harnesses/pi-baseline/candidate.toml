@@ -1,7 +1,6 @@
 schema_version = 1
 agent = "pi"
-description = "Stock single-agent Pi: default system prompt, no extensions or skills, low thinking, default tools."
+description = "Stock single-agent Pi: default system prompt, no extensions or skills, default tools."
 
 [valves]
-thinking = "low"
 tools = ["read", "bash", "edit", "write"]
