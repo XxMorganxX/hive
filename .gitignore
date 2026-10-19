@@ -36,3 +36,6 @@ experience/
 
 # Personal Claude Code settings and plugins
 .claude/
+
+# Course proposal PDF (lists student NetIDs); kept locally, never published
+CS 4701_ Project Proposal*.pdf

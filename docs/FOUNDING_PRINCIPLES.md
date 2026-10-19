@@ -564,7 +564,7 @@ These are for the team. Each has a default, so work can go ahead until someone o
 
 ## 12. References
 
-- Project proposal: `CS 4701_ Project Proposal (1).pdf`
+- Project proposal: the CS 4701 course submission (not in this repo; it lists student NetIDs)
 - Meta-Harness paper: <https://arxiv.org/abs/2603.28052>, code at stanford-iris-lab/meta-harness
 - Mismanaged Geniuses Hypothesis: <https://alexzhang13.github.io/blog/2026/mgh/>
 - Harbor: <https://github.com/harbor-framework/harbor>
