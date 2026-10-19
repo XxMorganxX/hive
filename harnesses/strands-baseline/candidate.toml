@@ -1,0 +1,7 @@
+schema_version = 1
+agent = "strands"
+description = "Stock single-agent Strands: no candidate system prompt (Strands has none of its own), no extensions or skills, the SDK's vended shell and file_editor, Strands' default 40-message window."
+
+[valves]
+tools = ["shell", "file_editor"]
+conversation_window = 40

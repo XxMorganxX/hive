@@ -1,0 +1,101 @@
+# How Strands extensions are written: the data behind StrandsAdapter.extension_spec().
+#
+# The controller renders this into the overseer's extension guide (hive/extensions.py), so it
+# is instruction text and lives here, not in code. Every claim was checked against the
+# installed strands-agents source (hooks/events.py, hooks/registry.py, plugins/plugin.py,
+# plugins/registry.py, agent/agent.py) and by offline runs with a scripted model. When the
+# pinned version changes, re-check every row, then EXTENSIONS_API.md, then bump `version`.
+
+framework = "strands-agents"
+version = "1.61.1"
+language = "python"
+suffixes = [".py"]
+
+entry_convention = """\
+define a top-level, non-async function `def extension()` that takes no arguments and returns \
+one instance of a `strands.plugins.Plugin` subclass whose `name` equals the file's stem \
+(`extensions/guard.py` -> `name = "guard"`). HIVE imports the file on its own (no sibling \
+imports), calls `extension()`, and attaches the plugin: `init_agent(agent)` runs first, then \
+every `@hook` method is registered for the event type in its annotation, then every `@tool` \
+method is added as a tool (active only if its name is in the `tools` valve). Inside \
+`init_agent` you may also call `agent.add_hook(callback)` or `agent.hooks.add_hook(provider)` \
+for a HookProvider. A hook that raises aborts the whole run (`extension_error`); a tool that \
+raises only returns an error result to the model."""
+
+forbidden = [
+  "assigning `agent.model` (or `event.agent.model`), or calling `agent.model.update_config(...)`: the model and its parameters are fixed by the experiment (P3)",
+  "importing `strands.models` or any model class (`BedrockModel`, `OpenAIModel`, `AnthropicModel`, ...), `openai`, `boto3`, `botocore` or `anthropic`",
+  "`strands._middleware` and `strands.models.routing.ModelRouter`: private, provisional, and they route the model call",
+  "creating another `Agent` (a sub-agent) without passing `model=agent.model`: Strands defaults to `BedrockModel`, which HIVE disables",
+  "`aux_model`, or a `SummarizingConversationManager` given its own `summarization_agent` with a different model",
+]
+
+[[lifecycle]]
+id = "before_run"
+support = "supported"
+native_api = "@hook def f(self, event: BeforeInvocationEvent)"
+can_modify = "event.messages (rewrite or redact the input messages); event.cancel = True or a message (end the run before any model call)"
+caveats = "Fires once per invocation, and again for each AfterInvocationEvent.resume. Cancelling ends the run without a final answer, which HIVE scores as agent_error."
+
+[[lifecycle]]
+id = "system_prompt"
+support = "supported"
+native_api = "event.agent.system_prompt = ... in a BeforeInvocationEvent or BeforeModelCallEvent hook (or in init_agent)"
+can_modify = "the whole system prompt string"
+caveats = "The change persists for the rest of the run. HIVE's system prompt ends with the absolute working directory, which file_editor needs: keep that line when you replace the prompt. Prefer SYSTEM.md for static text."
+
+[[lifecycle]]
+id = "before_model_call"
+support = "partial"
+native_api = "@hook def f(self, event: BeforeModelCallEvent)"
+can_modify = "event.cancel only. The context is edited by mutating event.agent.messages in place"
+caveats = "In-place edits to event.agent.messages persist in the conversation; they are not limited to this one call (unlike Pi's context event). event.projected_input_tokens is read-only. Writing any field that is not writable raises AttributeError, which aborts the run as extension_error."
+
+[[lifecycle]]
+id = "after_model_call"
+support = "supported"
+native_api = "@hook def f(self, event: AfterModelCallEvent)"
+can_modify = "event.retry = True (call the model again); read event.stop_response (.message, .stop_reason) and event.exception"
+caveats = "A retry discards the reply that was just received (it is never added to the conversation). Every retry is another paid model call; guard against retrying forever. After* hooks run in reverse registration order. HIVE's own retry strategy already handles throttling."
+
+[[lifecycle]]
+id = "wrap_model_call"
+support = "unsupported"
+native_api = "none public (only the private strands._middleware.InvokeModelStage, used by the provisional ModelRouter)"
+can_modify = "nothing"
+caveats = "Forbidden: routing or wrapping the model call can switch the model (P3). Use before_model_call / after_model_call instead."
+
+[[lifecycle]]
+id = "before_tool_call"
+support = "supported"
+native_api = "@hook def f(self, event: BeforeToolCallEvent); for a whole batch, BeforeToolsEvent"
+can_modify = "event.tool_use (rewrite the 'input' dict), event.selected_tool (swap the tool object), event.cancel_tool = True or a message (the model sees it as an error result); BeforeToolsEvent.cancel cancels the batch"
+caveats = "Tools requested in one model turn run concurrently by default, so the events of one batch interleave. Tool names arrive in event.tool_use['name']."
+
+[[lifecycle]]
+id = "after_tool_call"
+support = "supported"
+native_api = "@hook def f(self, event: AfterToolCallEvent); for a whole batch, AfterToolsEvent"
+can_modify = "event.result (replace the ToolResult dict: status, content), event.retry = True (run the tool again); AfterToolsEvent.end_turn stops the loop after this batch"
+caveats = "After* hooks run in reverse registration order. event.exception is set when the tool raised; event.result then already holds the error result the model would see."
+
+[[lifecycle]]
+id = "register_tool"
+support = "supported"
+native_api = "@tool methods on the Plugin (from strands import tool)"
+can_modify = "adds a tool with the method's name, docstring (description) and typed arguments (schema)"
+caveats = "A tool is offered to the model only if its name is in the tools valve; otherwise it is dropped and missing from the load report. Names must be unique across the vended tools and every extension. A tool that raises becomes an error result and the run goes on (not extension_error)."
+
+[[lifecycle]]
+id = "compaction"
+support = "partial"
+native_api = "in init_agent: agent.conversation_manager = <your strands.agent.conversation_manager.ConversationManager subclass>"
+can_modify = "how agent.messages is trimmed or summarized: apply_management(agent) after each invocation, reduce_context(agent, e) on a context overflow"
+caveats = "HIVE's default is SlidingWindowConversationManager(window_size = the conversation_window valve), whose hooks are already registered before init_agent runs; replacing the attribute does not unregister them. A summarizing manager must use the agent's own model, never a second one (P3)."
+
+[[lifecycle]]
+id = "after_run"
+support = "supported"
+native_api = "@hook def f(self, event: AfterInvocationEvent)"
+can_modify = "event.resume = <new input> (re-enter the loop with another user turn); read event.result (.stop_reason, .message)"
+caveats = "Resuming runs the loop again, with more paid model calls, and the trial's time limit still applies. After* hooks run in reverse registration order."

@@ -1,0 +1,7 @@
+# The Strands runner's venv (.venvs/strands), built by scripts/setup-framework-venvs.sh.
+# Exact pins (P13): the adapter checks strands-agents' installed version against the
+# experiment's strands_version. openai is pinned explicitly because the [openai] extra
+# allows anything below 3.0. strands-agents-tools is deliberately absent: its shell and
+# editor are deprecated, and the runner uses the SDK's own strands.vended_tools.
+strands-agents[openai]==1.61.1
+openai==2.54.0
