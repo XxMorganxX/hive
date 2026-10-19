@@ -18,6 +18,7 @@ import pytest
 
 import hive.agents.deepagents.adapter as da
 from hive.agents.deepagents import DeepAgentsAdapter
+from hive.agents.process import TRIAL_MARKER_ENV
 from hive.candidate import Candidate
 from hive.contracts import LIFECYCLE_POINTS, AgentAdapter, ModelSpec, Task
 from hive.extensions import expected_extension_files, render_extension_guide
@@ -379,7 +380,7 @@ def test_runner_is_referenced_by_absolute_path_and_exists():
     assert da.RUNNER.is_absolute() and da.RUNNER.is_file()
 
 
-def test_environment_holds_only_path_home_lang_and_the_provider_key(tmp_path, fake_python, monkeypatch):
+def test_environment_holds_only_path_home_and_lang(tmp_path, fake_python, monkeypatch):
     for name, value in {
         "LANGSMITH_API_KEY": "ls-secret", "LANGSMITH_TRACING": "true", "LANGCHAIN_TRACING_V2": "true",
         "AWS_ACCESS_KEY_ID": "AKIA", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel", "ANTHROPIC_API_KEY": "sk-ant",
@@ -387,9 +388,18 @@ def test_environment_holds_only_path_home_lang_and_the_provider_key(tmp_path, fa
     }.items():  # fmt: skip
         monkeypatch.setenv(name, value)
     _, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python), tmp_path)
-    env = {name: value for name, value in record(trace_dir)["env"].items() if not name.startswith("__CF")}
-    assert set(env) == {"PATH", "HOME", "LANG", "OPENAI_API_KEY"}
-    assert env["OPENAI_API_KEY"] == "sk-test-not-a-real-key"
+    env = {name: value for name, value in record(trace_dir)["env"].items()
+           if not name.startswith("__CF") and name != TRIAL_MARKER_ENV}  # fmt: skip
+    assert set(env) == {"PATH", "HOME", "LANG"}
+
+
+def test_the_provider_key_is_sent_as_one_json_line_on_stdin(tmp_path, fake_python):
+    # Not in the environment: a process's exec-time environment stays readable (ps eww) after
+    # os.environ.pop, so the runner reads the key from stdin and hands it to the client.
+    _, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python), tmp_path)
+    stdin = record(trace_dir)["stdin"]
+    assert stdin.endswith("\n") and stdin.count("\n") == 1
+    assert json.loads(stdin) == {"credentials": {"OPENAI_API_KEY": "sk-test-not-a-real-key"}}
 
 
 def test_home_is_a_fresh_directory_in_the_trace_dir(tmp_path, fake_python):
@@ -410,8 +420,9 @@ def test_scripted_provider_gets_no_credential(tmp_path, fake_python):
     model = ModelSpec(provider="scripted", id="gpt-5-nano")
     _, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python, model=model, scripted_turns_path=str(turns)),
                           tmp_path)  # fmt: skip
-    env = {name for name in record(trace_dir)["env"] if not name.startswith("__CF")}
+    env = {name for name in record(trace_dir)["env"] if not name.startswith("__CF") and name != TRIAL_MARKER_ENV}
     assert env == {"PATH", "HOME", "LANG"}
+    assert json.loads(record(trace_dir)["stdin"]) == {"credentials": {}}
     spec = json.loads((trace_dir / "run_spec.json").read_text())
     assert spec["model"]["provider"] == "scripted" and spec["scripted_turns_file"] == str(turns.resolve())
 

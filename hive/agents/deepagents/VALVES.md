@@ -15,7 +15,7 @@ rejected. Make one isolated change per proposal.
 | Valve | Type | Default | What it does |
 |---|---|---|---|
 | `tools` | list of strings | `["ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute"]` | The tool allowlist over built-in and extension tools alike. A tool not listed is hidden from the model, and a call to it is refused. The built-ins are the eight defaults (`execute` runs a shell command in the working directory) and `task` (only with `general_purpose_subagent = true`). A tool an extension registers must be listed here, or that extension fails to load. An empty list disables every tool. Names must be unique. |
-| `general_purpose_subagent` | true / false | `false` | Adds deepagents' general-purpose subagent and its `task` tool (list `task` in `tools` too), so the model can hand a subtask to a fresh agent with the same model and tools. **Caveat:** your extension middleware does not reach the subagent: deepagents applies main-agent middleware only to the main agent, so hooks that gate or rewrite tool calls are bypassed for work the model delegates. HIVE's own tool allowlist, model-call limit and tool-error handling do apply to it. |
+| `general_purpose_subagent` | true / false | `false` | Adds deepagents' general-purpose subagent and its `task` tool (list `task` in `tools` too), so the model can hand a subtask to a fresh agent with the same model and tools. **Caveat:** your extension middleware does not reach the subagent: deepagents applies main-agent middleware only to the main agent, so hooks that gate or rewrite tool calls are bypassed for work the model delegates. HIVE's own tool allowlist and tool-error handling do apply to it, the step limit applies to each of its runs, and its model calls count toward the one model-call limit of the trial, shared with the main agent. |
 
 No other valve names are accepted. `schema_version` and `agent = "deepagents"` must stay as they
 are; `description` is free text and may be updated to describe the change.
@@ -35,8 +35,10 @@ Extensions are first-class: the controller renders an extension guide for you (w
 sits, what it can change, its caveats, what is forbidden, and the pinned API reference). In short,
 each `extensions/<name>.py` defines `def extension():` returning `AgentMiddleware` instances and/or
 `BaseTool` objects. The controller checks every run: a file that fails to import, lacks
-`extension()`, returns anything else, has an async-only hook, or registers a tool missing from
-`tools` makes the trial `harness_load_error`; an exception thrown by extension code during the run
+`extension()`, returns anything else, has an async-only hook, registers a tool missing from
+`tools`, or returns middleware named like an entry of deepagents' middleware stack or a HIVE guard
+(only `SummarizationMiddleware` may be taken, by one extension) makes the trial
+`harness_load_error`; an exception thrown by extension code during the run
 makes it `extension_error`. Both score 0. An exception thrown by a tool itself does **not**: it
 becomes an error result the model sees, and the run goes on.
 
@@ -50,9 +52,12 @@ is `quota`; any other provider failure is `provider_error`. All score 0.
 ## Not editable
 
 - **The model**: provider, id and its thinking level (reasoning effort) are fixed by the experiment
-  so that a score change reflects the harness, not the model. HIVE checks every
-  request and every reply: a run that sends a request with another model or reasoning effort, or
-  gets a reply from another model, is marked `model_mismatch` and counted as 0.
+  so that a score change reflects the harness, not the model. HIVE checks every request made
+  through the agent's model and every reply it traces: a run that sends a request with another
+  model or reasoning effort, or gets a reply from another model, is marked `model_mismatch` and
+  counted as 0. Extension code runs in the same process as the agent, so these checks catch
+  mistakes and plain violations; they are not a sandbox. Getting around them, for example by
+  calling the provider client behind the model directly, is forbidden.
 - **Run settings**: the deepagents version, the time limit per task, the model-call and step
   limits, the shell command timeout and the provider retry policy. These belong to the experiment.
 - `lineage.json`, which the controller writes.

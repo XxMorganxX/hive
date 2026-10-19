@@ -4,7 +4,8 @@ Started by hive/agents/deepagents/adapter.py as
 
     <venv python> -I runner.py <trace_dir>/run_spec.json        (cwd = the trial workdir)
 
-This file imports only the stdlib and the framework, never hive: it runs in another venv,
+with one JSON line on stdin, `{"credentials": {"OPENAI_API_KEY": "..."}}` (empty for the
+scripted provider). This file imports only the stdlib and the framework, never hive: it runs in another venv,
 and nothing in the controller may depend on the framework. It speaks the runner protocol of
 hive/agents/runner_protocol.py through files:
 
@@ -21,37 +22,55 @@ and langchain-openai 1.7.2. Why the less obvious choices:
 
 - Usage is summed per model call from `on_llm_end` callbacks, not from the final state: the
   final state holds only the main agent's messages, so subagent calls would go unpaid (P12).
-- Every request is checked in `on_chat_model_start` (model id and reasoning effort) and the
-  callback raises before the request is sent: an extension that overrides the model or its
-  settings must not get a paid call through (P3). Replies are checked by the controller.
+- Every request that goes through the agent's chat model is checked in `on_chat_model_start`
+  (model id and reasoning effort) and counted there against `max_model_calls`, and the callback
+  raises before the request is sent: an extension that overrides the model or its settings must
+  not get a paid call through (P3), and every handler call inside wrap_model_call, every
+  summarization call and every subagent call is a paid call. One counter per trial, held by the
+  callback object (not graph state), so subagents share it. Replies are checked by the controller.
 - `LocalShellBackend.execute` starts each command in a new session and waits on pipes, so a
   group kill misses it and `cmd &` blocks until its timeout. HIVE's subclass records each
   command's process group and waits on the shell itself, with output going to files.
-- HIVE's guards sit after the candidate's middleware: a tool allowlist (the `tools` valve),
-  a model-call limit raising an error (the stock `end` behaviour fakes a final answer), and
-  ToolErrorMiddleware, so a tool's own exception becomes an error result while an
-  extension hook's exception still ends the run.
+- HIVE's guards sit after the candidate's middleware: a tool allowlist (the `tools` valve) and
+  ToolErrorMiddleware, so a tool's own exception becomes an error result while an extension
+  hook's exception still ends the run. deepagents replaces any stack entry whose name a custom
+  middleware reuses, in place, even entries inner to the guards; so an extension middleware
+  named like a stack entry (except the summarization slot) or a guard fails to load.
 - The general-purpose subagent is off unless the valve asks for it. User middleware never
-  reaches it (graph.py), so when it is on, HIVE builds it explicitly with its guards.
-- The provider credential is removed from os.environ once the model is built, before any
-  extension code is imported.
+  reaches it (graph.py), so when it is on, HIVE builds it explicitly with its guards, and binds
+  the experiment's recursion_limit on it: create_agent binds 9_999, and a subagent's bound
+  config wins over the parent's run config.
+- The provider credential never enters the environment. A process's exec-time environment
+  stays readable by its children (`ps eww $PPID`, /proc/<pid>/environ) after os.environ.pop,
+  so the key arrives on stdin, read to EOF before anything else runs, and goes straight to the
+  client constructor. Shell commands get an explicit PATH/HOME/LANG environment.
+- Extension code runs in this process, so it can reach the built model object, which holds the
+  key and the provider client. The request checks, the call count and the trace see only calls
+  made through the langchain model; they detect mistakes and plain violations, but they are not
+  a sandbox, and the static checks in validate() are not either.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import json
-import os
-import re
-import shutil
-import signal
-import subprocess
 import sys
-import tempfile
-import time
-import traceback
-from pathlib import Path
-from typing import Any
+
+# First, before any import: extensions are imported in place from the candidate, which must not
+# change, and `-I` ignores PYTHONDONTWRITEBYTECODE.
+sys.dont_write_bytecode = True
+
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import shutil  # noqa: E402
+import signal  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import traceback  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
 
 # What each AgentMiddleware hook is in the controller's neutral vocabulary (hive.contracts
 # LIFECYCLE_POINTS). wrap_tool_call can both gate a call and rewrite its result.
@@ -64,8 +83,19 @@ HOOK_POINTS = {
     "after_agent": ("after_run",),
 }
 SUMMARIZATION_SLOT = "SummarizationMiddleware"
-CREDENTIAL_VARIABLES = ("OPENAI_API_KEY",)
-SHELL_ENV_VARIABLES = ("PATH", "HOME", "LANG")
+# Every middleware name deepagents 0.7.28 puts in a stack it builds (graph.py create_deep_agent,
+# main agent and subagents; some only with options HIVE never sets). A custom middleware with
+# one of these names replaces that entry in place, wherever it sits, including inner to HIVE's
+# guards. Only SUMMARIZATION_SLOT is open to extensions (the documented compaction slot).
+DEEPAGENTS_STACK_NAMES = frozenset({
+    "FilesystemMiddleware", "SubAgentMiddleware", "_ParentNotifierMiddleware", SUMMARIZATION_SLOT,
+    "PatchToolCallsMiddleware", "AsyncSubAgentMiddleware", "SkillsMiddleware", "AnthropicPromptCachingMiddleware",
+    "MemoryMiddleware", "HumanInTheLoopMiddleware", "UnsupportedContentMiddleware", "_ToolExclusionMiddleware",
+})  # fmt: skip
+OPENAI_CREDENTIAL = "OPENAI_API_KEY"
+# HIVE_TRIAL_ID is the process helper's trial marker (hive/agents/process.py): a shell command
+# that daemonizes is still found and killed after the trial by it.
+SHELL_ENV_VARIABLES = ("PATH", "HOME", "LANG", "HIVE_TRIAL_ID")
 MAIN_AGENT_NAME = "main"
 TRACE_TEXT_CHARS = 4000
 STDERR_EXCERPT_LINES = 12
@@ -77,6 +107,10 @@ class ExtensionContractError(Exception):
 
 class ModelSpecViolation(Exception):
     """A request was about to go to another model or reasoning effort than the experiment fixed."""
+
+
+class ModelCallLimitReached(Exception):
+    """The trial's model calls (main agent and subagents together) reached max_model_calls."""
 
 
 # --- trace and result files -------------------------------------------------------------------
@@ -107,27 +141,62 @@ def clip(text: Any, limit: int = TRACE_TEXT_CHARS) -> str:
 
 
 def main(argv: list[str]) -> int:
-    spec = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
-    result: dict[str, Any] = {"status": "errored", "final_text": "", "error": None, "error_class": "agent_error",
-                              "extensions": [], "runtime_errors": []}  # fmt: skip
+    # First thing, before the spec or any framework or candidate code: take the key off stdin.
     try:
-        trial = Trial(spec)
+        credentials, credentials_error = read_credentials(), None
+    except Exception as error:  # noqa: BLE001 (reported in result.json like any other runner failure)
+        credentials, credentials_error = {}, error
+    spec = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
+    # No "extensions" key until the load phase has run: a run that failed before it has no load
+    # report, and an empty one would tell the controller every extension file went missing.
+    result: dict[str, Any] = {"status": "errored", "final_text": "", "error": None, "error_class": "agent_error",
+                              "runtime_errors": []}  # fmt: skip
+    trial = None
+    try:
+        if credentials_error is not None:
+            raise credentials_error
+        trial = Trial(spec, credentials)
         try:
             result.update(trial.run())
         finally:
             trial.cleanup()
     except BaseException as error:  # noqa: BLE001 (whatever happens, the controller gets a result)
-        if isinstance(error, KeyboardInterrupt):
-            raise
         result.update(error=f"the runner failed: {type(error).__name__}: {error}", error_class="agent_error")
+        if trial is not None and trial.loads is not None:
+            result.setdefault("extensions", trial.loads)
         traceback.print_exc()
     write_result(Path(spec["result_file"]), result)
     return 0
 
 
+def read_credentials() -> dict[str, str]:
+    """The provider credentials the adapter sends as one JSON line on stdin, read to EOF.
+
+    stdin is then pointed at /dev/null, so nothing started later can read the pipe. The key is
+    never put in os.environ (see the module doc). An empty stdin means no credentials.
+    """
+    text = sys.stdin.read() if sys.stdin is not None else ""
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(devnull, 0)
+    finally:
+        os.close(devnull)
+    if not text.strip():
+        return {}
+    payload = json.loads(text)
+    credentials = payload.get("credentials") if isinstance(payload, dict) else None
+    if not isinstance(credentials, dict) or not all(
+        isinstance(name, str) and isinstance(value, str) for name, value in credentials.items()
+    ):
+        raise ValueError('stdin must hold one JSON object {"credentials": {"NAME": "value", ...}}')
+    return credentials
+
+
 class Trial:
-    def __init__(self, spec: dict[str, Any]):
+    def __init__(self, spec: dict[str, Any], credentials: dict[str, str] | None = None):
         self.spec = spec
+        self.credentials = credentials if credentials is not None else {}
+        self.loads: list[dict[str, Any]] | None = None  # set once the load phase has run
         self.workdir = Path(spec["workdir"])
         self.trace = TraceFile(Path(spec["trace_file"]))
         self.extension_files = {
@@ -142,23 +211,23 @@ class Trial:
     def run(self) -> dict[str, Any]:
         # Framework imports happen here, inside main()'s catch-all: a broken venv is a result too.
         fw = Framework()
-        model = build_model(fw, self.spec)
-        for name in CREDENTIAL_VARIABLES:
-            os.environ.pop(name, None)  # the model holds its key now; extension code never sees it
+        model = build_model(fw, self.spec, self.credentials)
+        self.credentials.clear()  # the model holds the key now; main() and this object keep no copy
 
         loads, middleware, tools = load_extensions(
             fw, self.spec["extensions"], allowed=set(self.spec["tools"]), builtin=set(self.spec["builtin_tools"])
         )
+        self.loads = loads
         self.trace.write("extensions_loaded", extensions=loads)
         if not all(load["loaded"] for load in loads):
             failed = [f"{load['path']}: {load['error']}" for load in loads if not load["loaded"]]
             return {"error_class": "harness_load_error", "extensions": loads,
                     "error": "extension files failed to load: " + "; ".join(failed)}  # fmt: skip
 
-        callbacks = make_trace_callbacks(fw, self.trace, self.spec["model"])
+        callbacks = make_trace_callbacks(fw, self.trace, self.spec["model"], self.spec["limits"]["max_model_calls"])
         try:
             agent = self.build_agent(fw, model, middleware, tools)
-        except Exception as error:  # noqa: BLE001 (e.g. duplicate middleware names): the candidate can't run as written
+        except Exception as error:  # noqa: BLE001 (e.g. a tool deepagents rejects): the candidate can't run as written
             self.trace.write("build_error", error=f"{type(error).__name__}: {error}")
             return {"error_class": "harness_load_error", "extensions": loads,
                     "error": f"the agent could not be built from the candidate: {type(error).__name__}: {error}"}  # fmt: skip
@@ -169,15 +238,19 @@ class Trial:
                 {"messages": [{"role": "user", "content": self.spec["instruction"]}]},
                 config={"callbacks": [callbacks], "recursion_limit": limits["recursion_limit"]},
             )
-        except BaseException as error:  # noqa: BLE001 (extension code may even raise SystemExit)
-            if isinstance(error, KeyboardInterrupt):
-                raise
+        except BaseException as error:  # noqa: BLE001 (extension code may raise SystemExit or KeyboardInterrupt)
             traceback.print_exc()
             return {"extensions": loads, **self.classify_failure(fw, error, callbacks)}
         if callbacks.violations:
             # An extension caught the violation and carried on; the run still left the experiment (P3).
             return {"extensions": loads, "error_class": "model_mismatch", "error": "; ".join(callbacks.violations)}
+        if callbacks.limit_reached:
+            # An extension caught the limit error and carried on; the run still used up its calls.
+            return {"extensions": loads, "error_class": "agent_error", "error": self.call_limit_message()}
         return {"extensions": loads, **final_answer(fw, output)}
+
+    def call_limit_message(self) -> str:
+        return f"the run hit the model call limit ({self.spec['limits']['max_model_calls']}) without finishing"
 
     def build_agent(self, fw: Framework, model: Any, extension_middleware: list, extension_tools: list) -> Any:
         spec, limits = self.spec, self.spec["limits"]
@@ -196,9 +269,10 @@ class Trial:
         subagents: list[dict[str, Any]] = []
         if spec["general_purpose_subagent"]:
             # Built explicitly, not left to deepagents: its auto-added subagent would run
-            # without HIVE's guards (tool allowlist, call limit, tool errors).
+            # without HIVE's guards (tool allowlist, tool errors).
             subagents.append({**fw.GENERAL_PURPOSE_SUBAGENT,
-                              "middleware": hive_guards(fw, [t for t in allowed if t != "task"], limits)})  # fmt: skip
+                              "middleware": hive_guards(fw, [t for t in allowed if t != "task"])})  # fmt: skip
+            bind_subagent_recursion_limit(fw, limits["recursion_limit"])
         else:
             # The only switch for the auto-added subagent is a harness profile for this model.
             key = f"{fw.get_model_provider(model)}:{fw.get_model_identifier(model)}"
@@ -211,7 +285,7 @@ class Trial:
             model,
             tools=extension_tools,
             system_prompt="\n\n".join(part.strip() for part in prompt_parts),
-            middleware=[*extension_middleware, *hive_guards(fw, allowed, limits)],
+            middleware=[*extension_middleware, *hive_guards(fw, allowed)],
             subagents=subagents,
             skills=skills,
             backend=backend,
@@ -223,6 +297,8 @@ class Trial:
         self.trace.write("run_error", error=clip(described))
         if isinstance(error, ModelSpecViolation) or callbacks.violations:
             return {"error_class": "model_mismatch", "error": "; ".join(callbacks.violations) or described}
+        if isinstance(error, ModelCallLimitReached) or callbacks.limit_reached:
+            return {"error_class": "agent_error", "error": self.call_limit_message()}
         if fw.is_quota_error(error):
             return {"error_class": "quota", "error": f"the provider refused for rate limit or quota: {described}"}
         if fw.is_provider_error(error):
@@ -232,8 +308,8 @@ class Trial:
             return {"error_class": "agent_error",
                     "error": f"the run hit the step limit (recursion limit: {limit} graph steps) without finishing"}  # fmt: skip
         if isinstance(error, fw.ModelCallLimitExceededError):
-            limit = self.spec["limits"]["max_model_calls"]
-            return {"error_class": "agent_error", "error": f"the run hit the model call limit ({limit}) without finishing"}
+            # Only an extension's own ModelCallLimitMiddleware raises this; HIVE's limit is ModelCallLimitReached.
+            return {"error_class": "agent_error", "error": f"an extension's model call limit ended the run: {described}"}
         origin = self.extension_frame(error)
         if origin is not None:
             return {"error_class": "extension_error", "runtime_errors": [f"{origin}: {described}"],
@@ -281,11 +357,11 @@ class Framework:
         from deepagents._models import get_model_identifier, get_model_provider
         from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
         from deepagents.backends.protocol import ExecuteResponse
+        from deepagents.middleware import subagents as subagents_module
         from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
         from langchain.agents.middleware import (
             AgentMiddleware,
             ContextEditingMiddleware,
-            ModelCallLimitMiddleware,
             ToolErrorMiddleware,
         )
         from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
@@ -308,9 +384,9 @@ class Framework:
         self.LocalShellBackend = LocalShellBackend
         self.ExecuteResponse = ExecuteResponse
         self.GENERAL_PURPOSE_SUBAGENT = GENERAL_PURPOSE_SUBAGENT
+        self.subagents_module = subagents_module
         self.AgentMiddleware = AgentMiddleware
         self.ContextEditingMiddleware = ContextEditingMiddleware
-        self.ModelCallLimitMiddleware = ModelCallLimitMiddleware
         self.ToolErrorMiddleware = ToolErrorMiddleware
         self.ModelCallLimitExceededError = ModelCallLimitExceededError
         self.BaseCallbackHandler = BaseCallbackHandler
@@ -341,14 +417,18 @@ class Framework:
         return isinstance(error, openai.OpenAIError)
 
 
-def build_model(fw: Framework, spec: dict[str, Any]) -> Any:
+def build_model(fw: Framework, spec: dict[str, Any], credentials: dict[str, str]) -> Any:
     model = spec["model"]
     if model["provider"] == "openai":
         from langchain_openai import ChatOpenAI
 
+        key = credentials.get(OPENAI_CREDENTIAL)
+        if not key:
+            raise ValueError(f"no {OPENAI_CREDENTIAL} arrived on stdin for model provider 'openai'")
         limits = spec["limits"]
         return ChatOpenAI(
             model=model["id"],
+            api_key=key,  # explicit: the key is never in os.environ for the client to find
             use_responses_api=True,
             reasoning={"effort": model["reasoning_effort"]},
             timeout=limits["provider_timeout_s"],
@@ -449,6 +529,7 @@ def load_extensions(fw: Framework, entries: list[dict[str, str]], *, allowed: se
     tool must not reuse (two tools with one name would leave which one runs to the framework).
     """
     loads, middleware, tools = [], [], []
+    middleware_owners: dict[str, str] = {}  # middleware name -> the extension file that returned it
     for index, entry in enumerate(entries):
         load: dict[str, Any] = {"path": entry["path"], "loaded": False, "error": None, "registered": []}
         try:
@@ -456,15 +537,39 @@ def load_extensions(fw: Framework, entries: list[dict[str, str]], *, allowed: se
             registered: list[str] = []
             for item in items:
                 registered += registration_of(fw, item, allowed, builtin)
-            middleware += [item for item in items if isinstance(item, fw.AgentMiddleware)]
+            file_middleware = [item for item in items if isinstance(item, fw.AgentMiddleware)]
+            names = check_middleware_names(file_middleware, entry["path"], middleware_owners)
+            middleware += file_middleware
             tools += [item for item in items if isinstance(item, fw.BaseTool)]
+            middleware_owners.update(names)
             load.update(loaded=True, registered=list(dict.fromkeys(registered)))
-        except BaseException as error:  # noqa: BLE001 (an extension may raise anything, SystemExit included)
-            if isinstance(error, KeyboardInterrupt):
-                raise
+        except BaseException as error:  # noqa: BLE001 (an extension may raise anything, KeyboardInterrupt included)
             load["error"] = describe_load_error(error, entry["file"])
         loads.append(load)
     return loads, middleware, tools
+
+
+def check_middleware_names(items: list, path: str, owners: dict[str, str]) -> dict[str, str]:
+    """Reject a middleware name deepagents would swap into its stack in place, or one already taken.
+
+    deepagents replaces a same-named stack entry instead of adding the middleware, even entries
+    inner to HIVE's guards, and keeps only the last of two custom middleware sharing a stack
+    name. Returns the names this file adds.
+    """
+    reserved = (DEEPAGENTS_STACK_NAMES - {SUMMARIZATION_SLOT}) | set(_GUARD_NAMES)
+    names: dict[str, str] = {}
+    for item in items:
+        name = item.name
+        if name in reserved:
+            raise ExtensionContractError(
+                f"it returns middleware named '{name}', a name deepagents or HIVE uses in the agent's middleware "
+                f"stack; rename it (the only stack name an extension may take is '{SUMMARIZATION_SLOT}')"
+            )
+        owner = names.get(name) or owners.get(name)
+        if owner is not None:
+            raise ExtensionContractError(f"it returns middleware named '{name}', a duplicate of one from {owner}")
+        names[name] = path
+    return names
 
 
 def import_isolated(file: str, index: int) -> Any:
@@ -543,34 +648,55 @@ def describe_load_error(error: BaseException, file: str) -> str:
 # --- HIVE's guards ----------------------------------------------------------------------------------
 
 
-def hive_guards(fw: Framework, allowed_tools: list[str], limits: dict[str, Any]) -> list:
-    """Innermost of the candidate's middleware, so no extension can undo them."""
+def hive_guards(fw: Framework, allowed_tools: list[str]) -> list:
+    """Inner to every extension middleware (load_extensions rejects names deepagents would swap
+    in place), so an extension's hooks see the allowlisted tools and its exceptions are not
+    turned into tool results. The model-call limit is not here: it is counted per trial in the
+    trace callback, which sees every call, retries and subagents included."""
     classes = hive_middleware_classes(fw)
     return [
-        classes["HiveModelCallLimit"](run_limit=limits["max_model_calls"], exit_behavior="error"),
         classes["HiveToolAllowlist"](allowed_tools),
         classes["HiveToolErrors"](on_error=lambda error, request: tool_error_content(fw, error)),
     ]
 
 
+def bind_subagent_recursion_limit(fw: Framework, recursion_limit: int) -> None:
+    """Bind the experiment's step limit on every subagent deepagents compiles.
+
+    create_agent binds recursion_limit=9_999 on each compiled agent, and a subagent's bound
+    config wins over the parent's run config (deepagents subagents.py, `task`), so the limit
+    passed to invoke never reaches it. deepagents compiles declarative subagents through the
+    module-level create_sub_agent, so HIVE wraps that once for this process (one trial).
+    """
+    module = fw.subagents_module
+    original = module.create_sub_agent
+    if getattr(original, "hive_recursion_limit", None) == recursion_limit:
+        return
+
+    def create_sub_agent(*args: Any, **kwargs: Any) -> Any:
+        return original(*args, **kwargs).with_config(recursion_limit=recursion_limit)
+
+    create_sub_agent.hive_recursion_limit = recursion_limit
+    module.create_sub_agent = create_sub_agent
+
+
 def tool_error_content(fw: Framework, error: Exception) -> str | None:
     # None lets the exception through: provider failures, limits and model checks from inside
     # a subagent's `task` call must end the run with their own class, not become tool output.
-    passthrough = (ModelSpecViolation, fw.ModelError, fw.ModelCallLimitExceededError, fw.GraphRecursionError)
+    passthrough = (ModelSpecViolation, ModelCallLimitReached, fw.ModelError, fw.ModelCallLimitExceededError,
+                   fw.GraphRecursionError)  # fmt: skip
     if isinstance(error, passthrough) or fw.is_provider_error(error):
         return None
     return f"Error: {type(error).__name__}: {error}"
 
 
 _GUARD_CLASSES: dict[str, type] = {}
+_GUARD_NAMES = ("HiveToolAllowlist", "HiveToolErrors")  # the guards' middleware names (their class names)
 
 
 def hive_middleware_classes(fw: Framework) -> dict[str, type]:
     if _GUARD_CLASSES:
         return _GUARD_CLASSES
-
-    class HiveModelCallLimit(fw.ModelCallLimitMiddleware):
-        """The experiment's model-call limit; its own name, so an extension may add another limit."""
 
     class HiveToolErrors(fw.ToolErrorMiddleware):
         """A tool's own exception becomes an error result the model sees, as in Pi."""
@@ -592,8 +718,7 @@ def hive_middleware_classes(fw: Framework) -> dict[str, type]:
             return fw.ToolMessage(content=f"Error: the tool '{name}' is not available.",
                                   tool_call_id=request.tool_call["id"], name=name, status="error")  # fmt: skip
 
-    _GUARD_CLASSES.update(HiveModelCallLimit=HiveModelCallLimit, HiveToolErrors=HiveToolErrors,
-                          HiveToolAllowlist=HiveToolAllowlist)  # fmt: skip
+    _GUARD_CLASSES.update(HiveToolErrors=HiveToolErrors, HiveToolAllowlist=HiveToolAllowlist)
     return _GUARD_CLASSES
 
 
@@ -601,7 +726,8 @@ def hive_middleware_classes(fw: Framework) -> dict[str, type]:
 
 
 def make_shell_backend(fw: Framework, workdir: Path, pgids_file: Path, timeout_s: int) -> Any:
-    # The shell's environment is the runner's minus the credential (already removed): PATH, HOME, LANG.
+    # An explicit environment: PATH, HOME, LANG and the trial marker only (the credential is never in
+    # os.environ either).
     env = {name: os.environ[name] for name in SHELL_ENV_VARIABLES if name in os.environ}
     return _shell_backend_class(fw)(workdir, pgids_file=pgids_file, virtual_mode=True, timeout=timeout_s, env=env)
 
@@ -681,13 +807,20 @@ def _kill_group(pgid: int) -> None:
 
 def trace_callbacks_class(fw: Framework) -> type:
     class _TraceCallbacks(fw.BaseCallbackHandler):
-        raise_error = True  # so a ModelSpecViolation stops the request before it is sent
+        raise_error = True  # so a ModelSpecViolation or the call limit stops the request before it is sent
 
-        def __init__(self, trace: TraceFile, model: dict[str, Any]):
+        def __init__(self, trace: TraceFile, model: dict[str, Any], max_model_calls: int):
             self.trace = trace
             self.expected_model = model["id"]
             self.expected_effort = model["reasoning_effort"]
             self.violations: list[str] = []
+            # One count per trial: this object is handed to invoke, and callbacks reach subagents,
+            # summarization and every handler call an extension makes. Parallel `task` calls run
+            # on threads, hence the lock.
+            self.max_model_calls = max_model_calls
+            self.model_calls = 0
+            self.limit_reached = False
+            self._lock = threading.Lock()
             self.agents_seen: set[str] = set()
             self.tool_names: dict[Any, str] = {}
 
@@ -712,6 +845,16 @@ def trace_callbacks_class(fw: Framework) -> type:
                 )
                 self.violations.append(violation)
                 raise ModelSpecViolation(violation)
+            with self._lock:
+                if self.model_calls >= self.max_model_calls:
+                    self.limit_reached = True
+                    refused = True
+                else:
+                    self.model_calls += 1
+                    refused = False
+            if refused:
+                self.trace.write("model_call_limit", agent=agent, max_model_calls=self.max_model_calls)
+                raise ModelCallLimitReached(f"the trial's {self.max_model_calls} model calls are used up")
 
         def on_llm_end(self, response: Any, *, run_id: Any, **kwargs: Any) -> None:
             try:
@@ -754,8 +897,8 @@ def trace_callbacks_class(fw: Framework) -> type:
     return _TraceCallbacks
 
 
-def make_trace_callbacks(fw: Framework, trace: TraceFile, model: dict[str, Any]) -> Any:
-    return trace_callbacks_class(fw)(trace, model)
+def make_trace_callbacks(fw: Framework, trace: TraceFile, model: dict[str, Any], max_model_calls: int) -> Any:
+    return trace_callbacks_class(fw)(trace, model, max_model_calls)
 
 
 if __name__ == "__main__":

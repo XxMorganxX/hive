@@ -17,11 +17,14 @@ mutate. This module therefore imports only the stdlib and hive.
 Behaviour below was checked against deepagents 0.7.28 / langchain 1.4.6 / langchain-core
 1.6.12 / langchain-openai 1.7.2 (installed source and offline runs):
 
-- The subprocess environment is built from nothing: PATH, LANG, a fresh HOME under the trace
-  dir, and the one credential the ModelSpec's provider needs. LangSmith tracing turns on from
-  LANGSMITH_* / LANGCHAIN_* variables and the OpenAI SDK honours OPENAI_BASE_URL, so an
-  inherited environment could leak traces or redirect the model (P3, P10). `-I` keeps
-  PYTHONPATH, user site-packages and the script directory off sys.path.
+- The subprocess environment is built from nothing: PATH, LANG and a fresh HOME under the trace
+  dir. LangSmith tracing turns on from LANGSMITH_* / LANGCHAIN_* variables and the OpenAI SDK
+  honours OPENAI_BASE_URL, so an inherited environment could leak traces or redirect the model
+  (P3, P10). `-I` keeps PYTHONPATH, user site-packages and the script directory off sys.path.
+- The one credential the ModelSpec's provider needs goes on the runner's stdin as one JSON
+  line, `{"credentials": {"OPENAI_API_KEY": "..."}}`, never in its environment: a process's
+  exec-time environment stays readable by its children (`ps eww $PPID`), so the agent's own
+  shell could print the key into the trace. The runner hands it to the client constructor.
 - The verdict comes from the runner's result.json and trace.jsonl, read by
   hive.agents.runner_protocol, never from the exit code (P8).
 - The framework starts shell commands in sessions of their own, so the runner lists their
@@ -93,7 +96,7 @@ DEFAULT_SETTINGS: Mapping[str, Any] = {
     "deepagents_version": DEEPAGENTS_VERSION,
     "timeout_s": 600,  # wall clock per trial, enforced by killing the process
     "term_grace_s": 5.0,  # between SIGTERM and SIGKILL on a timeout
-    "max_model_calls": 100,  # per run of the main agent (ModelCallLimitMiddleware)
+    "max_model_calls": 100,  # per trial: every request through the agent's chat model, subagent and retries included
     "recursion_limit": 1000,  # LangGraph super-steps: model, tool and middleware nodes all count
     "shell_timeout_s": 120,  # default per `execute` command
     "provider_timeout_s": 120,  # per model request
@@ -108,9 +111,12 @@ VERSION_CHECK_TIMEOUT_S = 60
 VERSION_CHECK_CODE = "import importlib.metadata as m; print(m.version('deepagents'))"
 
 # Names an extension must not use: each builds or swaps a chat model or a provider profile,
-# which would change the model the experiment fixed (P3). validate() rejects them statically;
-# the runner also checks every request and the controller every reply, since a static scan
-# can be dodged.
+# which would change the model the experiment fixed (P3). validate() rejects them statically,
+# and since a static scan can be dodged, the runner also checks every request made through the
+# agent's chat model and the controller every reply the runner traced. All of this is
+# detection: extension code runs in the runner's process and can reach the model object's key
+# and provider client, and a call made through that client directly is neither checked,
+# counted nor traced.
 FORBIDDEN_NAMES = (
     "ChatOpenAI", "AzureChatOpenAI", "ChatAnthropic", "ChatAnthropicVertex", "ChatGoogleGenerativeAI",
     "ChatBedrock", "ChatBedrockConverse", "init_chat_model", "register_harness_profile",
@@ -172,7 +178,7 @@ LIFECYCLE: tuple[LifecyclePoint, ...] = (
         "{'jump_to': 'model'} to call the model again. wrap_model_call: inspect the ModelResponse, call "
         "handler again to retry, or return a different AIMessage.",
         caveats="A jump_to retry keeps the first reply in state; a retry inside wrap_model_call discards it. "
-        "Every retry is a paid model call and counts toward the run's model-call limit.",
+        "Every retry is a paid model call and counts toward the trial's model-call limit.",
     ),
     LifecyclePoint(
         id="wrap_model_call",
@@ -182,8 +188,9 @@ LIFECYCLE: tuple[LifecyclePoint, ...] = (
         can_modify="request.override(messages=, system_message=, tools=, tool_choice=) before calling "
         "handler; call handler zero or more times; short-circuit by returning an AIMessage.",
         caveats="Never override model= or model_settings=: the model and its reasoning effort are fixed (P3), "
-        "and HIVE checks every request and reply (model_mismatch). The first middleware in your list is the "
-        "outermost.",
+        "and HIVE checks every request sent through the agent's chat model (each handler call) and every reply "
+        "(model_mismatch). Each handler call is one model call toward the trial's model-call limit, which the "
+        "main agent and the subagent share. The first middleware in your list is the outermost.",
     ),
     LifecyclePoint(
         id="before_tool_call",
@@ -194,7 +201,9 @@ LIFECYCLE: tuple[LifecyclePoint, ...] = (
         "block the call by returning ToolMessage(content=..., tool_call_id=request.tool_call['id'], "
         "status='error') without calling handler.",
         caveats="An exception raised by your hook ends the run as extension_error. An exception raised by the "
-        "tool itself becomes an error ToolMessage (HIVE adds ToolErrorMiddleware inside your middleware).",
+        "tool itself becomes an error ToolMessage (HIVE adds ToolErrorMiddleware inside your middleware). "
+        "A middleware named like a deepagents stack entry or a HIVE guard fails to load "
+        "(harness_load_error), except the 'SummarizationMiddleware' slot.",
     ),
     LifecyclePoint(
         id="after_tool_call",
@@ -217,8 +226,9 @@ LIFECYCLE: tuple[LifecyclePoint, ...] = (
         id="compaction",
         support="partial",
         native_api="A middleware whose `name` is 'SummarizationMiddleware' replaces deepagents' built-in "
-        "summarization in place (e.g. a ContextEditingMiddleware subclass with `name` overridden); or trim "
-        "messages in before_model / wrap_model_call",
+        "summarization in place (e.g. a ContextEditingMiddleware subclass with `name` overridden; the only "
+        "stack name an extension may take, and only one extension may take it); or trim messages in "
+        "before_model / wrap_model_call",
         can_modify="How the conversation is shortened before model calls.",
         caveats="extension() gets no model and building one is forbidden (P3), so a model-written summary "
         "can't be produced by an extension; the built-in summarizer uses the experiment's model.",
@@ -230,7 +240,7 @@ LIFECYCLE: tuple[LifecyclePoint, ...] = (
         can_modify="A state update; with @hook_config(can_jump_to=['model']) return {'jump_to': 'model'} "
         "(plus e.g. a new HumanMessage) to continue the run.",
         caveats="A run is completed only when it ends on a reply with no tool calls. Continuations count toward "
-        "the model-call limit.",
+        "the trial's model-call limit.",
     ),
 )
 
@@ -241,7 +251,9 @@ FORBIDDEN_APIS = (
     "middleware that builds or calls a model of its own: ModelFallbackMiddleware, LLMToolSelectorMiddleware, "
     "LLMToolEmulator, SummarizationMiddleware (langchain's or deepagents')",
     "deepagents.register_harness_profile / register_provider_profile / HarnessProfile",
-    "reading provider credentials (OPENAI_API_KEY) or setting OPENAI_BASE_URL",
+    "reading provider credentials (OPENAI_API_KEY, or the key the model object holds) or setting OPENAI_BASE_URL",
+    "calling the provider client behind the model directly (request.model.client / root_client, openai.OpenAI): "
+    "such calls skip HIVE's checks and usage count, so they are forbidden, not merely untracked",
 )
 
 
@@ -591,7 +603,7 @@ class DeepAgentsAgent:
     general_purpose_subagent: bool
     model: ModelSpec
     reasoning_effort: str
-    credential: tuple[str, str] | None  # (env var, value); never written to a file or argv
+    credential: tuple[str, str] | None  # (name, value); sent on the runner's stdin, never in a file, argv or env
     limits: Mapping[str, int | float]
     timeout_s: float
     term_grace_s: float
@@ -618,13 +630,12 @@ class DeepAgentsAgent:
         home.mkdir(exist_ok=True)
         spec_path = trace_dir / RUN_SPEC_FILE
         spec_path.write_text(json.dumps(self.run_spec(task, workdir.resolve(), trace_dir), indent=2) + "\n")
-        env = _base_environment(home=home)
-        if self.credential is not None:
-            env[self.credential[0]] = self.credential[1]
+        credentials = dict([self.credential]) if self.credential is not None else {}
         outcome = run_process_group(
             [self.python_path, "-I", str(RUNNER), str(spec_path)],
             cwd=workdir,
-            env=env,
+            env=_base_environment(home=home),
+            stdin_text=json.dumps({"credentials": credentials}) + "\n",
             timeout_s=self.timeout_s,
             stdout_path=trace_dir / STDOUT_FILE,
             stderr_path=trace_dir / STDERR_FILE,
@@ -635,7 +646,7 @@ class DeepAgentsAgent:
                                 wall_clock_s=time.monotonic() - started)  # fmt: skip
 
     def run_spec(self, task: Task, workdir: Path, trace_dir: Path) -> dict[str, Any]:
-        """Everything the runner needs, as plain JSON. Never the credential: it travels in the environment."""
+        """Everything the runner needs, as plain JSON. Never the credential: it travels on stdin."""
         return {
             "instruction": task.instruction,
             "workdir": str(workdir),

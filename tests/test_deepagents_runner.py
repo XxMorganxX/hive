@@ -59,11 +59,14 @@ def write_candidate(root: Path, valves: str = "", files: dict[str, str] | None =
 
 def trial(tmp_path: Path, turns: list[dict], *, valves: str = "", files: dict[str, str] | None = None,
           instruction: str = "Implement add in solution.py.", workspace: dict[str, str] | None = None,
-          **settings):  # fmt: skip
-    """One real trial; returns (AgentResult, workdir, trace_dir, candidate)."""
+          turns_text: str | None = None, **settings):  # fmt: skip
+    """One real trial; returns (AgentResult, workdir, trace_dir, candidate).
+
+    `turns_text`, when given, is written as the turns file instead of `turns` (e.g. broken JSON).
+    """
     candidate = write_candidate(tmp_path / "candidate", valves, files)
     turns_file = tmp_path / "turns.json"
-    turns_file.write_text(json.dumps(turns))
+    turns_file.write_text(json.dumps(turns) if turns_text is None else turns_text)
     adapter = DeepAgentsAdapter()
     assert adapter.validate(candidate) == []
     agent = adapter.build(candidate, MODEL, {"python_path": str(VENV_PYTHON), "prices": PRICES,
@@ -333,6 +336,141 @@ def test_a_tool_hook_that_throws_is_an_extension_error(tmp_path):
     assert "PermissionError: gate bug" in result.load_report.runtime_errors[0]
 
 
+def test_an_extension_raising_keyboard_interrupt_at_load_fails_to_load(tmp_path):
+    files = {"extensions/interrupt.py": "def extension():\n    raise KeyboardInterrupt()\n"}
+    result, _, trace_dir, candidate = trial(tmp_path, [turn("ok")], files=files)
+    assert (result.status, result.error_class) == ("errored", "harness_load_error"), (result.error, stderr(trace_dir))
+    [load] = result.load_report.extensions
+    assert load.loaded is False and "KeyboardInterrupt" in load.error
+    assert checked(result, candidate)[0] == "harness_load_error"
+
+
+def test_an_extension_raising_keyboard_interrupt_mid_run_is_an_extension_error(tmp_path):
+    source = (
+        "from langchain.agents.middleware import AgentMiddleware\n\n"
+        "class Stop(AgentMiddleware):\n    def before_model(self, state, runtime):\n        raise KeyboardInterrupt()\n\n"
+        "def extension():\n    return [Stop()]\n"
+    )
+    result, _, trace_dir, candidate = trial(tmp_path, [turn("ok")], files={"extensions/stop.py": source})
+    assert (result.status, result.error_class) == ("errored", "extension_error"), (result.error, stderr(trace_dir))
+    [runtime_error] = result.load_report.runtime_errors
+    assert runtime_error.startswith("extensions/stop.py:") and "KeyboardInterrupt" in runtime_error
+    assert checked(result, candidate)[0] == "extension_error"
+
+
+TAIL_SLOT_EXTENSION = '''
+from langchain.agents.middleware import AgentMiddleware
+
+
+class Inner(AgentMiddleware):
+    @property
+    def name(self):
+        return "{name}"
+
+    def wrap_tool_call(self, request, handler):
+        raise ValueError("hook bug")
+
+
+def extension():
+    return [Inner()]
+'''
+
+
+@pytest.mark.parametrize("name", ["UnsupportedContentMiddleware", "FilesystemMiddleware", "HiveToolErrors"])
+def test_an_extension_middleware_named_like_a_stack_entry_or_guard_fails_to_load(tmp_path, name):
+    files = {"extensions/slot.py": TAIL_SLOT_EXTENSION.replace("{name}", name)}
+    result, _, trace_dir, candidate = trial(tmp_path, [turn("", call("ls", path="/")), turn("done")], files=files)
+    assert (result.status, result.error_class) == ("errored", "harness_load_error"), (result.error, stderr(trace_dir))
+    [load] = result.load_report.extensions
+    assert load.loaded is False and name in load.error
+    assert trace_lines(trace_dir, "model_call") == []
+
+
+def test_an_extension_may_take_the_summarization_slot(tmp_path):
+    source = (
+        "from langchain.agents.middleware import ContextEditingMiddleware\n\n"
+        "class Trim(ContextEditingMiddleware):\n    @property\n    def name(self):\n"
+        "        return 'SummarizationMiddleware'\n\n"
+        "def extension():\n    return [Trim()]\n"
+    )
+    result, _, trace_dir, candidate = trial(tmp_path, [turn("ok")], files={"extensions/trim.py": source})
+    assert result.status == "completed", (result.error, stderr(trace_dir))
+    [load] = result.load_report.extensions
+    assert load.loaded is True and "compaction" in load.registered
+
+
+def test_two_extensions_cannot_both_take_the_summarization_slot(tmp_path):
+    source = (
+        "from langchain.agents.middleware import ContextEditingMiddleware\n\n"
+        "class Trim(ContextEditingMiddleware):\n    @property\n    def name(self):\n"
+        "        return 'SummarizationMiddleware'\n\n"
+        "def extension():\n    return [Trim()]\n"
+    )
+    files = {"extensions/one.py": source, "extensions/two.py": source}
+    result, _, trace_dir, _ = trial(tmp_path, [turn("ok")], files=files)
+    assert result.error_class == "harness_load_error", (result.error, stderr(trace_dir))
+    loads = {load.path: load for load in result.load_report.extensions}
+    assert loads["extensions/one.py"].loaded is True
+    assert loads["extensions/two.py"].loaded is False and "extensions/one.py" in loads["extensions/two.py"].error
+
+
+def test_the_reserved_names_cover_every_middleware_deepagents_builds(tmp_path):
+    # A pin check against the installed deepagents: every name in the stacks it hands to
+    # create_agent (main agent and subagent, with and without skills) is reserved or a HIVE guard.
+    script = '''
+import importlib.util, json, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+import deepagents.graph, deepagents.middleware.subagents
+seen = set()
+def capture(original):
+    def create_agent(model, **kwargs):
+        seen.update(m.name for m in kwargs["middleware"])
+        return original(model, **kwargs)
+    return create_agent
+deepagents.graph.create_agent = capture(deepagents.graph.create_agent)
+deepagents.middleware.subagents.create_agent = capture(deepagents.middleware.subagents.create_agent)
+fw = runner.Framework()
+model = runner.scripted_model_class(fw)(model_name="gpt-5-nano", reasoning={"effort": "low"}, turns=[{"text": "ok"}])
+root = Path(tempfile.mkdtemp())
+(root / "skills/x").mkdir(parents=True)
+(root / "skills/x/SKILL.md").write_text("---\\nname: x\\ndescription: y\\n---\\n")
+for subagent in (False, True):
+    for skills in (None, str(root / "skills")):
+        trial = runner.Trial({"workdir": str(root), "trace_file": str(root / "t.jsonl"), "extensions": [],
+                              "tools": ["ls", "task"], "child_pgids_file": str(root / "p"), "skills_dir": skills,
+                              "limits": {"shell_timeout_s": 5, "max_model_calls": 3, "recursion_limit": 10},
+                              "general_purpose_subagent": subagent, "system_prompt": None, "workdir_note": "x"})
+        trial.build_agent(fw, model, [], [])
+        trial.cleanup()
+print(json.dumps({"seen": sorted(seen), "stack": sorted(runner.DEEPAGENTS_STACK_NAMES),
+                  "guards": sorted(runner.hive_middleware_classes(fw))}))
+'''
+    completed = subprocess.run([str(VENV_PYTHON), "-I", "-c", script, str(da.RUNNER)], capture_output=True, text=True,
+                               timeout=120, cwd=tmp_path)  # fmt: skip
+    assert completed.returncode == 0, completed.stderr
+    names = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert set(names["seen"]) - set(names["guards"]) <= set(names["stack"])
+
+
+def test_the_runner_writes_no_bytecode_into_the_candidate(tmp_path):
+    result, _, trace_dir, candidate = trial(tmp_path, [turn("ok")], files={"extensions/marker.py": FIRING_EXTENSION},
+                                            valves='tools = ["shout"]\n')  # fmt: skip
+    assert result.status == "completed", (result.error, stderr(trace_dir))
+    assert not list(candidate.root.rglob("__pycache__")) and not list(candidate.root.rglob("*.pyc"))
+
+
+def test_a_runner_failure_before_the_load_phase_reports_no_extensions(tmp_path):
+    files = {"extensions/marker.py": FIRING_EXTENSION}
+    result, _, trace_dir, _ = trial(tmp_path, [], files=files, valves='tools = ["shout"]\n', turns_text="not json")
+    assert (result.status, result.error_class) == ("errored", "agent_error"), (result.error, stderr(trace_dir))
+    written = json.loads((trace_dir / "result.json").read_text())
+    assert "extensions" not in written
+    assert "JSONDecodeError" in written["error"]
+
+
 def test_a_tool_that_raises_becomes_an_error_result_and_the_run_goes_on(tmp_path):
     source = (
         "from langchain_core.tools import tool\n\n"
@@ -355,6 +493,65 @@ def test_hitting_the_model_call_limit_is_an_agent_error(tmp_path):
     assert (result.status, result.error_class) == ("errored", "agent_error"), stderr(trace_dir)
     assert "model call limit" in result.error.lower()
     assert len(trace_lines(trace_dir, "model_call")) == 3
+
+
+RETRYING_EXTENSION = '''
+from langchain.agents.middleware import AgentMiddleware
+
+
+class Retry(AgentMiddleware):
+    def wrap_model_call(self, request, handler):
+        for _ in range(4):
+            response = handler(request)
+        return response
+
+
+def extension():
+    return [Retry()]
+'''
+
+
+def test_every_model_call_inside_wrap_model_call_counts_toward_the_limit(tmp_path):
+    turns = [turn("", call("ls", path="/"))] * 7 + [turn("done")]
+    result, _, trace_dir, _ = trial(tmp_path, turns, files={"extensions/retry.py": RETRYING_EXTENSION}, max_model_calls=2)
+    assert (result.status, result.error_class) == ("errored", "agent_error"), (result.error, stderr(trace_dir))
+    assert "model call limit (2)" in result.error
+    assert len(trace_lines(trace_dir, "model_call")) == 2
+
+
+def test_an_extension_that_swallows_the_model_call_limit_still_ends_errored(tmp_path):
+    source = (
+        "from langchain.agents.middleware import AgentMiddleware\n"
+        "from langchain_core.messages import AIMessage\n\n"
+        "class Swallow(AgentMiddleware):\n    def wrap_model_call(self, request, handler):\n"
+        "        try:\n            return handler(request)\n"
+        "        except Exception:\n            return AIMessage(content='done anyway')\n\n"
+        "def extension():\n    return [Swallow()]\n"
+    )
+    result, _, trace_dir, _ = trial(tmp_path, [turn("", call("ls", path="/"))], files={"extensions/swallow.py": source},
+                                    max_model_calls=2)  # fmt: skip
+    assert (result.status, result.error_class) == ("errored", "agent_error"), (result.error, stderr(trace_dir))
+    assert "model call limit (2)" in result.error
+    assert len(trace_lines(trace_dir, "model_call")) == 2
+
+
+def test_the_model_call_limit_is_shared_by_the_main_agent_and_its_subagents(tmp_path):
+    valves = 'general_purpose_subagent = true\ntools = ["ls", "read_file", "task"]\n'
+    tasks = [call("task", description=f"Look at file {index}.", subagent_type="general-purpose") for index in range(6)]
+    turns = [turn("", *tasks)] + [turn("sub done")] * 6 + [turn("done")]
+    result, _, trace_dir, _ = trial(tmp_path, turns, valves=valves, max_model_calls=2)
+    assert (result.status, result.error_class) == ("errored", "agent_error"), (result.error, stderr(trace_dir))
+    assert "model call limit (2)" in result.error
+    assert len(trace_lines(trace_dir, "model_call")) == 2
+
+
+def test_the_recursion_limit_reaches_the_subagent(tmp_path):
+    valves = 'general_purpose_subagent = true\ntools = ["ls", "read_file", "task"]\n'
+    turns = [turn("", call("task", description="Loop.", subagent_type="general-purpose")), turn("", call("ls", path="/"))]
+    result, _, trace_dir, _ = trial(tmp_path, turns, valves=valves, recursion_limit=12)
+    assert (result.status, result.error_class) == ("errored", "agent_error"), (result.error, stderr(trace_dir))
+    assert "recursion limit: 12" in result.error
+    assert len(trace_lines(trace_dir, "model_call")) < 12
 
 
 def test_hitting_the_recursion_limit_is_an_agent_error(tmp_path):
@@ -426,12 +623,13 @@ def _alive(pid: int) -> bool:
 
 
 class _StubOpenAI(BaseHTTPRequestHandler):
-    """Answers POST /v1/responses like the Responses API; the test sets `reply` per server."""
+    """Answers POST /v1/responses like the Responses API; the test sets `reply` per server, or
+    `replies`, a list answered in order before falling back to `reply`."""
 
     def do_POST(self):  # noqa: N802 (http.server's naming)
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requests.append({"body": body, "authorization": self.headers.get("Authorization")})
-        status, payload = self.server.reply
+        status, payload = self.server.replies.pop(0) if self.server.replies else self.server.reply
         data = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -458,6 +656,7 @@ QUOTA = {"error": {"message": "You exceeded your current quota.", "type": "insuf
 def stub_openai():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _StubOpenAI)
     server.requests = []
+    server.replies = []
     server.reply = (200, RESPONSE)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -465,8 +664,14 @@ def stub_openai():
     server.shutdown()
 
 
+PLACEHOLDER_KEY = "sk-offline-placeholder-not-a-key"
+
+
 def openai_trial(tmp_path: Path, server, files: dict[str, str] | None = None):
-    """The runner started directly (not through the adapter) so OPENAI_BASE_URL can point at the stub."""
+    """The runner started directly (not through the adapter) so OPENAI_BASE_URL can point at the stub.
+
+    The key goes on stdin, as the adapter sends it, never in the runner's environment.
+    """
     candidate = write_candidate(tmp_path / "candidate", files=files)
     workdir, trace_dir = tmp_path / "workdir", tmp_path / "trace"
     workdir.mkdir()
@@ -483,9 +688,11 @@ def openai_trial(tmp_path: Path, server, files: dict[str, str] | None = None):
     ).run_spec(Task(id="t", split="search", instruction="What is 6 * 7?"), workdir.resolve(), trace_dir)  # fmt: skip
     (trace_dir / "run_spec.json").write_text(json.dumps(spec))
     env = {"PATH": os.environ["PATH"], "HOME": str(trace_dir), "LANG": "C.UTF-8",
-           "OPENAI_API_KEY": "sk-offline-test", "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1"}  # fmt: skip
-    subprocess.run([str(VENV_PYTHON), "-I", str(da.RUNNER), str(trace_dir / "run_spec.json")], cwd=workdir, env=env,
-                   timeout=120, capture_output=True)  # fmt: skip
+           "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1"}  # fmt: skip
+    stdin = json.dumps({"credentials": {"OPENAI_API_KEY": PLACEHOLDER_KEY}}) + "\n"
+    completed = subprocess.run([str(VENV_PYTHON), "-I", str(da.RUNNER), str(trace_dir / "run_spec.json")], cwd=workdir,
+                               env=env, input=stdin, text=True, timeout=120, capture_output=True)  # fmt: skip
+    (trace_dir / "runner.stderr").write_text(completed.stderr)
     return json.loads((trace_dir / "result.json").read_text()), trace_dir
 
 
@@ -497,7 +704,7 @@ def test_openai_usage_and_reported_model_are_traced(tmp_path, stub_openai):
     assert line["usage"] == {"input_tokens": 200, "output_tokens": 40, "cache_read_tokens": 1000, "cache_write_tokens": 0}
     request = stub_openai.requests[0]
     assert request["body"]["model"] == "gpt-5-nano" and request["body"]["reasoning"] == {"effort": "low"}
-    assert request["authorization"] == "Bearer sk-offline-test"
+    assert request["authorization"] == f"Bearer {PLACEHOLDER_KEY}"
 
 
 def test_openai_insufficient_quota_is_quota(tmp_path, stub_openai):
@@ -511,3 +718,19 @@ def test_extensions_cannot_read_the_provider_key_from_the_environment(tmp_path, 
     result, _ = openai_trial(tmp_path, stub_openai, files={"extensions/peek.py": source})
     assert result["status"] == "completed"
     assert (tmp_path / "workdir" / "key_seen.txt").read_text() == "absent"
+
+
+def test_the_agent_shell_cannot_read_the_provider_key(tmp_path, stub_openai):
+    # `ps eww -p $PPID` prints the runner's exec-time environment, which os.environ.pop never clears.
+    command = "env; ps eww -o command= -p $PPID"
+    # Its own response id: messages sharing an id replace each other in the agent's state.
+    execute = {**RESPONSE, "id": "resp_0", "output": [{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "execute",
+                                       "status": "completed", "arguments": json.dumps({"command": command})}]}  # fmt: skip
+    stub_openai.replies = [(200, execute)]
+    result, trace_dir = openai_trial(tmp_path, stub_openai)
+    assert result["status"] == "completed", (result, stderr(trace_dir))
+    [tool_end] = [line for line in trace_lines(trace_dir, "tool_end") if line["name"] == "execute"]
+    assert "PATH=" in tool_end["output"] and "runner.py" in tool_end["output"]  # both commands ran
+    assert stub_openai.requests[0]["authorization"] == f"Bearer {PLACEHOLDER_KEY}"  # the key did reach the provider
+    leaked = [str(path) for path in trace_dir.rglob("*") if path.is_file() and PLACEHOLDER_KEY in path.read_text(errors="replace")]
+    assert leaked == []

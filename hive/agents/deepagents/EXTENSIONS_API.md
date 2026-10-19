@@ -53,18 +53,27 @@ stack of the main agent, outermost first, as deepagents 0.7.28 builds it:
    `general_purpose_subagent = true`), `_ParentNotifierMiddleware`, `SummarizationMiddleware`,
    `PatchToolCallsMiddleware`: the deepagents core.
 2. **Your middleware**, from every extension file in file-name order, each file's list in order.
-   A middleware whose `name` equals a core entry's (e.g. `"SummarizationMiddleware"`) replaces
-   that entry in place instead. Two middleware with the same `name` fail the build
-   (`AssertionError: Please remove duplicate middleware instances.`).
-3. HIVE's guards: `HiveModelCallLimit` (the run's model-call limit), `HiveToolAllowlist` (the
-   `tools` valve: hides unlisted tools from the model and refuses calls to them) and
-   `HiveToolErrors` (a `ToolErrorMiddleware`: an exception raised by a tool becomes an error
-   `ToolMessage` the model sees).
+   deepagents swaps a middleware whose `name` equals a stack entry's into that entry's place,
+   wherever it sits, so HIVE allows that for one name only: a middleware named
+   `"SummarizationMiddleware"` replaces the built-in summarization in place (one extension at
+   most). Any other name used in these stacks (`FilesystemMiddleware`, `SubAgentMiddleware`,
+   `_ParentNotifierMiddleware`, `PatchToolCallsMiddleware`, `SkillsMiddleware`,
+   `AnthropicPromptCachingMiddleware`, `UnsupportedContentMiddleware`, ...) or by HIVE's guards,
+   and two middleware with the same `name`, fail to load (`harness_load_error`).
+3. HIVE's guards: `HiveToolAllowlist` (the `tools` valve: hides unlisted tools from the model and
+   refuses calls to them) and `HiveToolErrors` (a `ToolErrorMiddleware`: an exception raised by a
+   tool becomes an error `ToolMessage` the model sees).
 4. `SkillsMiddleware` (only with `skills/`), `AnthropicPromptCachingMiddleware` (a no-op for
    OpenAI), `UnsupportedContentMiddleware`.
 
 `wrap_*` hooks nest in this order (the first is outermost: it sees the request first and the
 response last). `before_*` hooks run in this order, `after_*` hooks in reverse.
+
+The model-call limit is not a middleware: HIVE counts every request sent through the agent's
+chat model, in a callback, against one limit per trial. Each `handler` call inside
+`wrap_model_call` is one call, and the general-purpose subagent's calls count toward the same
+limit. A request past the limit is refused before it is sent and the run ends as `agent_error`,
+even if your code catches the error.
 
 The run: `agent.invoke({"messages": [HumanMessage(task instruction)]})`, sync. Per run:
 `before_agent` once, then per turn `before_model`, `wrap_model_call` around the provider call,
@@ -132,7 +141,9 @@ Decorator forms (each returns an `AgentMiddleware` instance; `name=` sets its na
 
 ```python
 class ModelRequest(Generic[ContextT]):
-    model: BaseChatModel                  # HIVE: read-only. Replacing it is forbidden (P3).
+    model: BaseChatModel                  # HIVE: read-only. Replacing it is forbidden (P3). It also holds the
+                                          # API key and the provider client: reading them or calling the
+                                          # client directly is forbidden (such calls skip HIVE's checks).
     messages: list[AnyMessage]            # excluding the system message
     system_message: SystemMessage | None
     tool_choice: Any | None

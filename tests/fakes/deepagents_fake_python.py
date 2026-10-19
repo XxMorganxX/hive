@@ -7,14 +7,15 @@ The adapter runs exactly two kinds of command with its `python_path`:
 - `<python> -I -c <code>`: the pinned-version check. The fake prints the version in
   `fake_version.txt` beside itself, or 0.7.28.
 - `<python> -I <runner.py> <trace_dir>/run_spec.json`: one trial. The fake records how it
-  was started (argv, cwd, environment) in `<trace_dir>/fake_record.json`, then plays the
+  was started (argv, cwd, environment, and the stdin it read to EOF, as the real runner does)
+  in `<trace_dir>/fake_record.json`, then plays the
   scenario named by the task instruction ("SCENARIO <name>", default "completed"), writing
   trace.jsonl / result.json / child_pgids.txt in the runner protocol's formats.
 
 Every invocation is also appended to `invocations.jsonl` beside the fake, so tests can count
 version checks. The adapter passes the subprocess a scrubbed environment, so nothing can
-reach the fake through environment variables: files beside it and the run spec are the
-only channels, exactly as for the real runner.
+reach the fake through environment variables: files beside it, the run spec and the
+credentials line on stdin are the only channels, exactly as for the real runner.
 """
 
 from __future__ import annotations
@@ -76,10 +77,11 @@ def start_detached_sleeper(spec: dict) -> int:
 
 
 def trial(spec_path: Path) -> int:
+    stdin = sys.stdin.read()  # the credentials line; the tests' key is a placeholder
     spec = json.loads(spec_path.read_text())
     trace_dir = Path(spec["trace_dir"])
     (trace_dir / "fake_record.json").write_text(
-        json.dumps({"argv": sys.argv, "cwd": os.getcwd(), "env": dict(os.environ)})
+        json.dumps({"argv": sys.argv, "cwd": os.getcwd(), "env": dict(os.environ), "stdin": stdin})
     )
     instruction = spec["instruction"]
     scenario = instruction.split()[1] if instruction.startswith("SCENARIO ") else "completed"
