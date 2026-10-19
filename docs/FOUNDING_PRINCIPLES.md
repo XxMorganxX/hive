@@ -453,26 +453,30 @@ The proposal compares arms on task performance, cost, latency and consistency. E
 
 ## 8. Repository layout
 
-Organized by role, so the trust boundary is visible in the tree.
+One Python package. The core is flat; plug-ins live in one subpackage per role.
 
 ```
 hive/
-  controller/        # TRUSTED: loop, validation gate, selection, stats, experience writer
-  optimizer/         # optimizer prompt template + headless invocation
-adapters/
-  pi/                # Harness impl, HivePi Harbor agent, topology → Pi extension compiler
-suites/
-  <use-case>/        # Suite impl, Harbor dataset ref, splits, judges
-harnesses/           # hand-written seeds: single, hierarchical, peer, manager-worker, self-decomposing
-experiments/
-  <name>.toml        # ONE file per experiment: model, suite, splits, k, G, N, margin, $ cap
-experience/          # gitignored: the optimizer's read-only world
-runs/  jobs/         # gitignored: raw Harbor output
+  contracts.py       # THE contracts: Task, Agent/AgentAdapter, Suite, Overseer, value types
+  candidate.py       # candidate directory model + content hash + lineage
+  registry.py        # name -> implementation, for agents, suites and overseers (one entry point)
+  config.py          # experiment config loader (experiments/*.toml)
+  evaluate.py        # run a candidate on a suite split × k -> EvalReport (trusted)
+  selection.py       # promotion rule + its plain-language description (trusted)
+  loop.py            # the improvement loop + experience store writer (trusted)
+  cli.py             # `hive eval`, `hive run`
+  agents/            # pi/ (real), scripted/ (test double for zero-cost dry runs)
+  suites/            # exact_answer/, python_functions/ (later: harbor/)
+  overseers/         # claude_code/ (prompt.md lives here), null/
+harnesses/           # hand-written seed candidates
+experiments/         # ONE file per experiment: model, suite, k, G, margin, $ cap, overseer
+experience/          # gitignored: run outputs, the overseer's evidence
+tests/
 docs/  tasks/
 ```
 
-- **Single source of truth.** Every tunable (model id, k, generations, promotion margin, dollar cap, τ) lives in `experiments/<name>.toml`. Every prompt the controller sends lives in `hive/optimizer/`. Nothing is inlined in loop code.
-- **Write fences.** The optimizer may write only inside proposed candidates. `hive/controller/` and `suites/` are off-limits to it, and the controller enforces this.
+- **Single source of truth.** Every tunable lives in `experiments/<name>.toml`. Every prompt lives in a file beside the code that sends it (`hive/overseers/claude_code/prompt.md`). Nothing is inlined in loop code.
+- **Write fences.** The overseer edits only `workspace/candidate/`. The controller harvests that directory and `RATIONALE.md`, and nothing else.
 
 ## 9. Known pitfalls (checklist)
 
