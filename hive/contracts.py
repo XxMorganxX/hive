@@ -100,6 +100,7 @@ class Agent(Protocol):
 
         Must not raise for agent-side failures: return status="errored" instead.
         Must write its native trace files into `trace_dir`.
+        May be called concurrently from several threads, each with its own workdir and trace_dir.
         """
         ...
 
