@@ -1,0 +1,7 @@
+schema_version = 1
+agent = "deepagents"
+description = "Stock single-agent Deep Agents: no system prompt of its own, no extensions or skills, default tools, no subagent."
+
+[valves]
+tools = ["ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute"]
+general_purpose_subagent = false

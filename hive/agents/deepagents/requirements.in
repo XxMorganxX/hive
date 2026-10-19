@@ -1,0 +1,6 @@
+# Direct pins for the Deep Agents runner venv (.venvs/deepagents). The full lock is
+# requirements.txt, made with:
+#   uv pip compile requirements.in -o requirements.txt --python-version 3.12
+# Bump deepagents and the experiments' deepagents_version together (P13).
+deepagents==0.7.28
+langchain-openai==1.7.2

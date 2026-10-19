@@ -1,0 +1,46 @@
+# deepagents-python-functions: the Deep Agents seed improved by the Claude Code overseer on the python_functions suite.
+# Every tunable for this experiment lives here; relative paths resolve against this file.
+#
+# [experiment]  name of the run directory, the seed harness, and where run outputs go
+# [model]       the frozen model under test and its reasoning effort, never part of a candidate (P3)
+# [agent]       settings for the agent adapter the seed names (here Deep Agents): the pinned venv
+#               interpreter and deepagents version, the per-trial timeout, and the price table the
+#               cost comes from (USD per million tokens; the framework computes no dollars)
+# [suite]       which evaluation suite to score on
+# [evaluation]  trials per task (k) and how many trials run at once
+# [loop]        generations to search, the promotion margin, and the hard dollar cap for the whole run (P12)
+# [overseer]    the improvement strategy and its settings, including its own per-proposal dollar cap
+
+[experiment]
+name = "deepagents-python-functions"
+seed_candidate = "../harnesses/deepagents-baseline"
+output_dir = "../experience"
+
+[model]
+provider = "openai"
+id = "gpt-5-nano"
+thinking = "low"
+
+[agent]
+python_path = "../.venvs/deepagents/bin/python"  # built by scripts/setup-framework-venvs.sh deepagents
+deepagents_version = "0.7.28"
+timeout_s = 300
+prices = { input = 0.05, output = 0.40, cache_read = 0.005 }  # gpt-5-nano, matching Pi's catalog
+
+[suite]
+name = "python_functions"
+
+[evaluation]
+trials_per_task = 2
+concurrency = 4
+
+[loop]
+generations = 3
+promotion_margin = 0.05
+max_usd = 3.0
+
+[overseer]
+kind = "claude_code"
+model = "sonnet"
+max_usd_per_proposal = 1.0
+timeout_s = 900
