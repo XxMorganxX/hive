@@ -9,7 +9,12 @@ FIXTURES = "registry_fixtures"
 
 def test_builtins_name_every_shipped_plugin():
     assert registry.BUILTINS == {
-        "agent": {"pi": "hive.agents.pi:PiAdapter", "scripted": "hive.agents.scripted:ScriptedAdapter"},
+        "agent": {
+            "pi": "hive.agents.pi:PiAdapter",
+            "scripted": "hive.agents.scripted:ScriptedAdapter",
+            "deepagents": "hive.agents.deepagents:DeepAgentsAdapter",
+            "strands": "hive.agents.strands:StrandsAdapter",
+        },
         "suite": {
             "exact_answer": "hive.suites.exact_answer:ExactAnswerSuite",
             "python_functions": "hive.suites.python_functions:PythonFunctionsSuite",

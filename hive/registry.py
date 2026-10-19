@@ -29,6 +29,8 @@ BUILTINS: dict[str, dict[str, str]] = {
     "agent": {
         "pi": "hive.agents.pi:PiAdapter",
         "scripted": "hive.agents.scripted:ScriptedAdapter",
+        "deepagents": "hive.agents.deepagents:DeepAgentsAdapter",
+        "strands": "hive.agents.strands:StrandsAdapter",
     },
     "suite": {
         "exact_answer": "hive.suites.exact_answer:ExactAnswerSuite",
