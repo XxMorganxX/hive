@@ -10,7 +10,8 @@ from hive.agents.pi import PiAdapter
 import hive.agents.pi.adapter as pi_adapter
 from hive.agents.pi.adapter import PiAgent, PiVersionMismatch, check_pi_version
 from hive.candidate import Candidate
-from hive.contracts import Agent, AgentAdapter, ModelSpec, Task, Usage
+from hive.contracts import LIFECYCLE_POINTS, Agent, AgentAdapter, ExtensionSpec, LoadReport, ModelSpec, Task, Usage
+from hive.extensions import expected_extension_files, load_problem, render_extension_guide
 
 FAKE_PI = Path(__file__).parent / "fakes" / "fake_pi.py"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -59,6 +60,7 @@ def fake_pi(tmp_path, monkeypatch, user_agent_dir):
     monkeypatch.setenv("FAKE_PI_RECORD", str(record))
     monkeypatch.delenv("FAKE_PI_SCENARIO", raising=False)
     monkeypatch.delenv("FAKE_PI_VERSION", raising=False)
+    monkeypatch.delenv("FAKE_PI_FAILING_EXTENSION", raising=False)
     return lambda: json.loads(record.read_text())
 
 
@@ -298,17 +300,28 @@ def test_malformed_lines_are_skipped(tmp_path, fake_pi, monkeypatch):
 
 def test_extension_load_failure_is_harness_load_error(tmp_path, fake_pi, monkeypatch):
     monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_load_error")
-    result, _, _ = run(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    result, _, _ = run(build_agent(write_candidate(tmp_path / "c", files={"extensions/bad.ts": "x"})), tmp_path)
     assert result.status == "errored"
     assert result.error_class == "harness_load_error"
     assert "bad.ts" in result.error
 
 
-def test_extension_runtime_error_is_harness_load_error_even_if_run_finished(tmp_path, fake_pi, monkeypatch):
+def test_load_failure_pi_names_under_an_unexpected_path_still_fails_every_file(tmp_path, fake_pi, monkeypatch):
+    # Under --no-extensions only -e files load, so any load failure is the candidate's.
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_load_error")
+    monkeypatch.setenv("FAKE_PI_FAILING_EXTENSION", "/elsewhere/extensions/bad.ts")
+    result, _, _ = run(build_agent(write_candidate(tmp_path / "c", files={"extensions/guard.ts": "x"})), tmp_path)
+    assert result.error_class == "harness_load_error"
+    (guard,) = result.load_report.extensions
+    assert guard.loaded is False
+    assert "boom in bad.ts" in guard.error
+
+
+def test_extension_runtime_error_is_extension_error_even_if_run_finished(tmp_path, fake_pi, monkeypatch):
     monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_runtime_error")
     result, _, _ = run(build_agent(write_candidate(tmp_path / "c")), tmp_path)
     assert result.status == "errored"
-    assert result.error_class == "harness_load_error"
+    assert result.error_class == "extension_error"
 
 
 def test_timeout_is_errored_timeout_and_keeps_partial_output(tmp_path, fake_pi, monkeypatch):
@@ -708,13 +721,22 @@ def test_real_agent_dir_expands_tilde(monkeypatch, tmp_path):
 # --- extension crashes ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("scenario", ["extension_crash_at_start", "extension_crash_mid_run"])
-def test_stack_trace_naming_a_candidate_extension_is_harness_load_error(tmp_path, fake_pi, monkeypatch, scenario):
-    monkeypatch.setenv("FAKE_PI_SCENARIO", scenario)
+def test_stack_trace_naming_an_extension_before_the_run_started_is_harness_load_error(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_crash_at_start")
     candidate = write_candidate(tmp_path / "c", files={"extensions/crash.ts": "export default () => {}"})
     result, _, _ = run(build_agent(candidate), tmp_path)
     assert result.status == "errored"
     assert result.error_class == "harness_load_error"
+    assert "boom from candidate extension" in result.error
+
+
+def test_stack_trace_naming_an_extension_mid_run_is_extension_error(tmp_path, fake_pi, monkeypatch):
+    # The file loaded and the run started; its code then threw outside any handler Pi catches.
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_crash_mid_run")
+    candidate = write_candidate(tmp_path / "c", files={"extensions/crash.ts": "export default () => {}"})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert result.status == "errored"
+    assert result.error_class == "extension_error"
     assert "boom from candidate extension" in result.error
 
 
@@ -777,3 +799,430 @@ def test_validate_rejects_frontmatter_name_that_matches_another_skill_directory(
     files = {"skills/plan/SKILL.md": skill_md(), "skills/other/SKILL.md": skill_md(name="plan")}
     problems = PiAdapter().validate(write_candidate(tmp_path / "c", files=files))
     assert any("'plan'" in p for p in problems)
+
+
+# --- extension spec (docs/FOUNDING_PRINCIPLES.md §5.2) ----------------------------------
+
+
+def spec() -> ExtensionSpec:
+    result = PiAdapter().extension_spec()
+    assert result is not None
+    return result
+
+
+def lifecycle_point(point_id: str):
+    return next(point for point in spec().lifecycle if point.id == point_id)
+
+
+def test_extension_spec_declares_typescript_and_javascript_files():
+    assert spec().language == "typescript"
+    assert spec().suffixes == (".ts", ".js")
+
+
+def test_extension_spec_suffixes_are_the_ones_validate_accepts():
+    assert spec().suffixes == pi_adapter.EXTENSION_SUFFIXES
+
+
+def test_extension_spec_entry_is_a_default_exported_factory():
+    entry = spec().entry_convention
+    assert "default export" in entry
+    assert "(pi: ExtensionAPI) => void | Promise<void>" in entry
+
+
+def test_extension_spec_pins_pi_0_75_3():
+    assert spec().framework_version == "0.75.3"
+
+
+def test_extension_spec_declares_every_lifecycle_point_exactly_once():
+    assert sorted(point.id for point in spec().lifecycle) == sorted(LIFECYCLE_POINTS)
+
+
+def test_extension_spec_gives_every_point_a_native_api_and_what_it_can_modify():
+    for point in spec().lifecycle:
+        assert point.support in ("supported", "partial", "unsupported")
+        assert point.native_api and point.can_modify, point.id
+
+
+@pytest.mark.parametrize(
+    "point_id, native",
+    [
+        ("before_run", 'pi.on("before_agent_start")'),
+        ("system_prompt", 'pi.on("before_agent_start")'),
+        ("before_model_call", 'pi.on("context")'),
+        ("after_model_call", 'pi.on("message_end")'),
+        ("wrap_model_call", 'pi.on("before_provider_request")'),
+        ("before_tool_call", 'pi.on("tool_call")'),
+        ("after_tool_call", 'pi.on("tool_result")'),
+        ("register_tool", "pi.registerTool"),
+        ("compaction", 'pi.on("session_before_compact")'),
+        ("after_run", 'pi.on("agent_end")'),
+    ],
+)
+def test_extension_spec_maps_each_point_to_its_exact_pi_api(point_id, native):
+    assert native in lifecycle_point(point_id).native_api
+
+
+def test_extension_spec_marks_points_pi_only_partly_supports():
+    for point_id in ("after_model_call", "wrap_model_call", "after_run"):
+        assert lifecycle_point(point_id).support == "partial"
+
+
+def test_context_edits_are_documented_as_applying_to_one_call_only():
+    assert "one call" in lifecycle_point("before_model_call").caveats
+
+
+def test_tool_call_argument_rewrites_are_documented_as_in_place_mutation():
+    point = lifecycle_point("before_tool_call")
+    assert "event.input" in point.can_modify
+    assert "in place" in point.can_modify
+
+
+def test_tool_call_handler_throws_are_documented_as_unreported():
+    # Pi turns a throwing tool_call handler into an error tool result, with nothing on stderr.
+    assert "not reported" in lifecycle_point("before_tool_call").caveats
+
+
+def test_registered_tools_are_documented_as_gated_by_the_tools_valve():
+    assert "[valves].tools" in lifecycle_point("register_tool").caveats
+
+
+def test_extension_spec_forbids_apis_that_change_the_model():
+    forbidden = " ".join(spec().forbidden)
+    for api in ("pi.setModel", "pi.setThinkingLevel", "pi.registerProvider", "before_provider_request"):
+        assert api in forbidden
+
+
+def test_extension_spec_api_reference_is_the_pinned_excerpt():
+    excerpt = (REPO_ROOT / "hive" / "agents" / "pi" / "EXTENSIONS_API.md").read_text()
+    assert spec().api_reference == excerpt
+
+
+def test_api_reference_says_where_it_was_excerpted_from_and_stays_short():
+    reference = spec().api_reference
+    assert "0.75.3" in reference
+    assert "dist/core/extensions/types.d.ts" in reference
+    assert "interface ExtensionAPI" in reference
+    assert len(reference.splitlines()) <= 420
+
+
+def test_rendered_guide_declares_every_point():
+    assert "not declared" not in render_extension_guide(spec())
+
+
+# --- load report ------------------------------------------------------------------------
+
+GUARD_TS = """import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+export default function (pi: ExtensionAPI) {
+    pi.on("tool_call", async (event) => { if (event.toolName === "bash") return { block: true }; });
+    pi.on("context", async (event) => ({ messages: event.messages }));
+}
+"""
+CALC_TS = """import { Type } from "typebox";
+export default (pi) => {
+    pi.registerTool({
+        name: "calc",
+        label: "Calc",
+        description: "Add numbers",
+        parameters: Type.Object({ a: Type.Number() }),
+        async execute(id, params) { return { content: [], details: {} }; },
+    });
+};
+"""
+
+
+def candidate_with(tmp_path: Path, files: dict[str, str], valves: str = "") -> Candidate:
+    return write_candidate(tmp_path / "c", valves=valves, files=files)
+
+
+def loads_by_path(result) -> dict:
+    return {load.path: load for load in result.load_report.extensions}
+
+
+def test_successful_run_reports_every_extension_loaded(tmp_path, fake_pi):
+    candidate = candidate_with(tmp_path, {"extensions/a.ts": GUARD_TS, "extensions/b.js": "export default () => {}"})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert result.status == "completed"
+    assert [(load.path, load.loaded, load.error) for load in result.load_report.extensions] == [
+        ("extensions/a.ts", True, None),
+        ("extensions/b.js", True, None),
+    ]
+    assert result.load_report.runtime_errors == ()
+
+
+def test_load_report_paths_are_the_ones_the_controller_expects(tmp_path, fake_pi):
+    candidate = candidate_with(tmp_path, {"extensions/a.ts": GUARD_TS, "extensions/b.js": "export default () => {}"})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    expected = expected_extension_files(candidate, spec())
+    assert sorted(loads_by_path(result)) == expected
+    assert load_problem(expected, result.load_report) is None
+
+
+def test_load_report_lists_what_each_extension_registers(tmp_path, fake_pi):
+    candidate = candidate_with(
+        tmp_path, {"extensions/guard.ts": GUARD_TS, "extensions/calc.ts": CALC_TS}, valves='tools = ["read", "calc"]\n'
+    )
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    loads = loads_by_path(result)
+    assert loads["extensions/guard.ts"].registered == ("before_model_call", "before_tool_call")
+    assert loads["extensions/calc.ts"].registered == ("register_tool", "tool:calc")
+
+
+def test_candidate_without_extensions_gets_an_empty_load_report(tmp_path, fake_pi):
+    result, _, _ = run(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    assert result.load_report == LoadReport()
+
+
+def test_startup_load_failure_marks_the_named_file_not_loaded_with_its_error(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_load_error")
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": "x", "extensions/good.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    bad = loads_by_path(result)["extensions/bad.ts"]
+    assert bad.loaded is False
+    assert "boom in bad.ts" in bad.error
+    assert bad.registered == ()
+
+
+def test_startup_load_failure_marks_the_other_files_unknown_and_not_loaded(tmp_path, fake_pi, monkeypatch):
+    # Pi exits at startup when any -e file fails, so the others never ran in a trial.
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_load_error")
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": "x", "extensions/good.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    good = loads_by_path(result)["extensions/good.ts"]
+    assert good.loaded is False
+    assert "unknown" in good.error
+
+
+def test_each_failing_file_keeps_its_own_multi_line_load_error(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_load_error")
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": "x", "extensions/bad2.ts": "y"})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    loads = loads_by_path(result)
+    assert "boom in bad.ts" in loads["extensions/bad.ts"].error
+    assert "bad.ts:3:1" in loads["extensions/bad.ts"].error  # the second line of its message
+    assert "bad2.ts" not in loads["extensions/bad.ts"].error
+    assert "boom in bad2.ts" in loads["extensions/bad2.ts"].error
+
+
+def test_startup_load_failure_is_harness_load_error_naming_the_file(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_load_error")
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": "x"})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert result.error_class == "harness_load_error"
+    assert "extensions/bad.ts" in result.error
+
+
+def test_runtime_extension_error_is_attributed_to_the_extension(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_runtime_error")
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": GUARD_TS, "extensions/good.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert result.load_report.runtime_errors == ("extensions/bad.ts: handler threw",)
+
+
+def test_runtime_extension_error_leaves_every_file_loaded(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_runtime_error")
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": GUARD_TS, "extensions/good.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert all(load.loaded for load in result.load_report.extensions)
+
+
+def test_runtime_extension_error_is_extension_error_not_harness_load_error(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_runtime_error")
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert result.status == "errored"
+    assert result.error_class == "extension_error"
+    assert "extensions/bad.ts: handler threw" in result.error
+
+
+def test_crash_mid_run_is_a_runtime_error_of_the_named_file(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_crash_mid_run")
+    candidate = candidate_with(tmp_path, {"extensions/crash.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert loads_by_path(result)["extensions/crash.ts"].loaded is True
+    (runtime_error,) = result.load_report.runtime_errors
+    assert runtime_error.startswith("extensions/crash.ts: ")
+    assert "boom from candidate extension" in runtime_error
+
+
+def test_crash_at_start_marks_the_named_file_not_loaded(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "extension_crash_at_start")
+    candidate = candidate_with(tmp_path, {"extensions/crash.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    crash = loads_by_path(result)["extensions/crash.ts"]
+    assert crash.loaded is False
+    assert "boom from candidate extension" in crash.error
+
+
+def test_startup_failure_unrelated_to_extensions_is_agent_error_with_extensions_unknown(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "startup_failure")
+    candidate = candidate_with(tmp_path, {"extensions/guard.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert result.error_class == "agent_error"
+    guard = loads_by_path(result)["extensions/guard.ts"]
+    assert guard.loaded is False
+    assert "unknown" in guard.error
+
+
+def test_launch_failure_still_reports_the_extensions_as_not_loaded(tmp_path):
+    candidate = candidate_with(tmp_path, {"extensions/guard.ts": GUARD_TS})
+    agent = PiAdapter().build(candidate, MODEL, {"pi_bin": str(tmp_path / "no-such-pi")})
+    result, _, _ = run(agent, tmp_path)
+    assert result.error_class == "agent_error"
+    assert [load.loaded for load in result.load_report.extensions] == [False]
+
+
+def test_timeout_after_the_run_started_reports_extensions_loaded(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "timeout")
+    candidate = candidate_with(tmp_path, {"extensions/guard.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate, timeout_s=1), tmp_path)
+    assert result.error_class == "timeout"
+    assert [load.loaded for load in result.load_report.extensions] == [True]
+
+
+def test_model_mismatch_still_carries_the_load_report(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", "model_switch")
+    candidate = candidate_with(tmp_path, {"extensions/guard.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    assert result.error_class == "model_mismatch"
+    assert [load.loaded for load in result.load_report.extensions] == [True]
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "success",
+        "extension_load_error",
+        "extension_runtime_error",
+        "extension_crash_at_start",
+        "extension_crash_mid_run",
+    ],
+)
+def test_adapter_classification_agrees_with_the_controller_rule(tmp_path, fake_pi, monkeypatch, scenario):
+    monkeypatch.setenv("FAKE_PI_SCENARIO", scenario)
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": GUARD_TS, "extensions/good.ts": GUARD_TS})
+    result, _, _ = run(build_agent(candidate), tmp_path)
+    problem = load_problem(expected_extension_files(candidate, spec()), result.load_report)
+    assert (problem[0] if problem else None) == result.error_class
+
+
+# --- static registration analysis -------------------------------------------------------
+
+
+def test_registered_maps_pi_events_to_lifecycle_points():
+    source = """export default (pi) => {
+        pi.on("before_agent_start", () => {});
+        pi.on("tool_result", () => {});
+        pi.on("session_before_compact", () => {});
+        pi.on('agent_end', () => {});
+    };"""
+    assert pi_adapter.registered_by(source) == (
+        "after_run", "after_tool_call", "before_run", "compaction", "system_prompt",
+    )  # fmt: skip
+
+
+def test_registered_ignores_events_outside_the_catalog():
+    assert pi_adapter.registered_by('export default (pi) => { pi.on("model_select", () => {}); }') == ()
+
+
+def test_registered_works_whatever_the_api_parameter_is_named():
+    source = 'export default function (api: ExtensionAPI) { api.on("tool_call", () => {}); }'
+    assert pi_adapter.registered_by(source) == ("before_tool_call",)
+
+
+def test_registered_ignores_commented_out_calls():
+    source = """export default (pi) => {
+        // pi.on("tool_call", () => {});
+        /* pi.registerTool({ name: "calc" }); */
+        pi.on("context", () => {}); // a URL like "http://x" in a string is not a comment
+    };"""
+    assert pi_adapter.registered_by(source) == ("before_model_call",)
+
+
+def test_registered_reads_the_tool_name_even_after_nested_name_keys():
+    source = """pi.registerTool({
+        parameters: Type.Object({ name: Type.String() }),
+        label: "Lookup",
+        name: `lookup`,
+    });"""
+    assert pi_adapter.registered_by(source) == ("register_tool", "tool:lookup")
+
+
+def test_registered_records_a_tool_whose_name_is_not_a_literal_without_naming_it():
+    assert pi_adapter.registered_by("const tool = makeTool(); pi.registerTool(tool);") == ("register_tool",)
+
+
+def test_registered_does_not_treat_an_interpolated_template_as_a_literal_name():
+    assert pi_adapter.literal_tool_names("pi.registerTool({ name: `calc_${suffix}` });") == ()
+
+
+# --- extension tools must be in the tools valve -----------------------------------------
+
+
+def test_validate_rejects_extension_tool_missing_from_tools_valve(tmp_path):
+    candidate = candidate_with(tmp_path, {"extensions/calc.ts": CALC_TS}, valves='tools = ["read"]\n')
+    problems = PiAdapter().validate(candidate)
+    assert any("extensions/calc.ts" in p and "'calc'" in p and "tools" in p for p in problems)
+
+
+def test_validate_accepts_extension_tool_listed_in_tools_valve(tmp_path):
+    candidate = candidate_with(tmp_path, {"extensions/calc.ts": CALC_TS}, valves='tools = ["read", "calc"]\n')
+    assert PiAdapter().validate(candidate) == []
+
+
+def test_validate_checks_extension_tools_against_the_default_tools(tmp_path):
+    candidate = candidate_with(tmp_path, {"extensions/calc.ts": CALC_TS})
+    assert any("'calc'" in p for p in PiAdapter().validate(candidate))
+
+
+def test_validate_accepts_an_extension_overriding_a_listed_built_in_tool(tmp_path):
+    override = 'export default (pi) => { pi.registerTool({ name: "read", label: "r", description: "d" }); };'
+    assert PiAdapter().validate(candidate_with(tmp_path, {"extensions/read.ts": override})) == []
+
+
+def test_validate_ignores_tool_names_it_cannot_read_statically(tmp_path):
+    dynamic = "export default (pi) => { pi.registerTool(makeTool()); };"
+    assert PiAdapter().validate(candidate_with(tmp_path, {"extensions/dyn.ts": dynamic})) == []
+
+
+# --- VALVES.md and extensions -----------------------------------------------------------
+
+
+def test_valves_doc_points_to_the_controller_rendered_extension_guide():
+    assert "extension guide" in PiAdapter().describe_valves().lower()
+
+
+def test_valves_doc_states_the_registered_tool_rule():
+    text = PiAdapter().describe_valves()
+    assert "registerTool" in text
+    assert "string literal" in text
+
+
+def test_valves_doc_names_the_extension_error_class():
+    assert "extension_error" in PiAdapter().describe_valves()
+
+
+# Recorded from the real Pi 0.75.3 (an extension with a syntax error, run offline with no
+# credentials); {path} stands for the extension's absolute path.
+REAL_LOAD_FAILURE_STDERR = (
+    'Error: Failed to load extension "{path}": Failed to load extension: ParseError: Unexpected token, '
+    'expected ","  \n {path}:3:1\n'
+)
+
+
+def test_real_pi_load_failure_output_marks_the_file_not_loaded(tmp_path):
+    candidate = candidate_with(tmp_path, {"extensions/bad.ts": "x", "extensions/good.ts": GUARD_TS})
+    agent = build_agent(candidate)
+    bad_path = candidate.root / "extensions" / "bad.ts"
+    raw = pi_adapter.RawRun(
+        stdout="",
+        stderr=REAL_LOAD_FAILURE_STDERR.format(path=bad_path),
+        session_entries=(),
+        returncode=1,
+        timed_out=False,
+        wall_clock_s=0.5,
+    )
+    result = pi_adapter.interpret_run(raw, model=MODEL, extensions=agent.extensions, timeout_s=60)
+    assert result.error_class == "harness_load_error"
+    bad = loads_by_path(result)["extensions/bad.ts"]
+    assert "ParseError: Unexpected token" in bad.error
+    assert f"{bad_path}:3:1" in bad.error

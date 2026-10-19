@@ -185,6 +185,16 @@ def spawn_sleepers() -> None:
                 handle.write(str(pid))
 
 
+def failing_extensions() -> list[str]:
+    """The -e files a failure scenario blames: FAKE_PI_FAILING_EXTENSION when set, else those
+    named bad*, else the first, else a placeholder."""
+    if os.environ.get("FAKE_PI_FAILING_EXTENSION"):
+        return [os.environ["FAKE_PI_FAILING_EXTENSION"]]
+    paths = flag_values("-e")
+    bad = [path for path in paths if os.path.basename(path).startswith("bad")]
+    return bad or paths[:1] or ["/c/extensions/bad.ts"]
+
+
 def extension_stack_trace() -> str:
     """What Node prints when extension code throws outside any handler Pi catches."""
     extension = flag_values("-e")[0]
@@ -259,13 +269,23 @@ def main() -> int:
         # The run ended (agent_end) without the model's own final reply.
         emit([HEADER, AGENT_START, USER, TOOL_USE, TOOL_RESULT, AGENT_END])
     elif scenario == "extension_load_error":
-        # Pi 0.75.3 reports a failed extension load as a startup diagnostic and exits 1.
-        sys.stderr.write('Error: Failed to load extension "/c/extensions/bad.ts": Failed to load extension: boom\n')
+        # Pi 0.75.3 loads every -e file, reports each failure as a startup diagnostic (the
+        # loader's message can span lines), then exits 1 before printing the session header.
+        for path in failing_extensions():
+            name = os.path.basename(path)
+            sys.stderr.write(
+                f'Error: Failed to load extension "{path}": Failed to load extension: boom in {name}\n'
+                f"    at {path}:3:1\n"
+            )
         return 1
     elif scenario == "extension_runtime_error":
         # An extension handler that throws mid-run is reported and the run carries on without it.
-        sys.stderr.write("Extension error (/c/extensions/bad.ts): handler threw\n")
+        sys.stderr.write(f"Extension error ({failing_extensions()[0]}): handler threw\n")
         emit(SUCCESS_EVENTS)
+    elif scenario == "startup_failure":
+        # A startup error that is not about extensions (main.js exits before the session header).
+        sys.stderr.write("Error: No models available. Configure a provider first.\n")
+        return 1
     elif scenario == "extension_crash_at_start":
         sys.stderr.write(extension_stack_trace())
         return 1

@@ -27,10 +27,15 @@ dist/core/sdk.js, dist/core/skills.js, dist/modes/print-mode.js, pi-agent-core a
   call setModel / setThinkingLevel, and Pi's model resolver fuzzy-matches ids without a
   warning, so the adapter checks those fields, and the session file's model and thinking
   entries, against the experiment's ModelSpec (P3).
-- A failed extension load prints `Failed to load extension "<path>": ...` and exits 1; an
-  extension handler that throws mid-run prints `Extension error (<path>): ...` and the run
-  goes on. Extension code that throws outside a handler crashes Node with a stack trace
-  naming the file. A tool's execute() that throws becomes an error tool result instead.
+- Extensions (see extension_spec() and EXTENSIONS_API.md). Pi loads every `-e` file, and if
+  any failed it prints `Error: Failed to load extension "<path>": ...` per failure and exits
+  1 before the session header (main.js reportDiagnostics; core/extensions/loader.js). So
+  once the header or `agent_start` is on stdout, every `-e` file loaded: that is the
+  positive half of the load report, which Pi has nowhere else. An extension handler that
+  throws mid-run prints `Extension error (<path>): ...` (print-mode.js) and the run goes on.
+  Extension code that throws outside a handler crashes Node with a stack trace naming the
+  file. A tool's execute() that throws, and a `tool_call` handler that throws, become error
+  tool results the model sees, with nothing on stderr (runner.js emitToolCall has no catch).
 - Bash tool commands run detached, in their own session. Pi kills them on SIGTERM, not on
   SIGKILL, so a timeout sends SIGTERM first.
 """
@@ -52,7 +57,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hive.candidate import MANIFEST, Candidate, content_files
-from hive.contracts import AgentResult, ModelSpec, Task, Usage
+from hive.contracts import (
+    EXTENSIONS_DIR,
+    AgentResult,
+    ExtensionLoad,
+    ExtensionSpec,
+    LifecyclePoint,
+    LoadReport,
+    ModelSpec,
+    Task,
+    Usage,
+)
+from hive.extensions import load_problem
 
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
 # Used when the experiment's ModelSpec leaves `thinking` unset.
@@ -62,7 +78,6 @@ VALVE_NAMES = ("tools",)
 
 SYSTEM_PROMPT_FILE = "SYSTEM.md"
 APPEND_SYSTEM_PROMPT_FILE = "APPEND_SYSTEM.md"
-EXTENSIONS_DIR = "extensions"
 SKILLS_DIR = "skills"
 SKILL_FILE = "SKILL.md"
 EXTENSION_SUFFIXES = (".ts", ".js")
@@ -81,7 +96,12 @@ LINKED_AGENT_ENTRIES = ("auth.json", "bin")
 # user's settings say, so retry, compaction, shell and thinking-budget settings can't drift.
 PINNED_SETTINGS: Mapping[str, Any] = {}
 
-EXTENSION_ERROR_PATTERN = re.compile(r"Failed to load extension|Extension error \(")
+# Pi's own extension diagnostics on stderr (see module doc).
+LOAD_ERROR_LINE = re.compile(r'Failed to load extension "([^"]+)": ?(.*)$')
+DIAGNOSTIC_START = re.compile(r"^(?:Error|Warning): ")
+RUNTIME_ERROR_PREFIX = "Extension error ("
+RUNTIME_ERROR_LINE = re.compile(r"^Extension error \((.+?)\): ?(.*)$")
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 QUOTA_PATTERN = re.compile(r"\b429\b|rate[ _-]?limit|too many requests|quota|billing", re.IGNORECASE)
 COMPLETED_STOP_REASONS = ("stop", "length")
 
@@ -93,6 +113,7 @@ KILL_DRAIN_TIMEOUT_S = 10
 STDERR_TAIL_CHARS = 2000
 
 VALVES_DOC = Path(__file__).with_name("VALVES.md")
+EXTENSIONS_API_DOC = Path(__file__).with_name("EXTENSIONS_API.md")
 
 
 class PiVersionMismatch(RuntimeError):
@@ -242,6 +263,267 @@ def valve_problems(valves: Mapping[str, Any]) -> list[str]:
     return problems
 
 
+# --- extensions ---------------------------------------------------------------------------
+#
+# The catalog below maps HIVE's neutral lifecycle points onto Pi 0.75.3's extension API. Every
+# entry was checked against the installed dist/core/extensions/{types.d.ts,runner.js,loader.js},
+# dist/core/sdk.js and pi-agent-core agent-loop.js, and the failure rows by running Pi offline
+# with a fake provider. The caveats carry the semantics that differ from other frameworks,
+# because a bare "supported" would mislead the overseer.
+
+PI_VERSION = "0.75.3"
+
+PI_LIFECYCLE = (
+    LifecyclePoint(
+        id="before_run",
+        support="supported",
+        native_api='pi.on("session_start"), pi.on("input"), pi.on("before_agent_start")',
+        can_modify='input returns {action: "transform", text} to rewrite the task prompt; before_agent_start '
+        "returns {message} to add a custom message the model sees; session_start only observes",
+        caveats="before_agent_start fires once per prompt, and HIVE sends one prompt per task. "
+        'input returning {action: "handled"} skips the model, so the run ends with no answer (agent_error).',
+    ),
+    LifecyclePoint(
+        id="system_prompt",
+        support="supported",
+        native_api='pi.on("before_agent_start")',
+        can_modify="return {systemPrompt} to replace the system prompt; event.systemPrompt is the current one "
+        "and event.systemPromptOptions its structured parts",
+        caveats="Handlers chain in load order, each seeing the previous result. For fixed text, editing "
+        "SYSTEM.md or APPEND_SYSTEM.md is simpler and cheaper to get right.",
+    ),
+    LifecyclePoint(
+        id="before_model_call",
+        support="supported",
+        native_api='pi.on("context")',
+        can_modify="return {messages} to replace the message list sent on this model call",
+        caveats="event.messages is a deep copy and the edit applies to this one call only: it is not saved, "
+        "so a handler must re-apply it on every call. Handlers chain.",
+    ),
+    LifecyclePoint(
+        id="after_model_call",
+        support="partial",
+        native_api='pi.on("message_end"), pi.on("after_provider_response")',
+        can_modify="message_end returns {message} to replace the finished message (same role only); "
+        "after_provider_response observes the HTTP status and headers",
+        caveats="There is no retry hook: an extension cannot have a model call redone. message_end fires for "
+        "user, assistant and tool-result messages alike; check event.message.role.",
+    ),
+    LifecyclePoint(
+        id="wrap_model_call",
+        support="partial",
+        native_api='pi.on("before_provider_request")',
+        can_modify="return a value to replace the serialized provider payload",
+        caveats="There is no wrapper that receives the model call itself. Changing the payload's model "
+        "breaks the fixed model (P3) and is forbidden.",
+    ),
+    LifecyclePoint(
+        id="before_tool_call",
+        support="supported",
+        native_api='pi.on("tool_call")',
+        can_modify="return {block: true, reason} to cancel the call; rewrite its arguments by mutating "
+        "event.input in place (Pi does not re-validate them)",
+        caveats="Handlers run in load order and stop at the first block; later handlers see earlier "
+        "mutations. A throw inside a tool_call handler is not reported as an extension error: Pi turns it "
+        "into an error tool result the model sees, and the trial is not marked.",
+    ),
+    LifecyclePoint(
+        id="after_tool_call",
+        support="supported",
+        native_api='pi.on("tool_result")',
+        can_modify="return {content, details, isError} to replace the tool result",
+        caveats="Handlers chain in load order, each seeing the previous result.",
+    ),
+    LifecyclePoint(
+        id="register_tool",
+        support="supported",
+        native_api="pi.registerTool(ToolDefinition)",
+        can_modify="add a tool: name, label, description, TypeBox parameters and execute()",
+        caveats="The tool is active only if its name is also in [valves].tools; validation rejects a "
+        'registerTool({ name: "..." }) string literal missing from it. A tool named like a built-in '
+        "replaces the built-in. A throw in execute() becomes an error tool result the model sees.",
+    ),
+    LifecyclePoint(
+        id="compaction",
+        support="supported",
+        native_api='pi.on("session_before_compact"), pi.on("session_compact"), ctx.compact()',
+        can_modify="session_before_compact returns {cancel: true}, or {compaction: {summary, firstKeptEntryId, "
+        "tokensBefore}} to supply your own summary; session_compact observes the result",
+        caveats="Fires only when the context grows past Pi's threshold, whose settings the experiment pins.",
+    ),
+    LifecyclePoint(
+        id="after_run",
+        support="partial",
+        native_api='pi.on("agent_end"), pi.on("turn_end") with pi.sendUserMessage',
+        can_modify='agent_end only observes. To continue the run, call pi.sendUserMessage(text, {deliverAs: '
+        '"followUp"}) from turn_end while the run is still going',
+        caveats="No hook returns a continue signal. The follow-up route comes from Pi's loop code and is "
+        "not verified in print mode; check the trace before relying on it.",
+    ),
+)
+
+PI_FORBIDDEN = (
+    "pi.setModel",
+    "pi.setThinkingLevel",
+    "pi.registerProvider",
+    "pi.unregisterProvider",
+    'pi.on("before_provider_request") returning a payload with a different model',
+)
+
+PI_ENTRY_CONVENTION = (
+    "default export the factory `(pi: ExtensionAPI) => void | Promise<void>`. Pi calls it once at "
+    "startup, before the run, to register handlers and tools. The file is loaded with jiti: TypeScript "
+    "is transpiled but never type-checked, and only Node built-ins, Pi's own packages and `typebox` "
+    "can be imported."
+)
+
+# Pi events -> the neutral points they serve, for the static `registered` list. An event that
+# serves two points (before_agent_start) is listed under both.
+PI_EVENT_POINTS: Mapping[str, tuple[str, ...]] = {
+    "session_start": ("before_run",),
+    "input": ("before_run",),
+    "before_agent_start": ("before_run", "system_prompt"),
+    "context": ("before_model_call",),
+    "message_end": ("after_model_call",),
+    "after_provider_response": ("after_model_call",),
+    "before_provider_request": ("wrap_model_call",),
+    "tool_call": ("before_tool_call",),
+    "tool_result": ("after_tool_call",),
+    "session_before_compact": ("compaction",),
+    "session_compact": ("compaction",),
+    "agent_end": ("after_run",),
+    "turn_end": ("after_run",),
+}
+
+ON_CALL = re.compile(r"""\.on\(\s*(["'`])([A-Za-z_]+)\1""")
+REGISTER_TOOL_CALL = re.compile(r"\.registerTool\s*\(\s*")
+NAME_KEY = re.compile(r"name\s*:\s*")
+LITERAL_STRING = re.compile(r"""^(?:"([^"\\\n]*)"|'([^'\\\n]*)'|`([^`\\$]*)`)""")
+
+
+def pi_extension_spec() -> ExtensionSpec:
+    return ExtensionSpec(
+        language="typescript",
+        suffixes=EXTENSION_SUFFIXES,
+        entry_convention=PI_ENTRY_CONVENTION,
+        framework_version=PI_VERSION,
+        lifecycle=PI_LIFECYCLE,
+        forbidden=PI_FORBIDDEN,
+        api_reference=EXTENSIONS_API_DOC.read_text(encoding="utf-8"),
+    )
+
+
+def registered_by(source: str) -> tuple[str, ...]:
+    """What an extension's source hooks: neutral point ids, plus "tool:<name>" per literal tool name.
+
+    Static and best effort: Pi records nothing about what an extension registered, and running
+    the code to find out would mean running candidate code in the controller. Calls inside
+    comments are ignored; calls built dynamically (a computed event name, a tool object passed
+    by variable) are missed, though any registerTool call still counts as "register_tool".
+    """
+    code = without_comments(source)
+    registered = {point for match in ON_CALL.finditer(code) for point in PI_EVENT_POINTS.get(match.group(2), ())}
+    if REGISTER_TOOL_CALL.search(code):
+        registered.add("register_tool")
+    registered.update(f"tool:{name}" for name in literal_tool_names(source))
+    return tuple(sorted(registered))
+
+
+def literal_tool_names(source: str) -> tuple[str, ...]:
+    """Names in `registerTool({ name: "<literal>", ... })` calls, in source order. A name that is a
+    variable, an expression or an interpolated template can't be known statically and is skipped."""
+    code = without_comments(source)
+    names: list[str] = []
+    for match in REGISTER_TOOL_CALL.finditer(code):
+        if code.startswith("{", match.end()):
+            name = object_literal_name(code, match.end())
+            if name is not None and name not in names:
+                names.append(name)
+    return tuple(names)
+
+
+def object_literal_name(code: str, start: int) -> str | None:
+    """The string-literal value of the top-level `name` key of the object literal at code[start]."""
+    depth = 0
+    index = start
+    while index < len(code):
+        char = code[index]
+        if char in "'\"`":
+            index = string_end(code, index)
+            continue
+        if char in "{([":
+            depth += 1
+        elif char in "})]":
+            depth -= 1
+            if depth == 0:
+                return None
+        elif depth == 1 and (index == 0 or not (code[index - 1].isalnum() or code[index - 1] in "_$.")):
+            # Only a key of this object: `parameters: Type.Object({ name: ... })` is one level deeper.
+            key = NAME_KEY.match(code, index)
+            if key is not None:
+                value = LITERAL_STRING.match(code[key.end() :])
+                if value is None:
+                    return None
+                return next(group for group in value.groups() if group is not None)
+        index += 1
+    return None
+
+
+def string_end(code: str, start: int) -> int:
+    """Index just past the string literal opening at code[start] (or the end of the code)."""
+    quote = code[start]
+    index = start + 1
+    while index < len(code):
+        if code[index] == "\\":
+            index += 2
+            continue
+        if code[index] == quote:
+            return index + 1
+        index += 1
+    return len(code)
+
+
+def without_comments(source: str) -> str:
+    """The source with `//` and `/* */` comments blanked out, string literals kept intact."""
+    kept: list[str] = []
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if char in "'\"`":
+            end = string_end(source, index)
+            kept.append(source[index:end])
+            index = end
+        elif source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = len(source) if newline == -1 else newline
+        elif source.startswith("/*", index):
+            close = source.find("*/", index + 2)
+            kept.append(" ")
+            index = len(source) if close == -1 else close + 2
+        else:
+            kept.append(char)
+            index += 1
+    return "".join(kept)
+
+
+def extension_tool_problems(extensions: Sequence[Path], root: Path, valves: Mapping[str, Any]) -> list[str]:
+    """Pi silently leaves out an extension tool whose name is not in --tools; catch the cases
+    where the name is a string literal. A name built at runtime can't be checked (VALVES.md)."""
+    tools = valves.get("tools", list(DEFAULT_TOOLS))
+    if not isinstance(tools, list):
+        return []  # valve_problems already reports it
+    allowed = {tool for tool in tools if isinstance(tool, str)}
+    problems = []
+    for path in extensions:
+        for name in literal_tool_names(path.read_text(encoding="utf-8", errors="replace")):
+            if name not in allowed:
+                problems.append(
+                    f"'{path.relative_to(root).as_posix()}' registers tool '{name}', which is not in "
+                    "[valves].tools, so Pi would leave it inactive; add it to tools or remove the registration"
+                )
+    return problems
+
+
 def thinking_level(model: ModelSpec) -> str:
     """The reasoning effort is part of the frozen model spec (P3), never a candidate valve."""
     level = DEFAULT_THINKING if model.thinking is None else model.thinking
@@ -312,7 +594,9 @@ class PiAdapter:
             if candidate.agent != self.name:
                 problems.append(f"agent is '{candidate.agent}', expected '{self.name}'")
             problems.extend(valve_problems(candidate.valves))
-            problems.extend(read_layout(candidate.root).problems)
+            layout = read_layout(candidate.root)
+            problems.extend(layout.problems)
+            problems.extend(extension_tool_problems(layout.extensions, candidate.root, candidate.valves))
             return problems
         except Exception as error:  # validate must never raise; an unreadable candidate is a problem
             return [f"could not inspect candidate at {candidate.root}: {error}"]
@@ -339,8 +623,16 @@ class PiAdapter:
             "--system-prompt", str(layout.system_prompt or ""),
             "--append-system-prompt", str(layout.append_system_prompt or ""),
         ]  # fmt: skip
-        for extension in layout.extensions:
-            options += ["-e", str(extension)]
+        extensions = tuple(
+            ExtensionFile(
+                relative=path.relative_to(candidate.root).as_posix(),
+                path=path,
+                registered=registered_by(path.read_text(encoding="utf-8", errors="replace")),
+            )
+            for path in layout.extensions
+        )
+        for extension in extensions:
+            options += ["-e", str(extension.path)]
         for skill in layout.skills:
             options += ["--skill", str(skill)]
         return PiAgent(
@@ -348,13 +640,25 @@ class PiAdapter:
             options=tuple(options),
             timeout_s=float(resolved["timeout_s"]),
             model=model,
-            extensions=layout.extensions,
+            extensions=extensions,
             # Read now, from the environment HIVE started in, not from whatever a run changes.
             user_agent_dir=user_agent_dir(),
         )
 
     def describe_valves(self) -> str:
         return VALVES_DOC.read_text(encoding="utf-8")
+
+    def extension_spec(self) -> ExtensionSpec:
+        return pi_extension_spec()
+
+
+@dataclass(frozen=True)
+class ExtensionFile:
+    """One candidate extension as a run needs it."""
+
+    relative: str  # candidate-relative, as the load report names it: "extensions/guard.ts"
+    path: Path  # absolute, as passed with -e and as Pi names it on stderr
+    registered: tuple[str, ...]  # static, from registered_by(); read once at build time
 
 
 @dataclass(frozen=True)
@@ -384,7 +688,7 @@ class PiAgent:
     options: tuple[str, ...]  # everything except the per-run session dir and the instruction
     timeout_s: float
     model: ModelSpec  # what every assistant message must report (P3)
-    extensions: tuple[Path, ...]  # the candidate's extension files, to recognise their crashes
+    extensions: tuple[ExtensionFile, ...]  # the candidate's extension files, for the load report
     user_agent_dir: Path  # the user's real Pi agent dir, source of the credential links
 
     def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
@@ -411,7 +715,8 @@ class PiAgent:
 
         if outcome.launch_error is not None:
             message = f"could not start Pi ({self.pi_bin}): {outcome.launch_error}"
-            return errored("agent_error", message, Usage(), wall_clock_s)
+            report = LoadReport(tuple(unknown_load(e, "Pi did not start") for e in self.extensions))
+            return errored("agent_error", message, Usage(), wall_clock_s, report)
         raw = RawRun(
             stdout=outcome.stdout.decode(errors="replace"),
             stderr=outcome.stderr.decode(errors="replace"),
@@ -499,17 +804,27 @@ def read_session_entries(session_dir: Path) -> tuple[dict[str, Any], ...]:
     return tuple(entries)
 
 
-def errored(error_class: str, error: str, usage: Usage, wall_clock_s: float) -> AgentResult:
+def errored(
+    error_class: str, error: str, usage: Usage, wall_clock_s: float, load_report: LoadReport | None = None
+) -> AgentResult:
     return AgentResult(
-        status="errored", final_text="", usage=usage, wall_clock_s=wall_clock_s, error=error, error_class=error_class
+        status="errored",
+        final_text="",
+        usage=usage,
+        wall_clock_s=wall_clock_s,
+        error=error,
+        error_class=error_class,
+        load_report=load_report,
     )
 
 
-def interpret_run(raw: RawRun, *, model: ModelSpec, extensions: Sequence[Path], timeout_s: float) -> AgentResult:
+def interpret_run(
+    raw: RawRun, *, model: ModelSpec, extensions: Sequence[ExtensionFile], timeout_s: float
+) -> AgentResult:
     """Turn Pi's event stream, session file and stderr into one result.
 
     The checks run from "this run is not the experiment" to "the provider failed", so a run
-    that broke P3 is never reported as an ordinary error.
+    that broke P3 is never reported as an ordinary error. Every result carries a load report.
     """
     events = parse_events(raw.stdout)
     assistant_indexes = [
@@ -523,43 +838,49 @@ def interpret_run(raw: RawRun, *, model: ModelSpec, extensions: Sequence[Path], 
     usage = sum((usage_of(message) for message in assistant_messages), Usage())
     wall_clock_s = raw.wall_clock_s
     tail = raw.stderr.strip()[-STDERR_TAIL_CHARS:] or "(no stderr)"
+    report, report_is_evidence = load_report_of(raw, events, extensions)
+
+    def failed(error_class: str, error: str) -> AgentResult:
+        return errored(error_class, error, usage, wall_clock_s, report)
 
     mismatch = model_mismatch(events, assistant_messages, raw.session_entries, model)
     if mismatch is not None:
-        return errored("model_mismatch", mismatch, usage, wall_clock_s)
+        return failed("model_mismatch", mismatch)
 
     if raw.timed_out:
-        return errored("timeout", f"Pi exceeded the {timeout_s:g}s time limit", usage, wall_clock_s)
+        return failed("timeout", f"Pi exceeded the {timeout_s:g}s time limit")
 
-    extension_failure = extension_failure_of(raw.stderr, raw.returncode, extensions)
-    if extension_failure is not None:
-        # The candidate's own code failed, so this run is not the harness as specified.
-        return errored("harness_load_error", extension_failure, usage, wall_clock_s)
+    if report_is_evidence:
+        # The controller's own rule (hive.extensions.load_problem), so both always agree: a file
+        # that did not load is harness_load_error, a throw during the run is extension_error.
+        problem = load_problem([extension.relative for extension in extensions], report)
+        if problem is not None:
+            return failed(*problem)
 
     if raw.returncode is not None and raw.returncode < 0:
-        message = f"Pi was killed by {signal_name(-raw.returncode)} before the run ended. stderr: {tail}"
-        return errored("agent_error", message, usage, wall_clock_s)
+        killed_by = signal_name(-raw.returncode)
+        return failed("agent_error", f"Pi was killed by {killed_by} before the run ended. stderr: {tail}")
 
     if not assistant_messages:
-        return errored("agent_error", f"Pi produced no assistant message. stderr: {tail}", usage, wall_clock_s)
+        return failed("agent_error", f"Pi produced no assistant message. stderr: {tail}")
 
     last = assistant_messages[-1]
     stop_reason = last.get("stopReason")
     if stop_reason in ("error", "aborted"):
         message = str(last.get("errorMessage") or f"Pi stopped with stopReason={stop_reason}")
-        error_class = "quota" if QUOTA_PATTERN.search(message) else "provider_error"
-        return errored(error_class, message, usage, wall_clock_s)
+        return failed("quota" if QUOTA_PATTERN.search(message) else "provider_error", message)
 
     ended = any(event.get("type") == "agent_end" for event in events[assistant_indexes[-1] + 1 :])
     if not ended:
         message = f"Pi exited (code {raw.returncode}) with no agent_end after its last message. stderr: {tail}"
-        return errored("agent_error", message, usage, wall_clock_s)
+        return failed("agent_error", message)
 
     if stop_reason not in COMPLETED_STOP_REASONS:
-        message = f"Pi's run ended on stopReason={stop_reason!r}, not on the model's final reply"
-        return errored("agent_error", message, usage, wall_clock_s)
+        return failed("agent_error", f"Pi's run ended on stopReason={stop_reason!r}, not on the model's final reply")
 
-    return AgentResult(status="completed", final_text=text_of(last), usage=usage, wall_clock_s=wall_clock_s)
+    return AgentResult(
+        status="completed", final_text=text_of(last), usage=usage, wall_clock_s=wall_clock_s, load_report=report
+    )
 
 
 def model_mismatch(
@@ -592,18 +913,110 @@ def model_mismatch(
     return None
 
 
-def extension_failure_of(stderr: str, returncode: int | None, extensions: Sequence[Path]) -> str | None:
-    """Pi's own extension error lines, or a crash whose stack trace names a candidate extension."""
-    reported = [line for line in stderr.splitlines() if EXTENSION_ERROR_PATTERN.search(line)]
-    if reported:
-        return "\n".join(reported)
-    if returncode in (None, 0) or not extensions:
-        return None
-    # The loader may report either the path as given or its resolved form (/tmp vs /private/tmp).
-    paths = {str(path) for path in extensions} | {str(path.resolve()) for path in extensions}
-    if any(path in stderr for path in paths):
-        return f"a candidate extension crashed Pi (exit code {returncode}). stderr: {stderr.strip()[-STDERR_TAIL_CHARS:]}"
-    return None
+def load_report_of(
+    raw: RawRun, events: Sequence[Mapping[str, Any]], extensions: Sequence[ExtensionFile]
+) -> tuple[LoadReport, bool]:
+    """What this run loaded, and whether that is evidence about the extensions at all.
+
+    Pi has no positive load report, but it exits at startup when any `-e` file fails to load,
+    so a run that got as far as its session header loaded them all (see module doc). It is not
+    evidence when Pi stopped before the run for a reason that names no extension (no model, a
+    bad flag): then each file's status is unknown, and the run's failure is Pi's, not the
+    candidate's.
+    """
+    stderr = ANSI_ESCAPE.sub("", raw.stderr)
+    by_path = extension_paths(extensions)
+    load_errors = startup_load_errors(stderr)
+    runtime_errors = list(runtime_errors_of(stderr, by_path))
+    started = any(event.get("type") in ("session", "agent_start") for event in events)
+    crashed_in = crash_named_files(stderr, raw.returncode, extensions)
+
+    if load_errors:
+        named = {by_path[path].relative: message for path, message in load_errors.items() if path in by_path}
+        unattributed = "; ".join(message for path, message in load_errors.items() if path not in by_path)
+        others = "Pi exits at startup when any extension fails to load, so this one never ran"
+        if unattributed:
+            others += f" (failures Pi reported: {unattributed})"
+        loads = [
+            ExtensionLoad(e.relative, loaded=False, error=f"failed to load: {named[e.relative]}")
+            if e.relative in named
+            else unknown_load(e, others)
+            for e in extensions
+        ]
+        return LoadReport(tuple(loads), tuple(runtime_errors)), True
+    if started:
+        crash_detail = f"Pi crashed (exit code {raw.returncode}): {stderr.strip()[-STDERR_TAIL_CHARS:]}"
+        runtime_errors += [f"{extension.relative}: {crash_detail}" for extension in crashed_in]
+        loads = [ExtensionLoad(e.relative, loaded=True, registered=e.registered) for e in extensions]
+        return LoadReport(tuple(loads), tuple(runtime_errors)), True
+    if crashed_in:
+        crash_detail = f"Pi crashed at startup (exit code {raw.returncode}): {stderr.strip()[-STDERR_TAIL_CHARS:]}"
+        loads = [
+            ExtensionLoad(e.relative, loaded=False, error=crash_detail)
+            if e in crashed_in
+            else unknown_load(e, "Pi crashed at startup in another extension")
+            for e in extensions
+        ]
+        return LoadReport(tuple(loads), tuple(runtime_errors)), True
+    loads = [unknown_load(e, "Pi exited before the run started") for e in extensions]
+    return LoadReport(tuple(loads), tuple(runtime_errors)), False
+
+
+def unknown_load(extension: ExtensionFile, why: str) -> ExtensionLoad:
+    return ExtensionLoad(extension.relative, loaded=False, error=f"unknown: {why}")
+
+
+def extension_paths(extensions: Sequence[ExtensionFile]) -> dict[str, ExtensionFile]:
+    """Every form in which Pi may name an extension: the path as given and its resolved form
+    (/tmp vs /private/tmp), so attribution doesn't depend on how the path was spelled."""
+    paths: dict[str, ExtensionFile] = {}
+    for extension in extensions:
+        paths[str(extension.path)] = extension
+        paths.setdefault(str(extension.path.resolve()), extension)
+    return paths
+
+
+def startup_load_errors(stderr: str) -> dict[str, str]:
+    """Pi's `Failed to load extension "<path>": <error>` diagnostics, by path. The loader's error
+    (a syntax error with its code frame, say) can span lines; it runs to the next diagnostic."""
+    errors: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in stderr.splitlines():
+        match = LOAD_ERROR_LINE.search(line)
+        if match:
+            current = errors.setdefault(match.group(1), [])
+            current.append(match.group(2))
+        elif DIAGNOSTIC_START.match(line):
+            current = None
+        elif current is not None:
+            current.append(line)
+    return {path: "\n".join(parts).strip()[:STDERR_TAIL_CHARS] for path, parts in errors.items()}
+
+
+def runtime_errors_of(stderr: str, by_path: Mapping[str, ExtensionFile]) -> Iterator[str]:
+    """`Extension error (<path>): <error>` lines, as "<candidate path>: <error>". A path that is
+    no candidate file is kept as Pi printed it: the throw still happened."""
+    for line in stderr.splitlines():
+        if not line.startswith(RUNTIME_ERROR_PREFIX):
+            continue
+        # Match known paths first: a path may itself contain "): ".
+        known = next((path for path in by_path if line.startswith(f"{RUNTIME_ERROR_PREFIX}{path}): ")), None)
+        if known is not None:
+            yield f"{by_path[known].relative}: {line[len(RUNTIME_ERROR_PREFIX) + len(known) + 3 :]}"
+        elif (match := RUNTIME_ERROR_LINE.match(line)) is not None:
+            yield f"{match.group(1)}: {match.group(2)}"
+
+
+def crash_named_files(
+    stderr: str, returncode: int | None, extensions: Sequence[ExtensionFile]
+) -> list[ExtensionFile]:
+    """Candidate extensions named in the stack trace of a Pi that exited abnormally: code that
+    threw outside any handler Pi catches (a timer, an unawaited promise) and took Node down."""
+    if returncode in (None, 0):
+        return []
+    # Pi's own extension-error lines name the file too, but they are handled throws, not crashes.
+    trace = "\n".join(line for line in stderr.splitlines() if not line.startswith(RUNTIME_ERROR_PREFIX))
+    return [e for e in extensions if str(e.path) in trace or str(e.path.resolve()) in trace]
 
 
 def signal_name(signum: int) -> str:
