@@ -1,0 +1,32 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Build artifacts and caches
+dist/
+build/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Run outputs (traces, Harbor jobs) are large; commit summaries, not raw runs
+runs/
+jobs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Optimizer experience store (raw traces, large)
+experience/
