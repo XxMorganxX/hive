@@ -87,3 +87,14 @@ Spec lives in `docs/FOUNDING_PRINCIPLES.md` §5–§8. The code-level source of 
 - Multi-agent topology (`topology.yaml` compiler for Pi).
 - Wilson lower-bound selection, a noise-floor run, valve diversity, `flips/` diffs, ATIF export.
 - Extension typecheck (`tsc --noEmit`) in Pi `validate`.
+- 2026-10-19: Review fixes landed. Four fixers worked on disjoint files, and an independent recheck followed.
+  - **Recheck found one regression:** the controller's new relative `trial_dir` silently disabled the overseer's path rewriting.
+  - **Fix:** `OverseerBrief.evidence_origin` now says explicitly where the evidence was recorded, and relative `trial_dir` values map into `context/evidence`.
+  - **Also fixed:** malformed `AgentResult` fields now error one trial instead of crashing the run. The loop's archive of the overseer workspace no longer dies on a FIFO.
+  - **Observed:** 679 tests pass, both dry runs pass, and `hive validate harnesses/pi-baseline` returns OK.
+- 2026-10-19: **Real runs** (observed, about $0.07 total).
+  - **Pi on exact_answer** (k=1): 6/6 trials completed, selection 0.83, $0.0014. Traces hold the session JSONL, events and stderr; the model check sees provider `openai`, model `gpt-5-nano`, stopReason `stop`.
+  - **Overseer fence:** one `claude -p` (haiku) with the exact argv from `build_command()`. It could read `context/` and write `candidate/` and `RATIONALE.md`. Writing into `context/`, reading or writing outside the workspace, and reading the repo's held-out data were all denied, and the filesystem confirms nothing escaped. Cost $0.0013.
+  - **One real generation of the full loop** (Pi seed, sonnet overseer, k=2): it finished in 75 s for $0.06. The overseer found no failures and made one isolated, generic change (`APPEND_SYSTEM.md` verification guidance) with a structured rationale. The child tied the seed at 1.0, and the margin rule correctly declined it. The workspace named no absolute repo or run path.
+  - **Pi on python_functions** (k=1): 4/4 scored 1.0. `solution.py` was written in the trial workdir and the repo was untouched.
+- **Finding: the demo suites have no headroom for `gpt-5-nano`.** The seed scored 0.83 and then 1.0 on the same search split (noise, P1), and 1.0 on python_functions. They prove the plumbing but cannot show improvement (P14). Next: harder tasks (or a Harbor/Terminal-Bench suite) and a k≥3 noise-floor run before any claim.
