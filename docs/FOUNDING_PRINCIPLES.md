@@ -311,6 +311,12 @@ The **controller**, not the adapter, decides whether a run's extensions all load
 - **The Python frameworks** run in a runner script under their own pinned venv (`.venvs/<framework>`). The runner writes `trace.jsonl` (one line per model call, with usage and the reported model) and `result.json` (status, text, load report). `hive/agents/runner_protocol.py` is the single reader for both.
 - **Cost** comes from a `prices` table in `[agent]`, because these frameworks don't compute dollars.
 
+**Model gateway: the boundary for P3, P12 and the key.** Every real-provider model request, from every framework, goes through `hive/gateway`, a controller-side localhost proxy:
+- **Per trial,** the controller mints a token and passes `ModelEndpoint(base_url, api_key=token)` to `Agent.run`. The provider key stays in the controller and never enters a trial.
+- **Per request,** the gateway refuses (403, recorded as a violation) any other model, any effort other than `[model] thinking`, hosted tools, `n > 1`, non-default service tiers and background responses. It enforces `[evaluation] max_model_calls_per_trial`, and bills every call from the provider's own usage at `[model] prices`, streamed or not, including calls whose client disconnected.
+- **After the run,** the trial's ledger is authoritative. Usage and cost come from the ledger, and any violation makes the trial `model_mismatch`. The ledger is written to `trial_dir/gateway.json`.
+- **What it does not cover:** on the host, any same-user process can read another's exec environment (`ps eww`), including the controller's. Only containers or a separate OS user close that.
+
 ### 5.3 Suite contract (use-case seam)
 
 ```python

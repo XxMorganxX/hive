@@ -108,6 +108,20 @@
     - On macOS, system binaries hide their environment, so a `setsid` escape via `/bin/*` can survive the marker sweep.
     - On the host, any same-user process can read any other's exec environment (`ps eww`). The recheck saw a real OpenAI key in two unrelated long-running processes on this machine, and the user was told. So the controller's own `OPENAI_API_KEY` is readable by agent shells too. The gateway keeps the key out of trial processes, but not out of reach of the host. The real boundary is running trials in containers or as a separate OS user.
 
+- 2026-10-19: Gateway integrated (4 integrators + end-to-end recheck against a fake upstream; no real API).
+  - **Controller:** `evaluate` opens/closes a grant per trial, and the ledger is authoritative for usage and cost. A violation or a mismatching reported model makes the trial `model_mismatch`. An exhausted call limit on an incomplete run makes it `agent_error`; an upstream quota code makes it `quota`. The ledger goes to `gateway.json`, and `TrialOutcome.gateway` holds a summary.
+  - **Config:** `[model] prices` and `upstream_url`; `[evaluation] max_model_calls_per_trial`. A missing key fails before the run dir exists.
+  - **Pi:** a per-run `models.json` points its provider at the endpoint, and there is no `auth.json`. Verified with the real binary against a dead local URL.
+  - **Deep Agents / Strands:** the endpoint goes on stdin. Strands now gets a fresh `HOME`.
+  - **The recheck verified, per framework:**
+    - report cost equals the ledger;
+    - an extension's hidden calls are billed;
+    - wrong model or effort gives `model_mismatch`;
+    - the limit holds;
+    - no key or token in any file;
+    - the key is absent from trial environments.
+- 2026-10-19: **Decision: `[model] thinking` is required for real providers, and limited to `minimal|low|medium|high`.** The recheck found "unset" and "off" meant different things to the adapters (fallback "low", Pi clamping "off" to "minimal") and to the gateway (expects no effort), so every trial became `model_mismatch`. One shared set of levels removes the ambiguity (test-first in `test_config.py`).
+
 ## Model gateway (spec)
 
 **Why.** Model access is where P3 (frozen model), P12 (spend) and key secrecy are decided. Today all three are decided inside the trial process, next to candidate code, so they can only be detected. Moving them into the controller makes them a boundary, the same for every framework.

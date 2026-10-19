@@ -34,8 +34,13 @@ uv run hive run  experiments/pi-exact-answer.toml       # seed → overseer gene
 ```
 
 These need:
-- **Pi 0.75.3** on `PATH` (`pi --version`), with credentials for the provider in the config. The demo configs use `openai/gpt-5-nano`; log in with `pi` and `/login`, or set `OPENAI_API_KEY`.
+- **`OPENAI_API_KEY`** in the environment of `hive`. The controller's model gateway holds it. Every framework's trials reach the model only through the gateway, with a per-trial token, and never see the key.
+- **The framework:**
+  - **Pi 0.75.3** on `PATH` (`pi --version`);
+  - **Deep Agents / Strands:** their pinned venvs, built with `scripts/setup-framework-venvs.sh` (they go to `.venvs/`).
 - **Claude Code** on `PATH`, logged in. It is the overseer.
+
+The same experiment runs on any framework: `experiments/{pi,deepagents,strands}-exact-answer.toml` differ only in the seed and the `[agent]` settings.
 
 Every tunable lives in the experiment file, including the model, trials per task, generations, promotion margin, dollar cap and overseer model. Change the file, not the code.
 
@@ -45,7 +50,7 @@ Each role has one contract in [`hive/contracts.py`](hive/contracts.py). A new im
 
 | Role | Implement | Selected by | Built-ins |
 |---|---|---|---|
-| Agent framework | `AgentAdapter` (validate, build → `Agent`, describe_valves) | the candidate's `candidate.toml`: `agent = "..."` | `pi`, `scripted` (test double) |
+| Agent framework | `AgentAdapter` (validate, build → `Agent`, describe_valves, extension_spec) | the candidate's `candidate.toml`: `agent = "..."` | `pi`, `deepagents`, `strands`, `scripted` (test double) |
 | Evaluation suite | `Suite` (describe, metric, tasks, grade) | the experiment's `[suite] name` | `exact_answer`, `python_functions` |
 | Overseer | `Overseer` (propose from an `OverseerBrief`) | the experiment's `[overseer] kind` | `claude_code`, `null` (noise control) |
 
