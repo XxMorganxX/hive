@@ -3,9 +3,6 @@
 Cost is a property of the model, not of the agent framework, so prices live here, where the
 model gateway (hive/gateway) and the controller both read them. `[model] prices` in the
 experiment config is parsed with `parse_prices`.
-
-Transition note: hive/agents/runner_protocol.py still carries its own copy of `Prices` and
-`parse_prices` until the adapters import from here. The two are identical; keep them so.
 """
 
 from __future__ import annotations

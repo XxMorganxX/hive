@@ -163,3 +163,89 @@ def test_python_dash_m_hive_runs_the_cli(tmp_path):
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "OK"
+
+
+# --- the model gateway -----------------------------------------------------------------------
+
+# A made-up stand-in for the provider key. Never a real key.
+PLACEHOLDER_KEY = "sk-placeholder-provider-key-for-cli-tests"
+
+
+@pytest.fixture
+def upstream():
+    from fakes.fake_openai_upstream import FakeOpenAIUpstream
+
+    with FakeOpenAIUpstream() as fake:
+        yield fake
+
+
+def openai_config(tmp_path: Path, upstream_url: str) -> Path:
+    seed = tmp_path / "seed"
+    shutil.copytree(EXACT_SEED, seed)
+    manifest = seed / "candidate.toml"
+    manifest.write_text(manifest.read_text().replace('agent = "scripted"', 'agent = "loop_fixtures:GatewayScriptedAdapter"'))
+    path = tmp_path / "openai.toml"
+    path.write_text(f"""
+[experiment]
+name = "openai-test"
+seed_candidate = "seed"
+output_dir = "out"
+
+[model]
+provider = "openai"
+id = "gpt-5-nano"
+thinking = "low"
+prices = {{ input = 0.05, output = 0.40, cache_read = 0.005 }}
+upstream_url = "{upstream_url}"
+
+[suite]
+name = "exact_answer"
+
+[evaluation]
+trials_per_task = 1
+
+[loop]
+generations = 0
+max_usd = 1.0
+
+[overseer]
+kind = "null"
+""")
+    return path
+
+
+@pytest.mark.parametrize("command", ["run", "eval"])
+def test_a_missing_provider_key_is_a_user_error_and_creates_nothing(tmp_path, capsys, monkeypatch, upstream, command):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config = openai_config(tmp_path, upstream.url)
+    assert main([command, str(config)]) == 2
+    assert "OPENAI_API_KEY" in one_error_line(capsys.readouterr().err)
+    assert not (tmp_path / "out").exists()
+    assert upstream.requests == []
+
+
+def test_eval_sends_every_trial_through_the_gateway_and_writes_no_key(tmp_path, capsys, monkeypatch, upstream):
+    monkeypatch.setenv("OPENAI_API_KEY", PLACEHOLDER_KEY)
+    assert main(["eval", str(openai_config(tmp_path, upstream.url))]) == 0
+    capsys.readouterr()
+    [eval_dir] = (tmp_path / "out" / "openai-test").iterdir()
+    ledgers = list(eval_dir.rglob("gateway.json"))
+    assert ledgers and len(ledgers) == len(upstream.requests)
+    report = json.loads((eval_dir / "report.json").read_text())
+    assert report["cost_usd"] > 0
+    for path in eval_dir.rglob("*"):
+        if path.is_file():
+            assert PLACEHOLDER_KEY.encode() not in path.read_bytes(), path
+
+
+def test_run_with_a_real_provider_records_the_gateway_but_not_the_key(tmp_path, capsys, monkeypatch, upstream):
+    monkeypatch.setenv("OPENAI_API_KEY", PLACEHOLDER_KEY)
+    assert main(["run", str(openai_config(tmp_path, upstream.url)), "--run-id", "t"]) == 0
+    capsys.readouterr()
+    run_dir = tmp_path / "out" / "openai-test" / "t"
+    meta = json.loads((run_dir / "run_meta.json").read_text())
+    assert meta["model_gateway"]["key_env"] == "OPENAI_API_KEY"
+    assert meta["spent_usd"] > 0
+    for path in run_dir.rglob("*"):
+        if path.is_file():
+            assert PLACEHOLDER_KEY.encode() not in path.read_bytes(), path

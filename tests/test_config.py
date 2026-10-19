@@ -1,15 +1,17 @@
 import json
 import math
+import tomllib
 from pathlib import Path
 
 import pytest
 
 from hive.config import ConfigError, ExperimentConfig, load_experiment, snapshot
 from hive.contracts import ModelSpec
+from hive.pricing import Prices
 
 SECTIONS = {
     "experiment": {"name": '"demo"', "seed_candidate": '"candidates/seed"'},
-    "model": {"provider": '"openai"', "id": '"gpt-5-nano"'},
+    "model": {"provider": '"openai"', "id": '"gpt-5-nano"', "thinking": '"low"', "prices": "{ input = 0.05, output = 0.40 }"},
     "suite": {"name": '"exact_answer"'},
     "loop": {"max_usd": "5.0"},
     "overseer": {"kind": '"null"'},
@@ -78,11 +80,12 @@ def test_missing_plugin_sections_give_empty_settings(tmp_path):
 
 def test_model_section_becomes_model_spec(tmp_path):
     config = load_experiment(write_config(tmp_path))
-    assert config.model == ModelSpec(provider="openai", id="gpt-5-nano")
+    assert config.model == ModelSpec(provider="openai", id="gpt-5-nano", thinking="low")
 
 
-def test_model_thinking_defaults_to_none(tmp_path):
-    assert load_experiment(write_config(tmp_path)).model.thinking is None
+def test_a_scripted_provider_may_leave_thinking_unset(tmp_path):
+    path = write_config(tmp_path, {"model": {"provider": '"scripted"', "id": '"none"', "thinking": None, "prices": None}})
+    assert load_experiment(path).model.thinking is None
 
 
 def test_model_thinking_flows_into_the_model_spec(tmp_path):
@@ -395,7 +398,7 @@ def test_snapshot_records_resolved_paths_as_strings(tmp_path):
 def test_snapshot_records_model_and_plugin_choices(tmp_path):
     config = load_experiment(write_config(tmp_path, {"suite": {"limit": "3"}}))
     data = snapshot(config)
-    assert data["model"] == {"provider": "openai", "id": "gpt-5-nano", "thinking": None}
+    assert data["model"] == {"provider": "openai", "id": "gpt-5-nano", "thinking": "low"}
     assert (data["suite_name"], data["suite_settings"], data["overseer_kind"]) == ("exact_answer", {"limit": 3}, "null")
 
 
@@ -463,3 +466,114 @@ def test_path_settings_keep_symlinks_so_a_venv_interpreter_stays_the_venv_interp
     (venv_bin / "python").symlink_to(base)
     path = write_config(tmp_path, {"agent": {"python_path": '"../.venvs/x/bin/python"'}})
     assert load_experiment(path).agent_settings["python_path"] == str(venv_bin / "python")
+
+
+# --- the model gateway's settings: prices, upstream, call limit, provider key ---------------
+
+
+def test_model_prices_are_parsed_into_the_config(tmp_path):
+    config = load_experiment(write_config(tmp_path, {"model": {"prices": "{ input = 0.05, output = 0.40, cache_read = 0.005 }"}}))
+    assert config.prices == Prices(input=0.05, output=0.40, cache_read=0.005)
+
+
+def test_model_prices_are_required_for_a_real_provider(tmp_path):
+    assert problems_for(write_config(tmp_path, {"model": {"prices": None}})) == [
+        "[model] prices is required for provider 'openai': the gateway computes every trial's cost from it (P12)"
+    ]
+
+
+@pytest.mark.parametrize("table", ["{ input = 0.05 }", "{ input = -1, output = 1 }", "{ input = 1, output = 1, other = 2 }", '"cheap"'])
+def test_invalid_model_prices_are_a_problem(tmp_path, table):
+    [problem] = problems_for(write_config(tmp_path, {"model": {"prices": table}}))
+    assert problem.startswith("[model] prices: ")
+
+
+def test_scripted_provider_needs_no_prices_or_upstream(tmp_path):
+    config = load_experiment(write_config(tmp_path, {"model": {"provider": '"scripted"', "id": '"none"', "prices": None}}))
+    assert (config.prices, config.upstream_url, config.provider_key_env) == (None, None, None)
+
+
+def test_scripted_provider_may_still_state_prices(tmp_path):
+    config = load_experiment(write_config(tmp_path, {"model": {"provider": '"scripted"', "id": '"none"'}}))
+    assert config.prices == Prices(input=0.05, output=0.40)
+
+
+def test_upstream_url_defaults_by_provider(tmp_path):
+    assert load_experiment(write_config(tmp_path)).upstream_url == "https://api.openai.com"
+
+
+def test_upstream_url_can_be_set(tmp_path):
+    config = load_experiment(write_config(tmp_path, {"model": {"upstream_url": '"http://127.0.0.1:9999/proxy"'}}))
+    assert config.upstream_url == "http://127.0.0.1:9999/proxy"
+
+
+@pytest.mark.parametrize("url", ['"ftp://example.com"', '"api.openai.com"', '"https://api.openai.com/v1"', '"https://api.openai.com/?a=1"', "3"])
+def test_invalid_upstream_url_is_a_problem(tmp_path, url):
+    [problem] = problems_for(write_config(tmp_path, {"model": {"upstream_url": url}}))
+    assert problem.startswith("[model] upstream_url")
+
+
+def test_the_provider_key_variable_is_fixed_by_provider(tmp_path):
+    assert load_experiment(write_config(tmp_path)).provider_key_env == "OPENAI_API_KEY"
+
+
+def test_the_provider_key_variable_cannot_be_configured(tmp_path):
+    problems = problems_for(write_config(tmp_path, {"model": {"api_key_env": '"MY_KEY"'}}))
+    assert problems == ["[model] unknown key 'api_key_env'"]
+
+
+def test_an_unknown_provider_is_a_problem(tmp_path):
+    assert problems_for(write_config(tmp_path, {"model": {"provider": '"acme"'}})) == [
+        "[model] provider 'acme' is not supported; known providers: openai, scripted"
+    ]
+
+
+def test_max_model_calls_per_trial_defaults_to_50(tmp_path):
+    assert load_experiment(write_config(tmp_path)).max_model_calls_per_trial == 50
+
+
+def test_max_model_calls_per_trial_can_be_set(tmp_path):
+    config = load_experiment(write_config(tmp_path, {"evaluation": {"max_model_calls_per_trial": "7"}}))
+    assert config.max_model_calls_per_trial == 7
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "true", '"9"'])
+def test_max_model_calls_per_trial_must_be_a_positive_integer(tmp_path, value):
+    assert problems_for(write_config(tmp_path, {"evaluation": {"max_model_calls_per_trial": value}})) == [
+        f"[evaluation] max_model_calls_per_trial must be an integer >= 1, got {tomllib_value(value)!r}"
+    ]
+
+
+def tomllib_value(text: str):
+    return tomllib.loads(f"v = {text}")["v"]
+
+
+def test_agent_prices_are_rejected_with_a_pointer_to_model_prices(tmp_path):
+    problems = problems_for(write_config(tmp_path, {"agent": {"prices": "{ input = 0.05, output = 0.40 }"}}))
+    assert problems == ["[agent] prices moved to [model] prices: cost is a property of the model, computed by the gateway"]
+
+
+def test_snapshot_records_prices_upstream_and_call_limit(tmp_path):
+    data = snapshot(load_experiment(write_config(tmp_path)))
+    assert data["prices"] == {"input": 0.05, "output": 0.40, "cache_read": 0.0, "cache_write": 0.0}
+    assert data["upstream_url"] == "https://api.openai.com"
+    assert data["max_model_calls_per_trial"] == 50
+    json.dumps(data, allow_nan=False)
+
+
+
+def test_a_real_provider_must_state_its_thinking_level(tmp_path):
+    # Adapters and the gateway must agree on the effort sent on the wire; "unset" meant different things.
+    problems = problems_for(write_config(tmp_path, {"model": {"thinking": None}}))
+    assert any("thinking" in problem for problem in problems)
+
+
+@pytest.mark.parametrize("level", ['"off"', '"none"', '"xhigh"', '"LOW"', '""'])
+def test_thinking_must_be_a_level_every_framework_and_the_gateway_share(tmp_path, level):
+    problems = problems_for(write_config(tmp_path, {"model": {"thinking": level}}))
+    assert any("thinking" in problem for problem in problems)
+
+
+@pytest.mark.parametrize("level", ["minimal", "low", "medium", "high"])
+def test_shared_thinking_levels_load(tmp_path, level):
+    assert load_experiment(write_config(tmp_path, {"model": {"thinking": f'"{level}"'}})).model.thinking == level

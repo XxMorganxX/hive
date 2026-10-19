@@ -10,6 +10,10 @@ traceback. Anything else is a bug and keeps its traceback.
 
 The CLI holds no tunables of its own: every number comes from the experiment config,
 and the flags only override where outputs go or which candidate and split to score.
+
+For a real provider, `run` and `eval` read the provider's key from its environment variable
+(OPENAI_API_KEY for openai) and route every trial through one model gateway; a missing key
+is a user error, reported before any output directory is created.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from hive.candidate import Candidate, CandidateError
 from hive.config import ConfigError, ExperimentConfig, load_experiment
 from hive.contracts import SPLITS
 from hive.evaluate import REPORT_FILE, EvalReport, EvaluationError, evaluate
-from hive.loop import LOGGER, RUN_ID_FORMAT, ExperimentSummary, LoopError, run_experiment
+from hive.loop import LOGGER, RUN_ID_FORMAT, ExperimentSummary, LoopError, model_gateway, provider_key, run_experiment
 from hive.registry import RegistryError, make_agent_adapter, make_suite
 
 USER_ERRORS = (ConfigError, LoopError, RegistryError, CandidateError, EvaluationError)
@@ -149,22 +153,26 @@ def _eval_command(args: argparse.Namespace) -> int:
     if problems:
         raise CandidateError(f"{candidate.root} is not a valid {candidate.agent!r} candidate: " + "; ".join(problems))
     suite = make_suite(config.suite_name, config.suite_settings)
+    key = provider_key(config)  # a missing key is a user error, before anything is written
 
     timestamp = datetime.datetime.now(datetime.UTC).strftime(RUN_ID_FORMAT)
     out_dir = config.output_dir / config.name / f"{EVAL_DIR_PREFIX}{timestamp}"
     if out_dir.exists():
         raise EvaluationError(f"{out_dir} already exists; wait a second and run again")
-    report = evaluate(
-        candidate,
-        adapter,
-        suite,
-        args.split,
-        model=config.model,
-        agent_settings=config.agent_settings,
-        trials_per_task=args.trials if args.trials is not None else config.trials_per_task,
-        out_dir=out_dir,
-        concurrency=config.concurrency,
-    )
+    with model_gateway(config, key) as gateway:
+        del key  # only the gateway holds it from here on
+        report = evaluate(
+            candidate,
+            adapter,
+            suite,
+            args.split,
+            model=config.model,
+            agent_settings=config.agent_settings,
+            trials_per_task=args.trials if args.trials is not None else config.trials_per_task,
+            out_dir=out_dir,
+            concurrency=config.concurrency,
+            gateway=gateway,
+        )
     print(_format_report(report, out_dir / REPORT_FILE))
     return EXIT_OK
 

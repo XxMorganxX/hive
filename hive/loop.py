@@ -8,8 +8,8 @@ own agent adapter.
 One run, in order:
 
 1. Check the configuration before spending anything: split walls (P7), a non-empty
-   search split, a valid seed, a fresh run directory, a temp dir outside any git
-   checkout. Problems raise `LoopError`; a bad seed directory or plug-in name raises
+   search split, a valid seed, the provider's key for a real model, a fresh run
+   directory, a temp dir outside any git checkout. Problems raise `LoopError`; a bad seed directory or plug-in name raises
    `CandidateError` or `RegistryError` from the layer that found it. Nothing has run yet
    in any of these cases.
 2. Evaluate the seed on the search split. It becomes the first incumbent, and its cost
@@ -22,6 +22,12 @@ One run, in order:
    `hive.selection.decide` (P9).
 4. Score the seed and the final incumbent on the held-out split, once, at the very end,
    if the estimate fits. Nothing held-out is ever placed in a brief or a workspace (P7).
+
+For every real provider (anything but `scripted`), the whole run happens inside one model
+gateway (hive/gateway): the controller reads the provider key from the environment variable
+fixed for that provider (OPENAI_API_KEY for openai), refuses to start without it, and hands it
+only to the gateway. Each trial gets its own token, so the key never enters a trial process
+and is never written under the run directory; run_meta.json records that the gateway was used.
 
 Every evaluation first re-hashes the candidate snapshot it is about to score. A snapshot
 that changed on disk raises `LoopError` instead of being scored under a stale id (P4).
@@ -68,7 +74,8 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,6 +85,7 @@ from hive.config import ExperimentConfig, snapshot
 from hive.contracts import SPLITS, AgentAdapter, Overseer, OverseerBrief, Proposal, Split, Suite
 from hive.evaluate import REPORT_FILE, TRIALS_DIR, EvalReport, evaluate
 from hive.extensions import render_extension_guide
+from hive.gateway import ModelGateway
 from hive.registry import make_agent_adapter, make_overseer, make_suite
 from hive.selection import decide, describe_rule
 
@@ -123,6 +131,46 @@ class LoopError(Exception):
     """The experiment can't start, or can't continue without recording something false."""
 
 
+def provider_key(config: ExperimentConfig) -> str | None:
+    """The provider's API key from the controller's environment; None for the scripted provider.
+
+    Raises LoopError when a real provider's key is missing, so a run fails before it creates
+    anything. The key goes only to the gateway: never to a trial, a log or a file.
+    """
+    if not config.uses_gateway:
+        return None
+    variable = config.provider_key_env
+    if variable is None:
+        raise LoopError(f"provider {config.model.provider!r} has no known API key variable")
+    if config.prices is None:
+        raise LoopError(f"provider {config.model.provider!r} needs [model] prices: the gateway computes cost from them")
+    if config.upstream_url is None:
+        raise LoopError(f"provider {config.model.provider!r} needs [model] upstream_url")
+    key = os.environ.get(variable, "").strip()
+    if not key:
+        raise LoopError(f"provider {config.model.provider!r} needs its API key in ${variable}, which is not set")
+    return key
+
+
+@contextmanager
+def model_gateway(config: ExperimentConfig, key: str | None) -> Iterator[ModelGateway | None]:
+    """The run's one model gateway, running for the duration; None for the scripted provider."""
+    if key is None:
+        yield None
+        return
+    with ModelGateway(model=config.model, prices=config.prices, upstream_url=config.upstream_url, upstream_key=key,
+                      max_calls_per_trial=config.max_model_calls_per_trial) as gateway:  # fmt: skip
+        yield gateway
+
+
+def gateway_record(config: ExperimentConfig) -> dict[str, Any] | None:
+    """What run_meta.json says about the gateway: where the key came from, never the key."""
+    if not config.uses_gateway:
+        return None
+    return {"key_env": config.provider_key_env, "upstream_url": config.upstream_url,
+            "max_calls_per_trial": config.max_model_calls_per_trial}  # fmt: skip
+
+
 @dataclass(frozen=True)
 class ExperimentSummary:
     run_dir: Path
@@ -164,8 +212,8 @@ class _Evaluated:
 def run_experiment(config: ExperimentConfig, *, run_id: str | None = None) -> ExperimentSummary:
     """Run the whole loop for one experiment config and return its summary.
 
-    Configuration problems raise LoopError, CandidateError or RegistryError before anything
-    is evaluated. Any other exception, including a LoopError for a snapshot changed on disk,
+    Configuration problems, including a real provider's missing API key, raise LoopError,
+    CandidateError or RegistryError before anything is evaluated or the run dir is created. Any other exception, including a LoopError for a snapshot changed on disk,
     propagates after run_meta.json has recorded it.
     """
     if run_id is None:
@@ -184,12 +232,21 @@ def run_experiment(config: ExperimentConfig, *, run_id: str | None = None) -> Ex
         listing = "; ".join(problems)
         raise LoopError(f"seed candidate {config.seed_candidate} is not valid for agent {seed.agent!r}: {listing}")
 
+    key = provider_key(config)  # before the run dir exists: a missing key leaves nothing behind
+
     run_dir = (Path(config.output_dir) / config.name / run_id).resolve()
     if run_dir.exists():
         raise LoopError(f"run directory {run_dir} already exists; choose another run id so runs never mix")
+    with model_gateway(config, key) as gateway:
+        del key  # only the gateway holds it from here on
+        return _run(config, run_id, run_dir, suite, overseer, adapter, seed, gateway)
+
+
+def _run(config: ExperimentConfig, run_id: str, run_dir: Path, suite: Suite, overseer: Overseer,
+         adapter: AgentAdapter, seed: Candidate, gateway: ModelGateway | None) -> ExperimentSummary:  # fmt: skip
     run_dir.mkdir(parents=True)
 
-    experiment = _Experiment(config, run_dir, suite, overseer, adapter)
+    experiment = _Experiment(config, run_dir, suite, overseer, adapter, gateway)
     meta: dict[str, Any] = {
         "run_id": run_id,
         "config": snapshot(config),
@@ -199,6 +256,7 @@ def run_experiment(config: ExperimentConfig, *, run_id: str | None = None) -> Ex
         "stopped_reason": None,
         "error": None,
         "spent_usd": 0.0,
+        "model_gateway": gateway_record(config),
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "git_commit": _git_commit(),
@@ -222,8 +280,10 @@ def run_experiment(config: ExperimentConfig, *, run_id: str | None = None) -> Ex
 class _Experiment:
     """The mutable state of one run: the incumbent, the spend and what has been evaluated."""
 
-    def __init__(self, config: ExperimentConfig, run_dir: Path, suite: Suite, overseer: Overseer, adapter: AgentAdapter):
+    def __init__(self, config: ExperimentConfig, run_dir: Path, suite: Suite, overseer: Overseer, adapter: AgentAdapter,
+                 gateway: ModelGateway | None = None):  # fmt: skip
         self.config = config
+        self.gateway = gateway  # every evaluation's trials go through it (None: scripted provider)
         self.run_dir = run_dir
         self.suite = suite
         self.overseer = overseer
@@ -314,6 +374,7 @@ class _Experiment:
             concurrency=self.config.concurrency,
             # Per trial, not from the finished report: an aborted evaluation has still spent.
             on_trial_cost=self._record_trial_cost,
+            gateway=self.gateway,
         )
         return report
 

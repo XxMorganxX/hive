@@ -186,3 +186,21 @@ def test_negative_or_non_integer_token_counts_in_the_trace_are_ignored_not_trust
     write_trace(tmp_path, call(input_tokens=-5), call(input_tokens="12"), call(input_tokens=7))
     write_result(tmp_path)
     assert interpret(tmp_path).usage.input_tokens == 7
+
+
+# --- prices live in hive.pricing; the gateway's ledger sets cost ----------------------------
+
+
+def test_prices_are_the_shared_pricing_types():
+    import hive.pricing
+
+    assert Prices is hive.pricing.Prices
+    assert parse_prices is hive.pricing.parse_prices
+
+
+def test_interpret_runner_without_prices_counts_tokens_at_zero_cost(tmp_path):
+    write_trace(tmp_path, call(input_tokens=1000, output_tokens=500))
+    write_result(tmp_path)
+    result = interpret_runner(tmp_path, finished(), model=MODEL, wall_clock_s=2.0)
+    assert result.status == "completed"
+    assert result.usage == Usage(input_tokens=1000, output_tokens=500, cost_usd=0.0)

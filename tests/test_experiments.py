@@ -86,3 +86,17 @@ def test_framework_experiments_fix_low_thinking_and_dry_runs_leave_it_unset(path
     # The reasoning-effort level is part of the frozen model (P3), so each config states it.
     expected = None if path.stem.startswith("dryrun-") else "low"
     assert load_experiment(path).model.thinking == expected
+
+
+@pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda path: path.stem)
+def test_real_model_experiments_price_the_model_and_go_through_the_gateway(path):
+    # Cost is a property of the model, computed by the gateway from [model] prices (P12).
+    config = load_experiment(path)
+    assert "prices" not in config.agent_settings
+    if path.stem.startswith("dryrun-"):
+        assert not config.uses_gateway
+        return
+    assert config.uses_gateway
+    assert config.prices is not None and config.prices.input > 0 and config.prices.output > 0
+    assert config.upstream_url == "https://api.openai.com"
+    assert config.provider_key_env == "OPENAI_API_KEY"

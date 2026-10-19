@@ -280,3 +280,18 @@ def test_run_returns_agent_error_instead_of_raising_when_the_trace_dir_is_missin
     result = agent.run(make_task("task-a"), workdir, tmp_path / "missing" / "trace")
     assert result.status == "errored"
     assert result.error_class == "agent_error"
+
+
+def test_run_accepts_a_gateway_endpoint_and_ignores_it(tmp_path):
+    from hive.contracts import ModelEndpoint
+
+    candidate = write_candidate(tmp_path / "c")
+    agent = ScriptedAdapter().build(candidate, MODEL, {})
+    workdir, trace_dir = tmp_path / "work", tmp_path / "trace"
+    workdir.mkdir()
+    trace_dir.mkdir()
+    endpoint = ModelEndpoint(base_url="http://127.0.0.1:9/v1", api_key="trial-token-placeholder")
+    with_endpoint = agent.run(make_task("t1"), workdir, trace_dir, endpoint=endpoint)
+    assert with_endpoint.status == "completed"
+    assert with_endpoint.usage == Usage()
+    assert "trial-token-placeholder" not in (trace_dir / "scripted.json").read_text()

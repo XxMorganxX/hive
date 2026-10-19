@@ -24,77 +24,46 @@ classifies runs the same way:
 
 How a runner is started, and what it must do with what it is given:
 
-- Credentials never travel in the runner's environment, where every shell command the agent
-  runs could read them (`env`, `ps eww -p $PPID`). The adapter sends one JSON line on stdin,
-  `{"credentials": {"OPENAI_API_KEY": "..."}}`, through run_process_group(stdin_text=...).
-  The runner reads stdin to EOF and closes it first thing, before importing any candidate
-  code, passes each key explicitly to its client's constructor (`api_key=...`), and never
-  sets it in os.environ.
-- Shell and tool children get an explicit minimal environment, without the credentials.
+- Model access never travels in the runner's environment, where every shell command the agent
+  runs could read it (`env`, `ps eww -p $PPID`). The adapter sends one JSON line on stdin
+  through run_process_group(stdin_text=...): for a real provider, the per-trial gateway
+  endpoint, `{"endpoint": {"base_url": "...", "api_key": "<per-trial token>"}}`, so the
+  provider's own key never enters the trial at all. The runner reads stdin to EOF and closes
+  it first thing, before importing any candidate code, passes the values explicitly to its
+  client's constructor (`base_url=...`, `api_key=...`), and never sets them in os.environ.
+- Shell and tool children get an explicit minimal environment, without the token.
   It must still carry hive.agents.process.TRIAL_MARKER_ENV from the runner's environment:
   the marker is how the controller finds and kills a command that left every process group
   it knows of (see hive/agents/process.py).
 
-Neither framework computes dollars, so cost comes from the experiment's price table.
+Neither framework computes dollars. For a real provider every call goes through the model
+gateway, and the controller replaces this usage with the gateway's ledger, which is priced from
+`[model] prices` (hive/evaluate.py). The token counts here stay as the runner's own account;
+`prices`, when given, prices them, and without it their cost is 0.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import re
 import signal
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from hive.agents.process import ProcessOutcome
 from hive.contracts import AGENT_ERROR_CLASSES, AgentResult, ExtensionLoad, LoadReport, ModelSpec, Usage
+from hive.pricing import Prices, parse_prices
+
+__all__ = ["RESULT_FILE", "TRACE_FILE", "Prices", "interpret_runner", "model_matches", "parse_prices"]
 
 TRACE_FILE = "trace.jsonl"
 RESULT_FILE = "result.json"
 
 _TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
-_PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")
-_REQUIRED_PRICES = ("input", "output")
 # Providers report dated snapshots of the requested model ("gpt-5-nano-2025-08-07").
 _SNAPSHOT_SUFFIX = re.compile(r"-(\d{4}-\d{2}-\d{2}|\d{8})")
 _STDERR_TAIL_CHARS = 2000
-
-
-@dataclass(frozen=True)
-class Prices:
-    """USD per million tokens."""
-
-    input: float
-    output: float
-    cache_read: float = 0.0
-    cache_write: float = 0.0
-
-    def cost(self, usage: Usage) -> float:
-        return (
-            usage.input_tokens * self.input
-            + usage.output_tokens * self.output
-            + usage.cache_read_tokens * self.cache_read
-            + usage.cache_write_tokens * self.cache_write
-        ) / 1_000_000
-
-
-def parse_prices(table: Any) -> Prices:
-    """The `prices` table from an adapter's settings. Required: without it, spend would read as $0."""
-    if not isinstance(table, Mapping):
-        raise ValueError("prices must be a table of USD per million tokens, e.g. { input = 0.05, output = 0.40 }")
-    unknown = sorted(set(table) - set(_PRICE_FIELDS))
-    if unknown:
-        raise ValueError(f"unknown price keys {unknown}; allowed: {list(_PRICE_FIELDS)}")
-    missing = [name for name in _REQUIRED_PRICES if name not in table]
-    if missing:
-        raise ValueError(f"prices must include {missing}")
-    for name, value in table.items():
-        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
-            raise ValueError(f"price {name!r} must be a finite number >= 0, got {value!r}")
-    return Prices(**{name: float(value) for name, value in table.items()})
 
 
 def model_matches(reported: str, model: ModelSpec) -> bool:
@@ -110,11 +79,12 @@ def model_matches(reported: str, model: ModelSpec) -> bool:
 
 
 def interpret_runner(
-    trace_dir: Path, outcome: ProcessOutcome, *, model: ModelSpec, prices: Prices, wall_clock_s: float
+    trace_dir: Path, outcome: ProcessOutcome, *, model: ModelSpec, prices: Prices | None = None, wall_clock_s: float
 ) -> AgentResult:
     calls = _model_calls(trace_dir / TRACE_FILE)
     tokens = Usage(**{field: sum(_count(call, field) for call in calls) for field in _TOKEN_FIELDS})
-    usage = Usage(**{field: getattr(tokens, field) for field in _TOKEN_FIELDS}, cost_usd=prices.cost(tokens))
+    cost = prices.cost(tokens) if prices is not None else 0.0
+    usage = Usage(**{field: getattr(tokens, field) for field in _TOKEN_FIELDS}, cost_usd=cost)
 
     def errored(error_class: str, error: str, load_report: LoadReport | None = None) -> AgentResult:
         return AgentResult(status="errored", final_text="", usage=usage, wall_clock_s=wall_clock_s,

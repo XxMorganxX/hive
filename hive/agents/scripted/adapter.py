@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hive.candidate import Candidate, CandidateError
-from hive.contracts import AgentResult, ExtensionSpec, ModelSpec, Task, Usage
+from hive.contracts import AgentResult, ExtensionSpec, ModelEndpoint, ModelSpec, Task, Usage
 
 RESPONSES_FILE = "responses.toml"
 TRACE_FILE = "scripted.json"
@@ -113,7 +113,8 @@ class ScriptedAgent:
 
     script: Script
 
-    def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
+    def run(self, task: Task, workdir: Path, trace_dir: Path, endpoint: ModelEndpoint | None = None) -> AgentResult:
+        # `endpoint` is accepted for the Agent contract and ignored: no model is ever called.
         started = time.monotonic()
         response = self.script.responses.get(task.id, self.script.default)
         files = self.script.files.get(task.id, {})

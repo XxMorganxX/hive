@@ -6,11 +6,13 @@ from typing import Any
 import pytest
 
 import loop_fixtures
+from fakes.fake_openai_upstream import CHAT_USAGE, FakeOpenAIUpstream
 from hive.candidate import Candidate
 from hive.config import ExperimentConfig
-from hive.contracts import ModelSpec
+from hive.contracts import ModelSpec, Usage
 from hive.extensions import render_extension_guide
 from hive.loop import ExperimentSummary, LoopError, run_experiment
+from hive.pricing import Prices
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXACT_SEED = REPO_ROOT / "harnesses" / "scripted-exact-answer"
@@ -720,3 +722,89 @@ def test_a_seed_whose_extensions_the_agent_never_loaded_scores_zero_with_harness
     trials = [trial for task in report["tasks"] for trial in task["trials"]]
     assert {trial["error_class"] for trial in trials} == {"harness_load_error"}
     assert all(trial["load_report"] is None for trial in trials)
+
+
+# --- the model gateway -----------------------------------------------------------------------
+
+# A made-up stand-in for the provider key. Never a real key.
+PLACEHOLDER_KEY = "sk-placeholder-provider-key-for-loop-tests"
+GATEWAY_PRICES = Prices(input=0.05, output=0.40, cache_read=0.005)
+_CACHED = CHAT_USAGE["prompt_tokens_details"]["cached_tokens"]
+CHAT_COST = GATEWAY_PRICES.cost(Usage(input_tokens=CHAT_USAGE["prompt_tokens"] - _CACHED,
+                                      output_tokens=CHAT_USAGE["completion_tokens"], cache_read_tokens=_CACHED))  # fmt: skip
+
+
+@pytest.fixture
+def upstream():
+    with FakeOpenAIUpstream() as fake:
+        yield fake
+
+
+def gateway_config(tmp_path: Path, upstream: FakeOpenAIUpstream, **overrides: Any) -> ExperimentConfig:
+    seed_with_agent(tmp_path, fixture("GatewayScriptedAdapter"))
+    values: dict[str, Any] = dict(model=ModelSpec(provider="openai", id="gpt-5-nano", thinking="low"),
+                                  prices=GATEWAY_PRICES, upstream_url=upstream.url)  # fmt: skip
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def test_a_real_provider_without_its_key_is_a_loop_error_before_the_run_dir_exists(tmp_path, upstream, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(LoopError, match="OPENAI_API_KEY"):
+        run_experiment(gateway_config(tmp_path, upstream), run_id="r1")
+    assert not (tmp_path / "out").exists()
+    assert upstream.requests == []
+
+
+def test_an_empty_provider_key_is_a_loop_error(tmp_path, upstream, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    with pytest.raises(LoopError, match="OPENAI_API_KEY"):
+        run_experiment(gateway_config(tmp_path, upstream), run_id="r1")
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_real_provider_without_prices_is_a_loop_error(tmp_path, upstream, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", PLACEHOLDER_KEY)
+    with pytest.raises(LoopError, match="prices"):
+        run_experiment(gateway_config(tmp_path, upstream, prices=None), run_id="r1")
+    assert not (tmp_path / "out").exists()
+
+
+def test_every_trial_goes_through_one_gateway_and_the_ledger_is_the_spend(tmp_path, upstream, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", PLACEHOLDER_KEY)
+    summary = run_experiment(gateway_config(tmp_path, upstream), run_id="r1")
+    ledgers = sorted(summary.run_dir.rglob("gateway.json"))
+    endpoints = {json.loads(path.read_text())["base_url"] for path in summary.run_dir.rglob("endpoint.json")}
+    assert ledgers and len(ledgers) == len(upstream.requests)
+    assert len(endpoints) == 1  # one gateway for the whole run
+    assert all(request.headers["authorization"] == f"Bearer {PLACEHOLDER_KEY}" for request in upstream.requests)
+    assert summary.total_cost_usd == pytest.approx(len(ledgers) * CHAT_COST)
+    meta = json.loads((summary.run_dir / "run_meta.json").read_text())
+    assert meta["spent_usd"] == pytest.approx(len(ledgers) * CHAT_COST)
+    assert meta["model_gateway"] == {"key_env": "OPENAI_API_KEY", "upstream_url": upstream.url,
+                                     "max_calls_per_trial": 50}  # fmt: skip
+    assert summary.seed_search_score == pytest.approx(SEED_SCORE)
+
+
+def test_no_file_under_the_run_dir_contains_the_provider_key(tmp_path, upstream, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", PLACEHOLDER_KEY)
+    summary = run_experiment(gateway_config(tmp_path, upstream), run_id="r1")
+    files = [path for path in summary.run_dir.rglob("*") if path.is_file()]
+    assert files
+    for path in files:
+        assert PLACEHOLDER_KEY.encode() not in path.read_bytes(), path
+
+
+def test_the_call_limit_comes_from_the_config(tmp_path, upstream, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", PLACEHOLDER_KEY)
+    summary = run_experiment(gateway_config(tmp_path, upstream, max_model_calls_per_trial=7), run_id="r1")
+    meta = json.loads((summary.run_dir / "run_meta.json").read_text())
+    assert meta["model_gateway"]["max_calls_per_trial"] == 7
+
+
+def test_a_scripted_run_uses_no_gateway(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    summary = run(tmp_path)
+    meta = json.loads((summary.run_dir / "run_meta.json").read_text())
+    assert meta["model_gateway"] is None
+    assert not list(summary.run_dir.rglob("gateway.json"))

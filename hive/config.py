@@ -13,6 +13,12 @@ Plug-in sections ([agent], [suite], [overseer]) are open: their extra keys belon
 to the plug-in, which validates them itself. One convention applies to all of them:
 a key ending in `_file`, `_dir` or `_path` is a path, and a relative one resolves against the
 config file's directory, like `seed_candidate` and `output_dir` do.
+
+[model] also holds what the model gateway (hive/gateway) needs: `prices` (USD per million
+tokens, required for every provider but the offline `scripted` one, because the gateway
+computes each trial's cost from it, P12) and `upstream_url` (defaulted by provider). The
+environment variable holding the provider's key is fixed here by provider, not configured:
+the key is read once by the controller and never written to any file.
 """
 
 from __future__ import annotations
@@ -27,16 +33,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from hive.contracts import ModelSpec
+from hive.pricing import Prices, parse_prices
 
 KNOWN_SECTIONS = ("experiment", "model", "agent", "suite", "evaluation", "loop", "overseer")
 
 # Sections whose keys are all HIVE's own; any other key in them is a typo.
 STRICT_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "experiment": ("name", "seed_candidate", "output_dir"),
-    "model": ("provider", "id", "thinking"),
-    "evaluation": ("trials_per_task", "concurrency"),
+    "model": ("provider", "id", "thinking", "prices", "upstream_url"),
+    "evaluation": ("trials_per_task", "concurrency", "max_model_calls_per_trial"),
     "loop": ("generations", "promotion_margin", "max_usd"),
 }
 
@@ -45,6 +53,15 @@ DEFAULT_TRIALS_PER_TASK = 1
 DEFAULT_CONCURRENCY = 1
 DEFAULT_GENERATIONS = 1
 DEFAULT_PROMOTION_MARGIN = 0.0
+DEFAULT_MAX_MODEL_CALLS_PER_TRIAL = 50
+
+# The offline provider: the scripted agent calls no model, so it gets no gateway, prices or key.
+OFFLINE_PROVIDER = "scripted"
+# Per real provider: where the gateway forwards to by default, and the environment variable the
+# controller reads the key from. Fixed in code so a config can't point the key lookup elsewhere.
+DEFAULT_UPSTREAM_URLS = {"openai": "https://api.openai.com"}
+PROVIDER_KEY_ENV = {"openai": "OPENAI_API_KEY"}
+KNOWN_PROVIDERS = tuple(sorted({OFFLINE_PROVIDER, *PROVIDER_KEY_ENV}))
 
 # The name becomes a directory under output_dir, so it must not be able to climb out of it.
 _SAFE_NAME = re.compile(r"[A-Za-z0-9._-]+")
@@ -78,6 +95,20 @@ class ExperimentConfig:
     max_usd: float
     overseer_kind: str
     overseer_settings: Mapping[str, Any]
+    # The model gateway's settings. Defaults keep hand-built configs (tests) on the offline path.
+    prices: Prices | None = None  # [model] prices; None only for the scripted provider
+    upstream_url: str | None = None  # [model] upstream_url or the provider's default; None for scripted
+    max_model_calls_per_trial: int = DEFAULT_MAX_MODEL_CALLS_PER_TRIAL
+
+    @property
+    def uses_gateway(self) -> bool:
+        """Every real provider's traffic goes through the model gateway; the scripted one has none."""
+        return self.model.provider != OFFLINE_PROVIDER
+
+    @property
+    def provider_key_env(self) -> str | None:
+        """The environment variable holding the provider's key (never the key itself)."""
+        return PROVIDER_KEY_ENV.get(self.model.provider)
 
 
 class _Section:
@@ -205,6 +236,10 @@ def _resolve_path_settings(section: str, settings: dict[str, Any], base: Path, p
     return resolved
 
 
+# Reasoning-effort levels every framework adapter and the gateway agree on.
+SHARED_THINKING_LEVELS = ("minimal", "low", "medium", "high")
+
+
 def load_experiment(path: Path | str) -> ExperimentConfig:
     config_path = Path(path).expanduser().resolve()
     data = _read_toml(config_path)
@@ -238,8 +273,16 @@ def load_experiment(path: Path | str) -> ExperimentConfig:
     model = sections["model"]
     provider = model.string("provider")
     model_id = model.string("id")
-    # Reasoning effort is part of the frozen model (P3); absent means the provider's default.
+    # Reasoning effort is part of the frozen model (P3). For a real provider it must be stated, and
+    # be a level that Pi, Deep Agents, Strands and the gateway all send the same way on the wire;
+    # "unset", "off" and "none" each meant something different to one of them.
     thinking = model.optional_string("thinking")
+    if provider is not None and provider != "scripted":
+        if thinking is None and "thinking" not in (model.table or {}):  # a bad value is already reported
+            model.problem(f"thinking is required for provider {provider!r}; one of {list(SHARED_THINKING_LEVELS)}")
+        elif thinking is not None and thinking not in SHARED_THINKING_LEVELS:
+            model.problem(f"thinking {thinking!r} is not supported; use one of {list(SHARED_THINKING_LEVELS)}")
+    prices, upstream_url = _gateway_settings(model, provider)
 
     suite = sections["suite"]
     suite_name = suite.string("name")
@@ -247,6 +290,9 @@ def load_experiment(path: Path | str) -> ExperimentConfig:
     evaluation = sections["evaluation"]
     trials_per_task = evaluation.integer("trials_per_task", DEFAULT_TRIALS_PER_TASK, minimum=1)
     concurrency = evaluation.integer("concurrency", DEFAULT_CONCURRENCY, minimum=1)
+    max_model_calls_per_trial = evaluation.integer(
+        "max_model_calls_per_trial", DEFAULT_MAX_MODEL_CALLS_PER_TRIAL, minimum=1
+    )
 
     loop = sections["loop"]
     generations = loop.integer("generations", DEFAULT_GENERATIONS, minimum=0)
@@ -259,6 +305,8 @@ def load_experiment(path: Path | str) -> ExperimentConfig:
 
     base = config_path.parent
     agent_settings = _resolve_path_settings("agent", sections["agent"].settings(), base, problems)
+    if "prices" in agent_settings:
+        problems.append("[agent] prices moved to [model] prices: cost is a property of the model, computed by the gateway")
     suite_settings = _resolve_path_settings("suite", suite.settings(excluding="name"), base, problems)
     overseer_settings = _resolve_path_settings("overseer", overseer.settings(excluding="kind"), base, problems)
 
@@ -281,7 +329,47 @@ def load_experiment(path: Path | str) -> ExperimentConfig:
         max_usd=max_usd,
         overseer_kind=overseer_kind,
         overseer_settings=overseer_settings,
+        prices=prices,
+        upstream_url=upstream_url,
+        max_model_calls_per_trial=max_model_calls_per_trial,
     )
+
+
+def _gateway_settings(model: _Section, provider: str | None) -> tuple[Prices | None, str | None]:
+    """([model] prices, upstream URL), with problems reported on `model`."""
+    if provider is not None and provider not in KNOWN_PROVIDERS:
+        model.problem(f"provider {provider!r} is not supported; known providers: {', '.join(KNOWN_PROVIDERS)}")
+        provider = None  # no further problems about a provider we don't know
+    prices = None
+    table = model.table.get("prices") if model.table is not None else None
+    if table is not None:
+        try:
+            prices = parse_prices(table)
+        except ValueError as error:
+            model.problem(f"prices: {error}")
+    elif provider is not None and provider != OFFLINE_PROVIDER:
+        model.problem(f"prices is required for provider {provider!r}: the gateway computes every trial's cost from it (P12)")
+    upstream_url = model.optional_string("upstream_url")
+    if upstream_url is not None:
+        problem = _upstream_url_problem(upstream_url)
+        if problem is not None:
+            model.problem(f"upstream_url {problem}, got {upstream_url!r}")
+            upstream_url = None
+    elif provider is not None:
+        upstream_url = DEFAULT_UPSTREAM_URLS.get(provider)
+    return prices, upstream_url
+
+
+def _upstream_url_problem(url: str) -> str | None:
+    # The gateway checks the same; checking here makes a bad URL a config error, not a crash mid-run.
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return "must be an http(s) URL"
+    if parts.query or parts.fragment:
+        return "must not have a query or fragment"
+    if parts.path.rstrip("/").endswith("/v1"):
+        return "is the provider's origin; the gateway appends /v1/..., so drop the trailing /v1"
+    return None
 
 
 def _json_safe(value: Any) -> Any:
@@ -289,6 +377,8 @@ def _json_safe(value: Any) -> Any:
         return str(value)
     if isinstance(value, ModelSpec):
         return {"provider": value.provider, "id": value.id, "thinking": value.thinking}
+    if isinstance(value, Prices):
+        return dataclasses.asdict(value)
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, list | tuple):

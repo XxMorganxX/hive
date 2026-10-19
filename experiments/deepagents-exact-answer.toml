@@ -2,10 +2,11 @@
 # Every tunable for this experiment lives here; relative paths resolve against this file.
 #
 # [experiment]  name of the run directory, the seed harness, and where run outputs go
-# [model]       the frozen model under test and its reasoning effort, never part of a candidate (P3)
+# [model]       the frozen model under test, its reasoning effort and its price table (never part of a
+#               candidate, P3); every model call goes through HIVE's gateway, which computes cost from
+#               the prices (P12) and reads the key from OPENAI_API_KEY
 # [agent]       settings for the agent adapter the seed names (here Deep Agents): the pinned venv
-#               interpreter and deepagents version, the per-trial timeout, and the price table the
-#               cost comes from (USD per million tokens; the framework computes no dollars)
+#               interpreter and deepagents version, the per-trial timeout
 # [suite]       which evaluation suite to score on
 # [evaluation]  trials per task (k) and how many trials run at once
 # [loop]        generations to search, the promotion margin, and the hard dollar cap for the whole run (P12)
@@ -20,12 +21,12 @@ output_dir = "../experience"
 provider = "openai"
 id = "gpt-5-nano"
 thinking = "low"
+prices = { input = 0.05, output = 0.40, cache_read = 0.005 }  # USD per million tokens for gpt-5-nano
 
 [agent]
 python_path = "../.venvs/deepagents/bin/python"  # built by scripts/setup-framework-venvs.sh deepagents
 deepagents_version = "0.7.28"
 timeout_s = 180
-prices = { input = 0.05, output = 0.40, cache_read = 0.005 }  # gpt-5-nano, matching Pi's catalog
 
 [suite]
 name = "exact_answer"

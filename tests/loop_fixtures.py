@@ -13,6 +13,7 @@ that found a real improvement".
 from __future__ import annotations
 
 import dataclasses
+import http.client
 import json
 import os
 import threading
@@ -20,6 +21,7 @@ import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from hive.agents.scripted.adapter import ScriptedAdapter
 from hive.candidate import Candidate
@@ -394,3 +396,44 @@ class ExtensionScriptedAdapter(ScriptedAdapter):
 
     def extension_spec(self) -> ExtensionSpec:
         return EXTENSION_SPEC
+
+
+# --- the model gateway -----------------------------------------------------------------------
+
+
+def chat_through(endpoint: Any, model: str = "gpt-5-nano") -> int:
+    """One chat completion through a gateway endpoint, sent the way a framework's client would."""
+    parts = urlsplit(endpoint.base_url)
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    try:
+        connection.request("POST", parts.path + "/chat/completions", body=body,
+                           headers={"Authorization": f"Bearer {endpoint.api_key}", "Content-Type": "application/json"})  # fmt: skip
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    finally:
+        connection.close()
+
+
+class GatewayScriptedAdapter(ScriptedAdapter):
+    """The scripted agent, but every trial first makes one model call through the endpoint it is
+    given, as a real framework adapter must. It refuses to run without an endpoint."""
+
+    name = "loop_fixtures:GatewayScriptedAdapter"
+
+    def build(self, candidate: Candidate, model: Any, settings: Mapping[str, Any]) -> _GatewayAgent:
+        return _GatewayAgent(super().build(candidate, model, settings))
+
+
+class _GatewayAgent:
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def run(self, task: Task, workdir: Path, trace_dir: Path, endpoint: Any = None) -> AgentResult:
+        if endpoint is None:
+            raise AssertionError("a real provider's trial must be given a gateway endpoint")
+        status = chat_through(endpoint)
+        (trace_dir / "endpoint.json").write_text(json.dumps({"base_url": endpoint.base_url, "status": status}))
+        result = self.inner.run(task, workdir, trace_dir, endpoint=endpoint)
+        return dataclasses.replace(result, usage=Usage(cost_usd=0.0))  # the ledger, not this, is billed

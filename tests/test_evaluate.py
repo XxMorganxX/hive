@@ -1,13 +1,17 @@
+import http.client
 import json
 import math
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 
+from fakes.fake_openai_upstream import CHAT_USAGE, FakeOpenAIUpstream
 from hive.candidate import Candidate
 from hive.contracts import (
     AGENT_ERROR_CLASSES,
@@ -17,18 +21,23 @@ from hive.contracts import (
     ExtensionSpec,
     Grade,
     LoadReport,
+    ModelEndpoint,
     ModelSpec,
     Task,
     Usage,
 )
 from hive.evaluate import (
+    GATEWAY_FILE,
     TRIAL_ERROR_CLASSES,
     EvalReport,
     EvaluationError,
+    GatewaySummary,
     TaskOutcome,
     TrialOutcome,
     evaluate,
 )
+from hive.gateway import ModelGateway
+from hive.pricing import Prices
 
 MODEL = ModelSpec(provider="fake", id="model-1")
 
@@ -1057,3 +1066,291 @@ def test_a_malformed_load_report_makes_the_trial_an_agent_error_and_keeps_its_co
     assert trial.load_report is None
     assert suite.grade_calls == []
     assert (tmp_path / "out" / "report.json").is_file()
+
+
+# --- the model gateway: per-trial endpoints, and the ledger as the authority (P3, P12) -----------
+
+GATEWAY_MODEL = ModelSpec(provider="openai", id="gpt-5-nano", thinking="low")
+PRICES = Prices(input=0.05, output=0.40, cache_read=0.005)
+# A made-up stand-in for the provider key. Never a real key.
+UPSTREAM_KEY = "sk-placeholder-upstream-key-for-evaluate-tests"
+CACHED = CHAT_USAGE["prompt_tokens_details"]["cached_tokens"]
+CHAT_TOKENS = Usage(input_tokens=CHAT_USAGE["prompt_tokens"] - CACHED,
+                    output_tokens=CHAT_USAGE["completion_tokens"], cache_read_tokens=CACHED)  # fmt: skip
+CHAT_BILL = Usage(input_tokens=CHAT_TOKENS.input_tokens, output_tokens=CHAT_TOKENS.output_tokens,
+                  cache_read_tokens=CACHED, cost_usd=PRICES.cost(CHAT_TOKENS))  # fmt: skip
+
+EndpointBehavior = Callable[[Task, Path, Path, ModelEndpoint], AgentResult]
+
+
+def model_call(endpoint: ModelEndpoint, *, model: str = "gpt-5-nano", scenario: str = "ok") -> int:
+    """One chat completion through the endpoint, sent the way a framework's HTTP client would."""
+    parts = urlsplit(endpoint.base_url)
+    body = {"model": model, "messages": [{"role": "user", "content": f"hi scenario={scenario}"}]}
+    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    try:
+        connection.request("POST", parts.path + "/chat/completions", body=json.dumps(body),
+                           headers={"Authorization": f"Bearer {endpoint.api_key}", "Content-Type": "application/json"})  # fmt: skip
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    finally:
+        connection.close()
+
+
+class EndpointAgent:
+    """An agent that sends its model traffic to the endpoint it is given, as every adapter must."""
+
+    def __init__(self, behavior: EndpointBehavior):
+        self.behavior = behavior
+        self.endpoints: list[ModelEndpoint] = []
+
+    def run(self, task: Task, workdir: Path, trace_dir: Path, endpoint: ModelEndpoint | None = None) -> AgentResult:
+        assert endpoint is not None, "with a gateway, evaluate must pass the endpoint"
+        self.endpoints.append(endpoint)
+        return self.behavior(task, workdir, trace_dir, endpoint)
+
+
+class EndpointAdapter(FakeAdapter):
+    def __init__(self, behavior: EndpointBehavior, spec: ExtensionSpec | None = None):
+        super().__init__(spec=spec)
+        self.agent = EndpointAgent(behavior)
+
+
+@pytest.fixture
+def upstream():
+    with FakeOpenAIUpstream() as fake:
+        yield fake
+
+
+@contextmanager
+def make_gateway(upstream: FakeOpenAIUpstream, *, max_calls: int = 50, **options: Any):
+    with ModelGateway(model=GATEWAY_MODEL, prices=PRICES, upstream_url=upstream.url, upstream_key=UPSTREAM_KEY,
+                      max_calls_per_trial=max_calls, **options) as gateway:  # fmt: skip
+        yield gateway
+
+
+def gateway_eval(candidate, behavior: EndpointBehavior, tmp_path, *, max_calls: int = 50, suite=None,
+                 upstream: FakeOpenAIUpstream, on_trial_cost=None, **options: Any) -> EvalReport:  # fmt: skip
+    with make_gateway(upstream, max_calls=max_calls, **options) as gateway:
+        return evaluate(candidate, EndpointAdapter(behavior), suite or FakeSuite([search_task("t1")]), "search",
+                        model=GATEWAY_MODEL, agent_settings={}, trials_per_task=1, out_dir=tmp_path / "out",
+                        gateway=gateway, on_trial_cost=on_trial_cost)  # fmt: skip
+
+
+def calls_then(statuses: list[int], scenarios: list[str] | None = None, result: AgentResult | None = None,
+               model: str = "gpt-5-nano") -> EndpointBehavior:  # fmt: skip
+    def behavior(task, workdir, trace_dir, endpoint):
+        for scenario in scenarios or ["ok"]:
+            statuses.append(model_call(endpoint, model=model, scenario=scenario))
+        return result or completed(usage=Usage(input_tokens=1, cost_usd=0.0))
+    return behavior
+
+
+def gateway_json(tmp_path: Path) -> dict[str, Any]:
+    return json.loads((tmp_path / "out" / "trials" / "t1" / "1" / GATEWAY_FILE).read_text())
+
+
+def test_without_a_gateway_the_agent_gets_no_endpoint(candidate, tmp_path):
+    adapter = FakeAdapter()  # FakeAgent.run takes no endpoint, so passing one would be an agent_error
+    assert only_trial(run_eval(candidate, adapter, FakeSuite([search_task("t1")]), tmp_path / "out")).status == "scored"
+    assert not (tmp_path / "out" / "trials" / "t1" / "1" / GATEWAY_FILE).exists()
+
+
+def test_each_trial_gets_its_own_endpoint_token(candidate, tmp_path, upstream):
+    adapter = EndpointAdapter(lambda task, workdir, trace_dir, endpoint: completed())
+    with make_gateway(upstream) as gateway:
+        evaluate(candidate, adapter, FakeSuite([search_task("t1"), search_task("t2")]), "search", model=GATEWAY_MODEL,
+                 agent_settings={}, trials_per_task=2, out_dir=tmp_path / "out", gateway=gateway)  # fmt: skip
+    tokens = [endpoint.api_key for endpoint in adapter.agent.endpoints]
+    assert len(tokens) == len(set(tokens)) == 4
+    assert UPSTREAM_KEY not in tokens
+
+
+def test_usage_and_cost_come_from_the_ledger_not_the_adapter(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    claimed = completed(usage=Usage(input_tokens=1, cost_usd=0.0))  # an adapter that under-reports its spend
+    costs: list[float] = []
+    report = gateway_eval(candidate, calls_then(statuses, ["ok", "ok"], claimed), tmp_path, upstream=upstream,
+                          on_trial_cost=costs.append)  # fmt: skip
+    trial = only_trial(report)
+    assert statuses == [200, 200]
+    assert trial.status == "scored"
+    assert trial.usage == CHAT_BILL + CHAT_BILL
+    assert costs == [pytest.approx(2 * CHAT_BILL.cost_usd)]
+    assert trial.gateway == GatewaySummary(calls=2, models_reported=("gpt-5-nano-2025-08-07",), error_codes=(),
+                                           violations=(), limit_reached=False, spend_lower_bound=False)  # fmt: skip
+
+
+def test_a_refused_model_is_model_mismatch_even_when_the_run_completed(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    suite = FakeSuite([search_task("t1")])
+    trial = only_trial(gateway_eval(candidate, calls_then(statuses, model="gpt-4o"), tmp_path, upstream=upstream,
+                                    suite=suite))  # fmt: skip
+    assert statuses == [403]
+    assert (trial.status, trial.error_class) == ("errored", "model_mismatch")
+    assert "gpt-4o" in trial.detail
+    assert suite.grade_calls == []
+    assert trial.gateway.violations
+
+
+def test_a_provider_reporting_another_model_is_model_mismatch(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    trial = only_trial(gateway_eval(candidate, calls_then(statuses, ["other_model"]), tmp_path, upstream=upstream))
+    assert (trial.status, trial.error_class) == ("errored", "model_mismatch")
+    assert "gpt-4o-2024-08-06" in trial.detail
+    assert trial.usage == CHAT_BILL  # the mismatched call was still billed
+
+
+def test_model_mismatch_outranks_the_agents_own_error_class(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    errored_run = AgentResult(status="errored", final_text="", usage=Usage(), wall_clock_s=1.0, error="boom",
+                              error_class="timeout")  # fmt: skip
+    trial = only_trial(gateway_eval(candidate, calls_then(statuses, ["other_model", "quota"], errored_run), tmp_path,
+                                    upstream=upstream))  # fmt: skip
+    assert trial.error_class == "model_mismatch"
+
+
+def test_the_call_limit_makes_an_unfinished_run_an_agent_error(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    errored_run = AgentResult(status="errored", final_text="", usage=Usage(), wall_clock_s=1.0,
+                              error="the provider refused the request", error_class="provider_error")  # fmt: skip
+    trial = only_trial(gateway_eval(candidate, calls_then(statuses, ["ok", "ok", "ok"], errored_run), tmp_path,
+                                    upstream=upstream, max_calls=2))  # fmt: skip
+    assert statuses == [200, 200, 403]
+    assert (trial.status, trial.error_class) == ("errored", "agent_error")
+    assert trial.detail.startswith("model call limit (2) reached")
+    assert "provider_error: the provider refused the request" in trial.detail
+    assert trial.usage == CHAT_BILL + CHAT_BILL
+    assert trial.gateway.limit_reached is True
+
+
+def test_the_call_limit_leaves_a_completed_run_scored(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    trial = only_trial(gateway_eval(candidate, calls_then(statuses, ["ok", "ok"]), tmp_path, upstream=upstream,
+                                    max_calls=1))  # fmt: skip
+    assert statuses == [200, 403]
+    assert trial.status == "scored"
+    assert trial.gateway.limit_reached is True
+
+
+@pytest.mark.parametrize("scenario", ["quota", "rate_limit"])
+def test_an_upstream_quota_or_rate_limit_makes_an_errored_run_quota(candidate, tmp_path, upstream, scenario):
+    statuses: list[int] = []
+    errored_run = AgentResult(status="errored", final_text="", usage=Usage(), wall_clock_s=1.0, error="429",
+                              error_class="provider_error")  # fmt: skip
+    trial = only_trial(gateway_eval(candidate, calls_then(statuses, [scenario], errored_run), tmp_path,
+                                    upstream=upstream))  # fmt: skip
+    assert statuses == [429]
+    assert (trial.status, trial.error_class) == ("errored", "quota")
+    assert ("insufficient_quota" if scenario == "quota" else "rate_limit_exceeded") in trial.detail
+
+
+def test_an_upstream_quota_error_leaves_a_completed_run_scored(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    trial = only_trial(gateway_eval(candidate, calls_then(statuses, ["quota", "ok"]), tmp_path, upstream=upstream))
+    assert trial.status == "scored"
+    assert trial.gateway.error_codes == ("insufficient_quota",)
+
+
+def test_a_call_without_usage_keeps_the_result_but_marks_spend_as_a_lower_bound(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    trial = only_trial(gateway_eval(candidate, calls_then(statuses, ["no_usage", "ok"]), tmp_path, upstream=upstream))
+    assert trial.status == "scored"
+    assert trial.usage == CHAT_BILL
+    assert "lower bound" in trial.detail
+    assert trial.gateway.spend_lower_bound is True
+
+
+def test_a_call_still_running_at_close_marks_spend_as_a_lower_bound(candidate, tmp_path):
+    def leave_a_call_running(task, workdir, trace_dir, endpoint):
+        threading.Thread(target=model_call, args=(endpoint,), kwargs={"scenario": "hang"}, daemon=True).start()
+        deadline = time.monotonic() + 5
+        while not slow.requests and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return completed()
+
+    with FakeOpenAIUpstream(hang_s=2.0) as slow:
+        trial = only_trial(gateway_eval(candidate, leave_a_call_running, tmp_path, upstream=slow, close_timeout_s=0.1))
+    assert trial.status == "scored"
+    assert "lower bound" in trial.detail
+    assert "in_flight_at_close" in trial.gateway.error_codes
+
+
+def test_the_grant_is_closed_and_billed_when_run_raises(candidate, tmp_path, upstream):
+    seen: list[ModelEndpoint] = []
+
+    def call_then_raise(task, workdir, trace_dir, endpoint):
+        seen.append(endpoint)
+        model_call(endpoint)
+        raise RuntimeError("adapter bug")
+
+    trial = only_trial(gateway_eval(candidate, call_then_raise, tmp_path, upstream=upstream))
+    assert (trial.status, trial.error_class) == ("errored", "agent_error")
+    assert "adapter bug" in trial.detail
+    assert trial.usage == CHAT_BILL
+    assert gateway_json(tmp_path)["calls"][0]["status"] == 200
+
+
+def test_the_token_is_revoked_after_the_trial(candidate, tmp_path, upstream):
+    seen: list[ModelEndpoint] = []
+
+    def remember(task, workdir, trace_dir, endpoint):
+        seen.append(endpoint)
+        return completed()
+
+    with make_gateway(upstream) as gateway:
+        evaluate(candidate, EndpointAdapter(remember), FakeSuite([search_task("t1")]), "search", model=GATEWAY_MODEL,
+                 agent_settings={}, trials_per_task=1, out_dir=tmp_path / "out", gateway=gateway)  # fmt: skip
+        assert model_call(seen[0]) == 401
+
+
+def test_an_interrupted_trial_still_reports_its_gateway_spend(candidate, tmp_path, upstream):
+    def call_then_interrupt(task, workdir, trace_dir, endpoint):
+        model_call(endpoint)
+        raise AbortTrial
+
+    costs: list[float] = []
+    with pytest.raises(AbortTrial):
+        gateway_eval(candidate, call_then_interrupt, tmp_path, upstream=upstream, on_trial_cost=costs.append)
+    assert costs == [pytest.approx(CHAT_BILL.cost_usd)]
+    assert gateway_json(tmp_path)["calls"][0]["status"] == 200
+
+
+def test_gateway_json_records_the_ledger_and_no_secret(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    tokens: list[str] = []
+
+    def behavior(task, workdir, trace_dir, endpoint):
+        tokens.append(endpoint.api_key)
+        return calls_then(statuses, ["ok", "quota"], model="gpt-5-nano")(task, workdir, trace_dir, endpoint)
+
+    gateway_eval(candidate, behavior, tmp_path, upstream=upstream)
+    data = gateway_json(tmp_path)
+    assert set(data) == {"calls", "violations", "limit_reached"}
+    assert [call["status"] for call in data["calls"]] == [200, 429]
+    assert data["calls"][0]["usage"] == {**CHAT_BILL.__dict__}
+    assert data["calls"][1]["error_code"] == "insufficient_quota"
+    assert (data["violations"], data["limit_reached"]) == ([], False)
+    for path in (tmp_path / "out").rglob("*"):
+        if path.is_file():
+            text = path.read_text(errors="replace")
+            assert UPSTREAM_KEY not in text and tokens[0] not in text, path
+
+
+def test_the_gateway_summary_round_trips_through_report_json(candidate, tmp_path, upstream):
+    statuses: list[int] = []
+    report = gateway_eval(candidate, calls_then(statuses, ["ok", "no_usage"]), tmp_path, upstream=upstream)
+    loaded = EvalReport.from_dict(json.loads((tmp_path / "out" / "report.json").read_text()))
+    assert loaded == report
+    outcome = json.loads((tmp_path / "out" / "trials" / "t1" / "1" / "outcome.json").read_text())
+    assert TrialOutcome.from_dict(outcome) == only_trial(report)
+    assert only_trial(report).gateway.calls == 2
+
+
+def test_outcomes_without_a_gateway_summary_still_load(candidate, tmp_path):
+    report = run_eval(candidate, FakeAdapter(), FakeSuite([search_task("t1")]), tmp_path / "out")
+    data = only_trial(report).to_dict()
+    assert data["gateway"] is None
+    del data["gateway"]
+    assert TrialOutcome.from_dict(data) == only_trial(report)
