@@ -1,0 +1,10 @@
+{"id": "count-letter-e", "split": "search", "question": "How many times does the letter \"e\" appear in the phrase \"nevertheless independence\"?", "answers": ["8"], "numeric": true}
+{"id": "mixed-arithmetic", "split": "search", "question": "What is (17 * 23) - (144 / 12) + 9?", "answers": ["388"], "numeric": true}
+{"id": "weekday-offset", "split": "search", "question": "January 1, 2030 is a Tuesday. What day of the week is October 19, 2030?", "answers": ["Saturday"], "numeric": false}
+{"id": "days-to-seconds", "split": "search", "question": "How many seconds are there in 3.5 days?", "answers": ["302400"], "numeric": true}
+{"id": "pet-logic", "split": "search", "question": "Alice, Bob and Carol each own exactly one pet, and the pets are a cat, a dog and a fish (one each). Alice owns neither the dog nor the fish. Bob does not own the dog. Who owns the dog?", "answers": ["Carol"], "numeric": false}
+{"id": "reverse-string", "split": "search", "question": "Write the string harness42 reversed, character by character.", "answers": ["24ssenrah"], "numeric": false}
+{"id": "fill-rate", "split": "heldout", "question": "Pipe A alone fills a tank in 6 hours. Pipe B alone fills the same tank in 3 hours. Both pipes run together at their constant rates, starting with the tank empty. How many hours do they take to fill it?", "answers": ["2"], "numeric": true}
+{"id": "count-letter-a", "split": "heldout", "question": "How many times does the letter \"a\" appear in the phrase \"banana bandana\"?", "answers": ["6"], "numeric": true}
+{"id": "unit-price", "split": "heldout", "question": "A shop sells pencils at 3 for $1.20, with no bulk discount. How many dollars do 25 pencils cost?", "answers": ["10"], "numeric": true}
+{"id": "date-offset", "split": "heldout", "question": "What date is exactly 100 days after February 10, 2024? Give the date in YYYY-MM-DD format.", "answers": ["2024-05-20"], "numeric": false}
