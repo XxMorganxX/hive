@@ -12,6 +12,7 @@ that found a real improvement".
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import tomllib
@@ -19,8 +20,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from hive.agents.scripted.adapter import ScriptedAdapter
 from hive.candidate import Candidate
-from hive.contracts import AgentResult, Grade, MetricSpec, OverseerBrief, Proposal, Task
+from hive.contracts import AgentResult, Grade, MetricSpec, OverseerBrief, Proposal, Task, Usage
 from hive.overseers.claude_code.overseer import build_workspace
 from hive.suites.exact_answer.suite import BUNDLED_TASKS_FILE
 
@@ -176,14 +178,17 @@ class RecordingOverseer(_BaseOverseer):
     briefs: list[OverseerBrief] = []
     workspaces: list[Path] = []
     heldout_existed: list[bool] = []
+    reports: list[dict[str, Any]] = []
 
     def propose(self, brief: OverseerBrief, workspace: Path) -> Proposal:
         workspace = Path(workspace)
         RecordingOverseer.briefs.append(brief)
         RecordingOverseer.workspaces.append(workspace)
-        # The incumbent report lives at <run_dir>/evals/gen-NNN/report.json.
-        run_dir = Path(brief.incumbent_report).parents[2]
-        RecordingOverseer.heldout_existed.append((run_dir / "heldout").exists())
+        # The brief's files are temporary copies, so record what they held while they exist.
+        RecordingOverseer.reports.append(json.loads(Path(brief.incumbent_report).read_text()))
+        # Briefs hold copies outside the run dir, so the test passes the run dir in explicitly.
+        if "run_dir" in self.settings:
+            RecordingOverseer.heldout_existed.append((Path(self.settings["run_dir"]) / "heldout").exists())
         build_workspace(brief, workspace)
         return Proposal(candidate_dir=workspace / "candidate", rationale="recorded")
 
@@ -192,6 +197,7 @@ class RecordingOverseer(_BaseOverseer):
         cls.briefs = []
         cls.workspaces = []
         cls.heldout_existed = []
+        cls.reports = []
 
 
 # --- suites ------------------------------------------------------------------------------
@@ -232,3 +238,56 @@ class EmptySearchSuite(_TinySuite):
 class NoHeldoutSuite(_TinySuite):
     name = "no-heldout"
     _TASKS = (("s1", "search"), ("s2", "search"))
+
+
+# --- integrity and budget fixtures -----------------------------------------------------------
+
+
+class TamperingOverseer(_BaseOverseer):
+    """Writes every held-out answer into the candidate it was briefed with, then proposes
+    nothing. If the brief pointed at the live snapshot, held-out scores would be forged."""
+
+    name = "tampering"
+
+    def propose(self, brief: OverseerBrief, workspace: Path) -> Proposal:
+        default, responses = read_responses(brief.incumbent.root)
+        write_responses(brief.incumbent.root / RESPONSES, default, {**responses, **exact_answers_as_responses()})
+        return Proposal(candidate_dir=None, rationale="", error="tampered instead of proposing")
+
+
+class TargetedTamperOverseer(_BaseOverseer):
+    """Rewrites the candidate directory at settings["target"]: stands in for any process that
+    edits a snapshot on disk behind the controller's back."""
+
+    name = "targeted-tamper"
+
+    def propose(self, brief: OverseerBrief, workspace: Path) -> Proposal:
+        target = Path(self.settings["target"])
+        default, responses = read_responses(target)
+        write_responses(target / RESPONSES, default, {**responses, **exact_answers_as_responses()})
+        return Proposal(candidate_dir=None, rationale="", error="tampered instead of proposing")
+
+
+def exact_answers_as_responses() -> dict[str, str]:
+    return {task_id: f"ANSWER: {answer}" for task_id, answer in exact_answers().items()}
+
+
+class CostlyScriptedAdapter(ScriptedAdapter):
+    """The scripted agent, but every trial costs settings["cost_per_trial"] dollars, so budget
+    rules can be tested without a model. Candidates name it as their agent by import path."""
+
+    name = "loop_fixtures:CostlyScriptedAdapter"
+
+    def build(self, candidate: Candidate, model: Any, settings: Mapping[str, Any]) -> _CostlyAgent:
+        cost = float(settings.get("cost_per_trial", 0.0))
+        return _CostlyAgent(super().build(candidate, model, {}), cost)
+
+
+class _CostlyAgent:
+    def __init__(self, inner: Any, cost_per_trial: float) -> None:
+        self.inner = inner
+        self.cost_per_trial = cost_per_trial
+
+    def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
+        result = self.inner.run(task, workdir, trace_dir)
+        return dataclasses.replace(result, usage=Usage(cost_usd=self.cost_per_trial))

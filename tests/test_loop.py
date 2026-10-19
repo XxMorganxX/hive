@@ -255,7 +255,10 @@ def test_held_out_is_skipped_with_a_reason_when_the_suite_has_none(tmp_path):
 
 
 def test_held_out_data_never_reaches_an_overseer(tmp_path):
-    summary = run(tmp_path, overseer_kind=fixture("RecordingOverseer"), generations=2)
+    run_dir = tmp_path / "out" / "loop-test" / "r1"
+    summary = run(
+        tmp_path, overseer_kind=fixture("RecordingOverseer"), overseer_settings={"run_dir": str(run_dir)}, generations=2
+    )
     briefs = loop_fixtures.RecordingOverseer.briefs
     assert len(briefs) == 2
     assert loop_fixtures.RecordingOverseer.heldout_existed == [False, False]
@@ -286,9 +289,9 @@ def test_brief_carries_the_incumbent_snapshot_metric_rule_and_history(tmp_path):
     first, second = loop_fixtures.RecordingOverseer.briefs
     run_dir = tmp_path / "out" / "loop-test" / "r1"
     assert first.generation == 1 and second.generation == 2
-    assert first.incumbent.root == (run_dir / "candidates" / first.incumbent.id).resolve()
-    assert first.incumbent_report == run_dir / "evals" / "gen-000" / "report.json"
-    assert first.evidence_dir == run_dir / "evals" / "gen-000" / "trials"
+    # The brief holds copies of the incumbent's snapshot, report and evidence (see the integrity tests).
+    assert first.incumbent.id == Candidate.load(run_dir / "candidates" / first.incumbent.id).id
+    assert loop_fixtures.RecordingOverseer.reports[0] == json.loads((run_dir / "evals" / "gen-000" / "report.json").read_text())
     assert first.metric.name == "accuracy"
     assert "0.0500" in first.selection_rule
     assert "Scripted agent valves" in first.valves
@@ -488,3 +491,105 @@ def test_unsafe_run_id_raises(tmp_path, run_id):
     with pytest.raises(LoopError, match="run id"):
         run_experiment(make_config(tmp_path), run_id=run_id)
     assert not (tmp_path / "out").exists()
+
+
+# --- snapshot integrity ----------------------------------------------------------------------
+
+
+def test_overseer_is_briefed_with_a_copy_so_it_cannot_alter_the_incumbent_snapshot(tmp_path):
+    summary = run(tmp_path, overseer_kind=fixture("TamperingOverseer"))
+    snapshot = Candidate.load(summary.run_dir / "candidates" / summary.seed_id)
+    assert snapshot.id == summary.seed_id
+    # The untouched scripted seed answers no held-out task; forged answers would score 1.0.
+    assert summary.heldout["seed"]["selection_score"] == 0.0
+
+
+def test_brief_points_outside_the_run_dir_at_copies_of_the_incumbent_and_its_evidence(tmp_path):
+    summary = run(tmp_path, overseer_kind=fixture("RecordingOverseer"))
+    [brief] = loop_fixtures.RecordingOverseer.briefs
+    for path in (brief.incumbent.root, brief.incumbent_report, brief.evidence_dir):
+        assert not Path(path).resolve().is_relative_to(summary.run_dir)
+    assert brief.incumbent.id == summary.seed_id
+
+
+def test_a_snapshot_edited_on_disk_is_refused_before_it_is_evaluated_again(tmp_path):
+    seed_id = Candidate.load(EXACT_SEED).id
+    target = tmp_path / "out" / "loop-test" / "r1" / "candidates" / seed_id
+    with pytest.raises(LoopError, match="changed on disk"):
+        run(tmp_path, overseer_kind=fixture("TargetedTamperOverseer"), overseer_settings={"target": str(target)})
+
+
+# --- budget estimates ------------------------------------------------------------------------
+
+COST_PER_TRIAL = 0.01
+SEARCH_EVAL_COST = 6 * COST_PER_TRIAL  # six search tasks, one trial each
+HELDOUT_EVAL_COST = 4 * COST_PER_TRIAL
+
+
+def costly_config(tmp_path: Path, **overrides: Any) -> ExperimentConfig:
+    seed = tmp_path / "seed"
+    shutil.copytree(EXACT_SEED, seed)
+    manifest = seed / "candidate.toml"
+    manifest.write_text(manifest.read_text().replace('agent = "scripted"', 'agent = "loop_fixtures:CostlyScriptedAdapter"'))
+    overrides.setdefault("agent_settings", {"cost_per_trial": COST_PER_TRIAL})
+    return make_config(tmp_path, **overrides)
+
+
+def test_a_generation_is_not_started_when_its_estimated_cost_would_break_the_cap(tmp_path):
+    config = costly_config(tmp_path, max_usd=SEARCH_EVAL_COST * 1.5, generations=3)
+    summary = run_experiment(config, run_id="r1")
+    assert summary.stopped_reason == "budget"
+    assert summary.generations == ()
+    assert not (summary.run_dir / "overseer").exists()
+    assert summary.total_cost_usd <= config.max_usd
+
+
+def test_a_child_is_not_evaluated_when_the_overseer_left_too_little_budget(tmp_path):
+    # Room for the seed and one more search evaluation, but the overseer spends most of it.
+    config = costly_config(
+        tmp_path,
+        max_usd=SEARCH_EVAL_COST * 2 + 0.01,
+        overseer_kind=fixture("ExpensiveOverseer"),
+        overseer_settings={"cost": 0.05},
+        generations=3,
+    )
+    summary = run_experiment(config, run_id="r1")
+    [row] = summary.generations
+    assert row["status"] == "over_budget"
+    assert row["eval_cost_usd"] == 0.0
+    assert summary.stopped_reason == "budget"
+    assert not (summary.run_dir / "evals" / "gen-001").exists()
+
+
+def test_held_out_is_skipped_when_its_estimated_cost_would_break_the_cap(tmp_path):
+    config = costly_config(tmp_path, max_usd=SEARCH_EVAL_COST + HELDOUT_EVAL_COST / 2, generations=0)
+    summary = run_experiment(config, run_id="r1")
+    assert summary.heldout["seed"] is None
+    assert "budget" in summary.heldout["skipped_reason"]
+    assert summary.total_cost_usd <= config.max_usd
+
+
+def test_held_out_runs_when_the_estimate_fits(tmp_path):
+    config = costly_config(tmp_path, max_usd=SEARCH_EVAL_COST + HELDOUT_EVAL_COST + 0.01, generations=0)
+    summary = run_experiment(config, run_id="r1")
+    assert summary.heldout["seed"] is not None
+    assert summary.total_cost_usd == pytest.approx(SEARCH_EVAL_COST + HELDOUT_EVAL_COST)
+
+
+# --- temp dir guard --------------------------------------------------------------------------
+
+
+def test_a_temp_dir_inside_a_git_checkout_is_refused_before_anything_runs(tmp_path, monkeypatch):
+    repo = tmp_path / "some-repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "tmp").mkdir()
+    monkeypatch.setattr("tempfile.tempdir", str(repo / "tmp"))
+    with pytest.raises(LoopError, match="git checkout"):
+        run(tmp_path)
+    assert_nothing_evaluated(tmp_path)
+
+
+def test_run_meta_records_whether_the_checkout_had_uncommitted_changes(tmp_path):
+    summary = run(tmp_path)
+    meta = json.loads((summary.run_dir / "run_meta.json").read_text())
+    assert meta["git_dirty"] in (True, False, None)  # None only when git is unavailable

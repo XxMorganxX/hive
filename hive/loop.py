@@ -8,14 +8,27 @@ own agent adapter.
 One run, in order:
 
 1. Check the configuration before spending anything: split walls (P7), a non-empty
-   search split, a valid seed, a fresh run directory. Problems raise `LoopError`.
-2. Evaluate the seed on the search split. It becomes the first incumbent.
-3. Each generation: stop if the spend has reached the cap (P12); ask the overseer for a
-   child in a temporary workspace outside the repository; reject empty, invalid,
-   unchanged or duplicate proposals without spending on them; otherwise evaluate the
-   child on search and apply `hive.selection.decide` (P9).
-4. Score the seed and the final incumbent on the held-out split, once, at the very end.
-   Nothing held-out is ever placed in a brief or a workspace (P7).
+   search split, a valid seed, a fresh run directory, a temp dir outside any git
+   checkout. Problems raise `LoopError`; a bad seed directory or plug-in name raises
+   `CandidateError` or `RegistryError` from the layer that found it. Nothing has run yet
+   in any of these cases.
+2. Evaluate the seed on the search split. It becomes the first incumbent, and its cost
+   calibrates the per-trial cost estimate used by every budget check after it (P12).
+3. Each generation: stop if the next search evaluation is not expected to fit under the
+   cap; brief the overseer with *copies* of the incumbent and its evidence, in temporary
+   directories outside the repository; reject empty, invalid, unchanged or duplicate
+   proposals without spending on them; skip the child's evaluation if the overseer's own
+   spend left too little budget; otherwise evaluate the child on search and apply
+   `hive.selection.decide` (P9).
+4. Score the seed and the final incumbent on the held-out split, once, at the very end,
+   if the estimate fits. Nothing held-out is ever placed in a brief or a workspace (P7).
+
+Every evaluation first re-hashes the candidate snapshot it is about to score. A snapshot
+that changed on disk raises `LoopError` instead of being scored under a stale id (P4).
+
+The cap is estimate-gated, not exact: the loop never *starts* work it expects to push the
+spend past `max_usd`, but a run can still overshoot by the estimate's error, and the
+overseer's own spend is bounded only by the overseer's per-proposal limit.
 
 Run directory, `<output_dir>/<experiment name>/<run id>/`:
 
@@ -52,7 +65,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from hive.candidate import Candidate, CandidateError
+from hive.candidate import Candidate, CandidateError, content_hash
 from hive.config import ExperimentConfig, snapshot
 from hive.contracts import SPLITS, AgentAdapter, Overseer, OverseerBrief, Proposal, Split, Suite
 from hive.evaluate import REPORT_FILE, TRIALS_DIR, EvalReport, evaluate
@@ -63,6 +76,7 @@ LOGGER = logging.getLogger("hive")
 
 RUN_ID_FORMAT = "%Y%m%d-%H%M%S"
 WORKSPACE_PREFIX = "hive-overseer-"
+BRIEF_PREFIX = "hive-brief-"
 
 RUN_META_FILE = "run_meta.json"
 GENERATIONS_FILE = "generations.jsonl"
@@ -85,6 +99,7 @@ STATUS_NO_PROPOSAL = "no_proposal"
 STATUS_INVALID = "invalid"
 STATUS_UNCHANGED = "unchanged"
 STATUS_DUPLICATE = "duplicate"
+STATUS_OVER_BUDGET = "over_budget"  # a valid child left unevaluated because the budget would not cover it
 
 # The run id becomes a directory name, so it must not be able to climb out of the experiment dir.
 _SAFE_RUN_ID = re.compile(r"[A-Za-z0-9._-]+")
@@ -93,7 +108,7 @@ _GIT_TIMEOUT_S = 10
 
 
 class LoopError(Exception):
-    """The experiment can't start: found before anything was evaluated or paid for."""
+    """The experiment can't start, or can't continue without recording something false."""
 
 
 @dataclass(frozen=True)
@@ -137,8 +152,9 @@ class _Evaluated:
 def run_experiment(config: ExperimentConfig, *, run_id: str | None = None) -> ExperimentSummary:
     """Run the whole loop for one experiment config and return its summary.
 
-    Raises LoopError for configuration problems, before anything is evaluated. Any
-    other exception propagates after run_meta.json has recorded it.
+    Configuration problems raise LoopError, CandidateError or RegistryError before anything
+    is evaluated. Any other exception, including a LoopError for a snapshot changed on disk,
+    propagates after run_meta.json has recorded it.
     """
     if run_id is None:
         run_id = _utc_now().strftime(RUN_ID_FORMAT)
@@ -150,6 +166,7 @@ def run_experiment(config: ExperimentConfig, *, run_id: str | None = None) -> Ex
     seed = Candidate.load(config.seed_candidate)
     adapter = make_agent_adapter(seed.agent)
     _check_splits(suite)
+    _check_temp_dir_outside_git()
     problems = adapter.validate(seed)
     if problems:
         listing = "; ".join(problems)
@@ -173,6 +190,7 @@ def run_experiment(config: ExperimentConfig, *, run_id: str | None = None) -> Ex
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "git_commit": _git_commit(),
+        "git_dirty": _git_dirty(),
     }
     # Written now as well as at the end, so even a killed process leaves a record (P13).
     _write_json(run_dir / RUN_META_FILE, meta)
@@ -199,6 +217,9 @@ class _Experiment:
         self.overseer = overseer
         self.adapter = adapter
         self.spent_usd = 0.0
+        # Calibrated from the seed's search evaluation; 0.0 until then (P12).
+        self.cost_per_trial_estimate = 0.0
+        self.budget_exhausted = False
         self.rows: list[dict[str, Any]] = []
         # Candidate id -> its latest search evaluation, for duplicate detection.
         self.evaluated: dict[str, _Evaluated] = {}
@@ -209,17 +230,23 @@ class _Experiment:
                     config.model.qualified, self.overseer.name)  # fmt: skip
         seed_snapshot = self._snapshot_seed(seed)
         seed_eval = self._evaluate_search(seed_snapshot, generation=0)
+        if seed_eval.report.n_trials:
+            self.cost_per_trial_estimate = seed_eval.report.cost_usd / seed_eval.report.n_trials
         LOGGER.info("seed %s: search score %.4f", seed_snapshot.id, seed_eval.report.selection_score)
 
         incumbent = seed_eval
         stopped_reason = STOPPED_COMPLETED
         for generation in range(1, config.generations + 1):
-            if self.spent_usd >= config.max_usd:
-                LOGGER.info("generation %d: budget reached ($%.4f of $%.4f); stopping", generation,
+            if not self._fits(self._estimate("search")):
+                LOGGER.info("generation %d: another search evaluation (~$%.4f) would not fit under the cap "
+                            "($%.4f spent of $%.4f); stopping", generation, self._estimate("search"),
                             self.spent_usd, config.max_usd)  # fmt: skip
                 stopped_reason = STOPPED_BUDGET
                 break
             incumbent = self._generation(generation, incumbent, seed_eval)
+            if self.budget_exhausted:
+                stopped_reason = STOPPED_BUDGET
+                break
 
         heldout = self._heldout(seed_eval.candidate, incumbent.candidate)
         summary = ExperimentSummary(
@@ -254,7 +281,15 @@ class _Experiment:
         copy.write_lineage(parents=[parent.id], origin=self.overseer.name, rationale=rationale)
         return copy
 
+    def _estimate(self, split: Split) -> float:
+        """Expected cost of one evaluation on `split`, from the seed's measured cost per trial."""
+        return self.cost_per_trial_estimate * len(self.suite.tasks(split)) * self.config.trials_per_task
+
+    def _fits(self, expected_cost: float) -> bool:
+        return self.spent_usd < self.config.max_usd and self.spent_usd + expected_cost <= self.config.max_usd
+
     def _evaluate(self, candidate: Candidate, split: Split, out_dir: Path) -> EvalReport:
+        _verify_intact(candidate)
         report = evaluate(
             candidate,
             self.adapter,
@@ -281,21 +316,28 @@ class _Experiment:
     def _generation(self, generation: int, incumbent: _Evaluated, seed: _Evaluated) -> _Evaluated:
         record_dir = self.run_dir / OVERSEER_DIR / _generation_dirname(generation)
         record_dir.mkdir(parents=True)
-        brief = OverseerBrief(
-            incumbent=incumbent.candidate,
-            metric=self.suite.metric(),
-            suite_description=self.suite.describe(),
-            valves=self.adapter.describe_valves(),
-            selection_rule=describe_rule(self.config.promotion_margin),
-            generation=generation,
-            incumbent_report=incumbent.eval_dir / REPORT_FILE,
-            evidence_dir=incumbent.eval_dir / TRIALS_DIR,
-            history=[dict(row) for row in self.rows],
-        )
         LOGGER.info("generation %d: asking overseer %s to improve %s", generation, self.overseer.name,
                     incumbent.candidate.id)  # fmt: skip
-
-        proposal, archived_candidate = self._propose(brief, record_dir)
+        # The overseer gets copies, never the run's own files: nothing it writes can change a
+        # snapshot that is scored later or the evidence later generations are briefed with.
+        with tempfile.TemporaryDirectory(prefix=BRIEF_PREFIX, ignore_cleanup_errors=True) as bundle:
+            bundle_dir = Path(bundle).resolve()
+            shutil.copy2(incumbent.eval_dir / REPORT_FILE, bundle_dir / REPORT_FILE)
+            evidence = incumbent.eval_dir / TRIALS_DIR
+            if evidence.is_dir():
+                shutil.copytree(evidence, bundle_dir / TRIALS_DIR, symlinks=True)
+            brief = OverseerBrief(
+                incumbent=incumbent.candidate.copy_to(bundle_dir / "incumbent"),
+                metric=self.suite.metric(),
+                suite_description=self.suite.describe(),
+                valves=self.adapter.describe_valves(),
+                selection_rule=describe_rule(self.config.promotion_margin),
+                generation=generation,
+                incumbent_report=bundle_dir / REPORT_FILE,
+                evidence_dir=bundle_dir / TRIALS_DIR,
+                history=[dict(row) for row in self.rows],
+            )
+            proposal, archived_candidate = self._propose(brief, record_dir)
         overseer_cost = _checked_cost(proposal, self.overseer.name)
         self.spent_usd += overseer_cost
 
@@ -325,6 +367,13 @@ class _Experiment:
             earlier = self.evaluated[child.id]
             row["child_selection_score"] = earlier.report.selection_score
             row["child_measured_mean"] = earlier.report.measured_mean
+        elif status == STATUS_EVALUATED and not self._fits(self._estimate("search")):
+            row["status"] = STATUS_OVER_BUDGET
+            row["reason"] = (
+                f"a search evaluation (~${self._estimate('search'):.4f}) would not fit under the cap "
+                f"(${self.spent_usd:.4f} spent of ${self.config.max_usd:.4f}); not evaluated"
+            )
+            self.budget_exhausted = True
         elif status == STATUS_EVALUATED:
             snapshot_candidate = self._snapshot_child(child, incumbent.candidate, proposal.rationale)
             spent_before = self.spent_usd
@@ -344,7 +393,7 @@ class _Experiment:
         self.rows.append(row)
         with (self.run_dir / GENERATIONS_FILE).open("a") as handle:
             handle.write(json.dumps(row) + "\n")
-        LOGGER.info("generation %d: %s%s; %s", generation, status, " (promoted)" if row["promoted"] else "",
+        LOGGER.info("generation %d: %s%s; %s", generation, row["status"], " (promoted)" if row["promoted"] else "",
                     row["reason"])  # fmt: skip
         return next_incumbent
 
@@ -418,19 +467,20 @@ class _Experiment:
         result: dict[str, Any] = {"seed": None, "final": None, "skipped_reason": None}
         if not self.suite.tasks("heldout"):
             result["skipped_reason"] = "the suite has no held-out tasks"
-        elif self.spent_usd >= self.config.max_usd:
+        elif not self._fits(self._estimate("heldout")):
             result["skipped_reason"] = (
-                f"budget exhausted before the held-out evaluation (spent ${self.spent_usd:.4f} "
-                f"of ${self.config.max_usd:.4f})"
+                f"budget: a held-out evaluation (~${self._estimate('heldout'):.4f}) would not fit under the cap "
+                f"(spent ${self.spent_usd:.4f} of ${self.config.max_usd:.4f})"
             )
         else:
             result["seed"] = self._heldout_entry(seed, "seed")
             if final.id == seed.id:
                 result["final"] = {**result["seed"], "same_report_as_seed": True}
-            elif self.spent_usd >= self.config.max_usd:
+            elif not self._fits(self._estimate("heldout")):
                 result["skipped_reason"] = (
-                    f"budget exhausted after the seed's held-out evaluation (spent ${self.spent_usd:.4f} "
-                    f"of ${self.config.max_usd:.4f}); the final incumbent was not scored on held-out"
+                    f"budget: after the seed's held-out evaluation, another (~${self._estimate('heldout'):.4f}) "
+                    f"would not fit under the cap (spent ${self.spent_usd:.4f} of ${self.config.max_usd:.4f}); "
+                    "the final incumbent was not scored on held-out"
                 )
             else:
                 result["final"] = {**self._heldout_entry(final, "final"), "same_report_as_seed": False}
@@ -463,6 +513,25 @@ def _check_splits(suite: Suite) -> None:
         raise LoopError(f"suite {suite.name!r} breaks the split walls: {'; '.join(overlaps)}")
     if not suite.tasks("search"):
         raise LoopError(f"suite {suite.name!r} has no tasks in the search split")
+
+
+def _check_temp_dir_outside_git() -> None:
+    """Overseer workspaces are temp dirs; inside a git checkout, Claude Code would load that repo's CLAUDE.md."""
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    for directory in (temp_root, *temp_root.parents):
+        if (directory / ".git").exists():
+            raise LoopError(
+                f"the temp dir {temp_root} is inside the git checkout {directory}; overseer workspaces must live "
+                "outside any repository, so point TMPDIR somewhere else"
+            )
+
+
+def _verify_intact(candidate: Candidate) -> None:
+    """A snapshot is scored under its id, so its files must still hash to that id (P4)."""
+    if content_hash(candidate.root) != candidate.id:
+        raise LoopError(
+            f"candidate snapshot {candidate.id} changed on disk ({candidate.root}); refusing to score it under a stale id"
+        )
 
 
 def _checked_cost(proposal: Proposal, overseer_name: str) -> float:
@@ -511,6 +580,22 @@ def _git_commit() -> str | None:
         return None
     commit = completed.stdout.strip()
     return commit if completed.returncode == 0 and commit else None
+
+
+def _git_dirty() -> bool | None:
+    """Whether the HIVE checkout had uncommitted changes, so a commit hash alone can't be trusted (P13)."""
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return bool(completed.stdout.strip()) if completed.returncode == 0 else None
 
 
 def _utc_now() -> datetime.datetime:
