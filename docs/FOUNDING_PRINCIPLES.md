@@ -158,7 +158,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 ### P11. The search space is written down, and topology is in it
 
 **Rule:**
-- Each adapter publishes a `describe_schema()` text that lists every valve the overseer may edit. That text goes into the proposer prompt verbatim, and changes to it are versioned like code.
+- Each agent adapter publishes a `describe_valves()` text that lists every valve the overseer may edit. That text goes into the overseer brief verbatim, and changes to it are versioned like code.
 - Topology valves (roles, delegation edges, fan-out, depth, coordination rules) are listed first.
 - The controller enforces **valve diversity** across generations, so the overseer can't keep circling one idea.
 
