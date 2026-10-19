@@ -91,6 +91,23 @@
   The 20 findings that don't depend on the fix are being fixed in parallel: key via stdin, call limits, name and tool collisions, load-report precedence, attribution, validators, Pi compaction usage, setsid escapes.
 - 2026-10-19: **Decision (user): build a controller-side model gateway now.** **Decision (user): no real Deep Agents / Strands runs by me;** the user will export `OPENAI_API_KEY`.
 
+- 2026-10-19: Gateway built and attacked. Tests use a fake upstream and real OpenAI SDKs (openai 2.x/3.x, langchain-openai).
+  - **It held against 14 attack families:** auth, path desync, duplicate keys, model/effort lookalikes, limit races, revocation, key echo, disconnect billing.
+  - **Two gaps, fixed by me test-first:**
+    - Hosted tools (web/file search, code interpreter) bill outside token usage. Only function and custom tools are allowed now.
+    - One trial could pin unbounded gateway threads. Now there is a per-trial in-flight cap and a 30 s client timeout.
+  - **The builder's own additions:** a `background` refusal, forced `include_usage`, billing of incomplete/failed responses, `usage_missing` flags, and key scrubbing of relayed bytes.
+- 2026-10-19: Independent review fixes landed and were rechecked.
+  - **Key:** sent on stdin (never in the runner's environment); shell children get a minimal environment.
+  - **Call limits:** counted per provider request in the callback, shared with subagents. The subagent recursion limit is bound.
+  - **Collisions:** extension name and tool collisions are rejected.
+  - **Load reports:** the report is omitted until the load phase has run.
+  - **Trial marker:** a per-trial marker kills `setsid` escapes.
+  - **Pi:** `before_provider_request` is rejected statically, and compaction usage is estimated.
+  - **Limits the recheck confirmed that only containers close** (recorded, not fixed):
+    - On macOS, system binaries hide their environment, so a `setsid` escape via `/bin/*` can survive the marker sweep.
+    - On the host, any same-user process can read any other's exec environment (`ps eww`). The recheck saw a real OpenAI key in two unrelated long-running processes on this machine, and the user was told. So the controller's own `OPENAI_API_KEY` is readable by agent shells too. The gateway keeps the key out of trial processes, but not out of reach of the host. The real boundary is running trials in containers or as a separate OS user.
+
 ## Model gateway (spec)
 
 **Why.** Model access is where P3 (frozen model), P12 (spend) and key secrecy are decided. Today all three are decided inside the trial process, next to candidate code, so they can only be detected. Moving them into the controller makes them a boundary, the same for every framework.
