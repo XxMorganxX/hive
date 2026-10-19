@@ -30,11 +30,11 @@ Use these words in code and docs with exactly these meanings.
 | **Harness spec** | A directory that fully describes one harness. It is content-hashed, and that hash is the **candidate id**. |
 | **Candidate** | One harness spec under evaluation, plus its lineage (parents, origin, rationale). |
 | **Seed** | The starting candidate for a search. Usually the stock single-agent baseline. |
-| **Adapter** | The only code that knows a framework's native format. It turns a harness spec into a runnable Harbor agent. |
+| **Adapter** | The only code that knows a framework's native format. It validates a candidate and builds it into a runnable agent behind the `Agent` contract. |
 | **Topology** | The roles in a multi-agent harness, who can talk to whom, and the coordination rules. A first-class part of the harness spec. |
 | **Valve** | One editable aspect of a harness that the overseer may change (a prompt section, a hook, a role, a fan-out limit). |
 | **Suite** | A set of tasks for one use case, plus its scoring rule. A suite is split into **search**, **validation** and **held-out** sets. |
-| **Task** | One Harbor task: instruction, environment, verifier. |
+| **Task** | One unit of evaluation: an instruction plus optional workspace files. The suite that owns the task holds its grader, and the agent never sees answers or hidden tests. |
 | **Trial** | One run of one candidate on one task. A task is run **k** times. |
 | **Outcome** | The scored result of a task for one candidate: status, reward, cost, tokens, trace pointer. |
 | **Experience store** | The append-only directory the overseer reads: every candidate's spec, scores and raw traces. |
@@ -74,11 +74,21 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 
 **Why:** content addressing makes it easy to deduplicate, diff and resume candidates, and one loop can drive any framework. A re-proposed candidate is never paid for twice.
 
-### P5. One swap boundary, and it's Harbor's
+### P5. Three swap boundaries, and HIVE owns them
 
-**Rule:** every framework enters through a Harbor agent (`BaseAgent` / `BaseInstalledAgent`), loaded by `module:Class`. Framework-specific code stays inside its adapter. Nothing outside an adapter imports a framework.
+**Rule:**
+- Every role that can be swapped has one small contract in `hive/contracts.py`:
+  - **`AgentAdapter` / `Agent`:** frameworks (Pi, Strands, Deep Agents, …).
+  - **`Suite`:** evaluation use cases.
+  - **`Overseer`:** the improvement strategy (Claude Code, a null control, …).
+- Implementations are chosen by name in the experiment config through one registry.
+- Framework-specific code stays inside its adapter, and nothing outside an adapter imports a framework.
+- Harbor plugs in **behind** these contracts: as a `Suite` that runs Harbor datasets in Docker, and as an execution backend for agents.
 
-**Why:** Harbor already provides sandboxing, concurrency, verifiers, the dataset registry and ATIF traces, and it has built-in agents for Pi, Strands and LangGraph. The framework research converged on this boundary independently. Building our own would mean rebuilding Harbor. ([harbor](research/harbor-and-meta-harness.md))
+**Why:**
+- Evaluation tasks must be abstract and universal. A 10-line exact-answer check and a Terminal-Bench container task should both satisfy the same suite contract.
+- Harbor's `BaseAgent` is execution-shaped. It would tie every suite to containers and every task to Harbor's directory layout.
+- Keeping Harbor as an implementation keeps everything it offers (sandboxing, the dataset registry, ATIF traces, built-in Pi/Strands/LangGraph agents) without making it the definition of a task. ([harbor](research/harbor-and-meta-harness.md))
 
 ### P6. Traces are raw, complete, and never scored
 
@@ -134,7 +144,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 ### P10. The overseer reads everything and writes one thing
 
 **Rule:**
-- The optimizer runs headless with read-only access to the experience store. It writes only a proposals file.
+- The overseer runs headless in a scratch workspace. It reads a copy of the evidence and edits an isolated copy of the candidate. The controller harvests only that copy and a rationale.
 - Each proposed candidate makes **one isolated change** and contains no task names, ids or answers.
 - Each one carries a rationale: "observed …; changed …; expected to transfer because …".
 - The controller validates (schema, typecheck, a real load check), runs a smoke test, then scores.
