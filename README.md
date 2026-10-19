@@ -49,7 +49,7 @@ Each role has one contract in [`hive/contracts.py`](hive/contracts.py). A new im
 | Evaluation suite | `Suite` (describe, metric, tasks, grade) | the experiment's `[suite] name` | `exact_answer`, `python_functions` |
 | Overseer | `Overseer` (propose from an `OverseerBrief`) | the experiment's `[overseer] kind` | `claude_code`, `null` (noise control) |
 
-**Swapping suites** is a one-line change in the experiment file. For example, `experiments/pi-exact-answer.toml` and `experiments/pi-python-functions.toml` differ only in `[suite] name` and a timeout.
+**Swapping suites** is a one-line change in the experiment file. For example, `experiments/pi-exact-answer.toml` and `experiments/pi-python-functions.toml` differ only in the experiment name, `[suite] name` and the agent timeout.
 
 ```bash
 uv run hive validate harnesses/pi-baseline   # check a candidate against its adapter
