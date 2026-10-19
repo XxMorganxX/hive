@@ -15,6 +15,25 @@ classifies runs the same way:
 - `result.json`, written once at the end:
       {"status": "completed" | "errored", "final_text", "error", "error_class",
        "extensions": [{"path", "loaded", "error", "registered"}], "runtime_errors": [...]}
+  The runner writes "extensions" only once its load phase has run, and leaves the key out
+  when the run failed before it (a broken import, a model that could not be built). Absent,
+  the run has no load report, so the controller keeps the runner's own error instead of
+  calling it a load failure (hive.extensions.load_problem). An entry with "loaded": false
+  needs an "error": an errored run's load report counts against the candidate only where a
+  file failed with a reason.
+
+How a runner is started, and what it must do with what it is given:
+
+- Credentials never travel in the runner's environment, where every shell command the agent
+  runs could read them (`env`, `ps eww -p $PPID`). The adapter sends one JSON line on stdin,
+  `{"credentials": {"OPENAI_API_KEY": "..."}}`, through run_process_group(stdin_text=...).
+  The runner reads stdin to EOF and closes it first thing, before importing any candidate
+  code, passes each key explicitly to its client's constructor (`api_key=...`), and never
+  sets it in os.environ.
+- Shell and tool children get an explicit minimal environment, without the credentials.
+  It must still carry hive.agents.process.TRIAL_MARKER_ENV from the runner's environment:
+  the marker is how the controller finds and kills a command that left every process group
+  it knows of (see hive/agents/process.py).
 
 Neither framework computes dollars, so cost comes from the experiment's price table.
 """
@@ -161,7 +180,9 @@ def _read_result(path: Path) -> dict[str, Any] | None:
     return result if isinstance(result, dict) else None
 
 
-def _load_report(result: Mapping[str, Any]) -> LoadReport:
+def _load_report(result: Mapping[str, Any]) -> LoadReport | None:
+    if "extensions" not in result:  # the runner never reached its load phase
+        return None
     loads = []
     for entry in result.get("extensions") or ():
         if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str):

@@ -26,21 +26,33 @@ def expected_extension_files(candidate: Candidate, spec: ExtensionSpec | None) -
     ]
 
 
-def load_problem(expected: Sequence[str], report: LoadReport | None) -> tuple[str, str] | None:
-    """(error_class, detail) when the run did not run the candidate's extensions as written."""
-    if expected and report is None:
+def load_problem(
+    expected: Sequence[str], report: LoadReport | None, *, run_errored: bool = False
+) -> tuple[str, str] | None:
+    """(error_class, detail) when the run did not run the candidate's extensions as written.
+
+    A completed run must account for every expected file: missing from the report, or marked
+    not loaded, is a load failure. A run that errored may have stopped before it loaded
+    anything (a runner crash, a framework that never started, a timeout), so its report is
+    evidence against the candidate only where it affirmatively says a file failed: marked not
+    loaded with a reason. Without one, a missing report or entry is explained by the run's
+    own error. Runtime errors count either way: the code ran and threw.
+    """
+    if expected and report is None and not run_errored:
         return "harness_load_error", f"the adapter returned no load report for {len(expected)} extension file(s)"
     if report is None:
         return None
     by_path = {load.path: load for load in report.extensions}
     failures = []
+    affirmative = False
     for path in expected:
         load = by_path.get(path)
         if load is None:
             failures.append(f"{path}: not loaded (absent from the load report)")
         elif not load.loaded:
             failures.append(f"{path}: failed to load: {load.error or 'no reason given'}")
-    if failures:
+            affirmative = affirmative or load.error is not None
+    if failures and (affirmative or not run_errored):
         return "harness_load_error", "; ".join(failures)
     if report.runtime_errors:
         return "extension_error", "extension code threw during the run: " + "; ".join(report.runtime_errors)
@@ -83,7 +95,8 @@ def render_extension_guide(spec: ExtensionSpec | None) -> str:
             )
     if spec.forbidden:
         lines += ["", "## Never use", ""]
-        lines += [f"- `{api}`" for api in spec.forbidden]
+        # Plain bullets: an entry is Markdown and carries its own code spans.
+        lines += [f"- {entry}" for entry in spec.forbidden]
     if spec.api_reference:
         lines += ["", f"## API reference (pinned, {spec.framework_version})", "", spec.api_reference.rstrip()]
     return "\n".join(lines) + "\n"

@@ -90,6 +90,45 @@ def test_runtime_errors_count_even_when_no_files_were_expected():
     assert error_class == "extension_error"
 
 
+# An errored run may have stopped before its extensions loaded (a runner crash, Pi failing to
+# start, a timeout before the load phase). Only an affirmative failure, a file reported not
+# loaded with a reason, is evidence against the candidate then.
+
+
+def test_errored_run_without_a_report_is_not_a_load_problem():
+    assert load_problem(["extensions/a.py"], None, run_errored=True) is None
+
+
+def test_errored_run_whose_report_leaves_out_an_extension_is_not_a_load_problem():
+    assert load_problem(["extensions/a.py"], report(), run_errored=True) is None
+
+
+def test_errored_run_with_a_file_marked_not_loaded_without_a_reason_is_not_a_load_problem():
+    # Strands' records start as loaded=False with no error until the load phase runs.
+    assert load_problem(["extensions/a.py"], report(ExtensionLoad("extensions/a.py", False)), run_errored=True) is None
+
+
+def test_errored_run_with_a_file_that_failed_to_load_is_a_load_error():
+    error_class, detail = load_problem(
+        ["extensions/a.py", "extensions/b.py"],
+        report(ExtensionLoad("extensions/a.py", False, "SyntaxError")),
+        run_errored=True,
+    )
+    assert error_class == "harness_load_error"
+    assert "extensions/a.py: failed to load: SyntaxError" in detail
+
+
+def test_errored_run_with_runtime_errors_is_still_an_extension_error():
+    error_class, _ = load_problem(["extensions/a.py"], report(runtime_errors=("boom",)), run_errored=True)
+    assert error_class == "extension_error"
+
+
+def test_completed_run_with_a_file_marked_not_loaded_without_a_reason_is_a_load_error():
+    error_class, detail = load_problem(["extensions/a.py"], report(ExtensionLoad("extensions/a.py", False)))
+    assert error_class == "harness_load_error"
+    assert "no reason given" in detail
+
+
 # --- the guide for the overseer ----------------------------------------------------------------
 
 
@@ -114,6 +153,13 @@ def test_guide_lists_every_neutral_lifecycle_point_with_its_support():
 
 def test_guide_lists_forbidden_apis():
     assert "agent.model = ..." in render_extension_guide(SPEC)
+
+
+def test_guide_renders_forbidden_entries_as_plain_bullets_so_their_own_markdown_survives():
+    spec = ExtensionSpec(**{**SPEC.__dict__, "forbidden": ("assigning `agent.model`", "`pi.setModel`")})
+    guide = render_extension_guide(spec)
+    assert "\n- assigning `agent.model`\n" in guide
+    assert "\n- `pi.setModel`\n" in guide
 
 
 def test_no_spec_gives_an_empty_guide():

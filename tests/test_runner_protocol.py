@@ -12,7 +12,7 @@ from hive.agents.runner_protocol import (
     model_matches,
     parse_prices,
 )
-from hive.contracts import ModelSpec, Usage
+from hive.contracts import LoadReport, ModelSpec, Usage
 
 MODEL = ModelSpec(provider="openai", id="gpt-5-nano", thinking="low")
 PRICES = Prices(input=0.05, output=0.40, cache_read=0.005, cache_write=0.0)
@@ -123,6 +123,22 @@ def test_load_report_comes_from_the_runner_result(tmp_path):
     assert report.extensions[0].path == "extensions/guard.py"
     assert report.extensions[0].registered == ("before_tool_call",)
     assert report.runtime_errors == ("extensions/guard.py: KeyError",)
+
+
+def test_a_result_without_an_extensions_key_has_no_load_report(tmp_path):
+    # The runner never reached its load phase, so it has nothing to report about extensions.
+    write_trace(tmp_path, call())
+    result = {"status": "errored", "final_text": "", "error": "the runner failed: ImportError",
+              "error_class": "agent_error", "runtime_errors": []}  # fmt: skip
+    (tmp_path / RESULT_FILE).write_text(json.dumps(result))
+    interpreted = interpret(tmp_path)
+    assert interpreted.error_class == "agent_error"
+    assert interpreted.load_report is None
+
+
+def test_an_empty_extensions_list_is_a_load_report_with_no_entries(tmp_path):
+    write_result(tmp_path, extensions=[])
+    assert interpret(tmp_path).load_report == LoadReport()
 
 
 # --- runs that did not finish normally ---------------------------------------------------------

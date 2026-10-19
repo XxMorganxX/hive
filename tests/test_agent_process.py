@@ -1,10 +1,11 @@
 import os
+import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
 
-from hive.agents.process import run_process_group
+from hive.agents.process import TRIAL_MARKER_ENV, run_process_group
 
 
 def script(tmp_path: Path, body: str) -> list[str]:
@@ -121,3 +122,83 @@ def test_missing_binary_is_a_launch_error_not_an_exception(tmp_path):
     outcome = run_process_group(["/nonexistent/binary"], stdout_path=tmp_path / "out.txt", stderr_path=tmp_path / "err.txt", cwd=tmp_path, env=dict(os.environ), timeout_s=5)
     assert outcome.launch_error is not None
     assert outcome.returncode is None
+
+
+# --- processes that left the trial's groups ------------------------------------------------
+#
+# A command that daemonizes (fork + setsid) or a process an extension starts in a session of
+# its own gets a process group nobody lists. The trial marker finds them anyway.
+
+
+def test_the_trial_process_carries_a_unique_trial_marker(tmp_path):
+    argv = script(tmp_path, f"import os; print(os.environ.get({TRIAL_MARKER_ENV!r}, ''))")
+    first = run_process_group(argv, stdout_path=tmp_path / "1.txt", stderr_path=tmp_path / "e1.txt", cwd=tmp_path, env=dict(os.environ), timeout_s=10)
+    second = run_process_group(argv, stdout_path=tmp_path / "2.txt", stderr_path=tmp_path / "e2.txt", cwd=tmp_path, env=dict(os.environ), timeout_s=10)
+    assert first.stdout.strip() and second.stdout.strip()
+    assert first.stdout != second.stdout
+
+
+def test_a_marker_in_the_given_environment_is_replaced_by_this_trials_own(tmp_path):
+    argv = script(tmp_path, f"import os; print(os.environ[{TRIAL_MARKER_ENV!r}])")
+    outcome = run_process_group(argv, stdout_path=tmp_path / "out.txt", stderr_path=tmp_path / "err.txt", cwd=tmp_path, env={**os.environ, TRIAL_MARKER_ENV: "stale"}, timeout_s=10)
+    assert outcome.stdout.strip() not in (b"", b"stale")
+
+
+DAEMONIZING_GRANDCHILD = """
+    import os, sys, time
+    # The classic daemonize: fork, setsid in the child, let the parent exit. The grandchild
+    # leads a new session and group that nobody lists in child_pgids.txt.
+    if os.fork() == 0:
+        os.setsid()
+        if os.fork() == 0:
+            open({pid_file!r}, "w").write(str(os.getpid()))
+            time.sleep(60)
+        os._exit(0)
+    time.sleep(0.5)
+    """
+
+
+def test_a_grandchild_that_calls_setsid_is_reaped_after_a_normal_exit(tmp_path):
+    pid_file = tmp_path / "daemon_pid"
+    pgids = tmp_path / "child_pgids.txt"  # stays empty: the daemon is never listed
+    argv = script(tmp_path, DAEMONIZING_GRANDCHILD.format(pid_file=str(pid_file)))
+    outcome = run_process_group(argv, stdout_path=tmp_path / "out.txt", stderr_path=tmp_path / "err.txt", cwd=tmp_path, env=dict(os.environ), timeout_s=10, extra_pgids_file=pgids)
+    assert outcome.returncode == 0, outcome.stderr
+    assert wait_dead(int(pid_file.read_text()))
+
+
+def test_a_grandchild_that_calls_setsid_is_reaped_after_a_timeout(tmp_path):
+    pid_file = tmp_path / "daemon_pid"
+    argv = script(tmp_path, DAEMONIZING_GRANDCHILD.format(pid_file=str(pid_file)).rstrip() + "\n    time.sleep(60)\n")
+    outcome = run_process_group(argv, stdout_path=tmp_path / "out.txt", stderr_path=tmp_path / "err.txt", cwd=tmp_path, env=dict(os.environ), timeout_s=2, term_grace_s=0.5)
+    assert outcome.timed_out
+    assert wait_dead(int(pid_file.read_text()))
+
+
+def test_an_unlisted_child_started_in_its_own_session_is_reaped(tmp_path):
+    # What an extension does with subprocess.Popen(..., start_new_session=True). `sleep` is a
+    # system binary, whose environment macOS hides; it is found as a child of the trial.
+    pid_file = tmp_path / "sleeper_pid"
+    argv = script(
+        tmp_path,
+        f"""
+        import subprocess, time
+        child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        open({str(pid_file)!r}, "w").write(str(child.pid))
+        time.sleep(1.5)
+        """,
+    )
+    outcome = run_process_group(argv, stdout_path=tmp_path / "out.txt", stderr_path=tmp_path / "err.txt", cwd=tmp_path, env=dict(os.environ), timeout_s=10)
+    assert outcome.returncode == 0, outcome.stderr
+    assert wait_dead(int(pid_file.read_text()))
+
+
+def test_processes_outside_the_trial_are_left_alone(tmp_path):
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        argv = script(tmp_path, "print('done')")
+        run_process_group(argv, stdout_path=tmp_path / "out.txt", stderr_path=tmp_path / "err.txt", cwd=tmp_path, env=dict(os.environ), timeout_s=10)
+        assert alive(bystander.pid)
+    finally:
+        bystander.kill()
+        bystander.wait()

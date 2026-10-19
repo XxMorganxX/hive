@@ -888,11 +888,11 @@ def test_completed_run_whose_report_leaves_out_an_extension_is_harness_load_erro
 
 
 @pytest.mark.parametrize("error_class", ["timeout", "quota", "provider_error", "agent_error", "extension_error"])
-def test_a_failed_load_replaces_the_class_and_detail_of_an_errored_run(extended_candidate, tmp_path, error_class):
+def test_a_failed_load_replaces_the_class_of_an_errored_run_and_keeps_its_detail(extended_candidate, tmp_path, error_class):
     trial = run_extended(extended_candidate, errored_result(error_class, guard_failed()), tmp_path)
     assert trial.error_class == "harness_load_error"
-    assert "extensions/guard.py" in trial.detail
-    assert "the agent's own message" not in trial.detail
+    assert trial.detail.startswith("extensions/guard.py: failed to load: SyntaxError: bad")
+    assert f"(the agent reported {error_class}: the agent's own message)" in trial.detail
     assert (trial.usage, trial.wall_clock_s) == (SPENT, 4.0)
 
 
@@ -928,6 +928,33 @@ def test_extension_code_that_threw_turns_an_agent_error_into_extension_error(ext
     trial = run_extended(extended_candidate, errored_result("agent_error", all_loaded("guard.py threw")), tmp_path)
     assert trial.error_class == "extension_error"
     assert "guard.py threw" in trial.detail
+    assert "(the agent reported agent_error: the agent's own message)" in trial.detail
+
+
+def not_reached() -> LoadReport:
+    """What a runner that failed before its load phase reports: no entries at all."""
+    return LoadReport()
+
+
+def unattempted() -> LoadReport:
+    """Strands-style records written before the load phase: not loaded, no reason."""
+    return LoadReport(extensions=tuple(ExtensionLoad(path=path, loaded=False) for path in EXTENSION_FILES))
+
+
+@pytest.mark.parametrize("error_class", ["timeout", "quota", "provider_error", "agent_error"])
+@pytest.mark.parametrize("report", [not_reached(), unattempted()], ids=["no_entries", "no_reasons"])
+def test_an_errored_run_whose_report_shows_no_load_failure_keeps_its_own_class(
+    extended_candidate, tmp_path, error_class, report
+):
+    # The runner failed before it loaded anything; its own error is the cause, not the extensions.
+    trial = run_extended(extended_candidate, errored_result(error_class, report), tmp_path)
+    assert (trial.error_class, trial.detail) == (error_class, "the agent's own message")
+
+
+def test_a_completed_run_whose_report_has_no_entries_is_harness_load_error(extended_candidate, tmp_path):
+    trial = run_extended(extended_candidate, completed_with(not_reached()), tmp_path)
+    assert trial.error_class == "harness_load_error"
+    assert "absent from the load report" in trial.detail
 
 
 def test_extension_code_that_threw_turns_an_unknown_error_class_into_extension_error(extended_candidate, tmp_path):

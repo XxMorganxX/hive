@@ -21,16 +21,20 @@ report: an evaluation aborted by Ctrl-C or a crash has still spent money, and th
 budget record must include it (P12).
 
 Extensions are checked here, not trusted to the adapter (§5.2, P8). Every extension file
-the adapter's ExtensionSpec matches in the candidate must appear loaded in the run's
-LoadReport, or the trial is `harness_load_error`; extension code that threw mid-run makes
-it `extension_error`. Both are errors, so they score 0 in selection. Precedence:
+the adapter's ExtensionSpec matches in the candidate must appear loaded in a completed run's
+LoadReport, or the trial is `harness_load_error` (an errored run is held to less; see
+below); extension code that threw mid-run makes it `extension_error`. Both are errors, so
+they score 0 in selection. Precedence:
 
 - `model_mismatch` outranks everything: that run is not part of the experiment at all (P3).
-- A report that shows an extension not loaded replaces any other class: the candidate did
-  not run as written, so the agent's own account of what went wrong is not about it.
-- A missing report only matters for a completed run. A run that errored (a timeout kill,
-  a crash) may never have reached the point of writing one, and calling that a load
-  failure would point the overseer at the wrong cause.
+- A report that shows an extension failed to load (marked not loaded, with a reason)
+  replaces any other class: the candidate did not run as written. The agent's own account
+  is kept after the load detail, since it may name the real cause.
+- A missing report, a file missing from it, or a file marked not loaded without a reason
+  only matters for a completed run. A run that errored (a timeout kill, a runner crash, a
+  framework that never started) may never have reached its load phase, and calling that a
+  load failure would point the overseer at the wrong cause. The rule is
+  hive.extensions.load_problem's, so adapters that apply it agree with the controller.
 - `extension_error` replaces `completed` and `agent_error` (the throw is the likely cause
   of the crash), but not `timeout`, `quota` or `provider_error`, which happen around the
   candidate's code rather than in it.
@@ -516,11 +520,9 @@ def _apply_load_check(
     """The trial's (error class or None for completed, detail) after the controller's extension check."""
     if error_class == "model_mismatch":  # P3 outranks everything
         return error_class, detail
-    if error_class is not None and load_report is None:
-        # An errored run may have died before it could report (a timeout kill writes nothing);
-        # the absence is explained by its own error. A completed run has no such excuse.
-        return error_class, detail
-    problem = load_problem(expected_extensions, load_report)
+    # An errored run may have died before its extensions loaded (a timeout kill, a runner
+    # crash, a framework that never started), so only an affirmative failure counts there.
+    problem = load_problem(expected_extensions, load_report, run_errored=error_class is not None)
     if problem is None:
         return error_class, detail
     problem_class, problem_detail = problem
@@ -529,6 +531,9 @@ def _apply_load_check(
     # account of an extension or model problem.
     if problem_class == "extension_error" and error_class not in (None, "agent_error"):
         return error_class, detail
+    if error_class is not None and detail:
+        # Keep the agent's own account: it may name a cause the load report does not.
+        problem_detail = f"{problem_detail} (the agent reported {error_class}: {detail})"
     return problem_class, problem_detail
 
 
