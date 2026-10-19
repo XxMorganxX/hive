@@ -67,6 +67,20 @@ def test_copy_to_preserves_id_and_content(tmp_path):
     assert (copy.root / "extensions" / "x.ts").read_text() == "export {}"
 
 
+def test_copy_to_drops_files_that_are_not_part_of_the_id(tmp_path):
+    # Whatever ships with a candidate must be covered by its id, or an edit could hide from dedup and diffs.
+    root = write_candidate(tmp_path / "a", extra={".hidden/payload.ts": "x", "__pycache__/m.pyc": "x"})
+    copy = Candidate.load(root).copy_to(tmp_path / "copy")
+    assert not (copy.root / ".hidden").exists()
+    assert not (copy.root / "__pycache__").exists()
+
+
+def test_copy_to_keeps_lineage(tmp_path):
+    original = Candidate.load(write_candidate(tmp_path / "a"))
+    original.write_lineage(parents=["p"], origin="seed", rationale="r")
+    assert original.copy_to(tmp_path / "copy").lineage() == original.lineage()
+
+
 def test_copy_to_refuses_existing_destination(tmp_path):
     original = Candidate.load(write_candidate(tmp_path / "a"))
     (tmp_path / "taken").mkdir()

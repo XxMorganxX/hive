@@ -108,5 +108,9 @@ class Candidate:
         dest = Path(dest)
         if dest.exists():
             raise CandidateError(f"refusing to copy candidate onto existing path {dest}")
-        shutil.copytree(self.root, dest, ignore=shutil.ignore_patterns("__pycache__", ".DS_Store"))
+        # Copy exactly what the id covers (plus lineage), so nothing can ship without changing the id.
+        def not_part_of_candidate(directory: str, names: list[str]) -> set[str]:
+            return {name for name in names if name != LINEAGE and _is_ignored(Path(name))}
+
+        shutil.copytree(self.root, dest, ignore=not_part_of_candidate)
         return Candidate.load(dest)
