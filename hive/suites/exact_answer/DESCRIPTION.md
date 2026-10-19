@@ -26,12 +26,11 @@ Only the agent's final text is graded. Reasoning before that line is allowed and
 
 ## Grading rules
 
-1. **Find the answer line.** The grader takes the **last** line of the final text that contains `ANSWER:` (case-insensitive). Text on that line before `ANSWER:` is ignored, so markdown such as `**ANSWER:** x` or a line wrapped in backticks still works. If no line contains `ANSWER:`, the reward is 0. An answer on the line after an empty `ANSWER:` is not read.
+1. **Find the answer line.** An answer line is a line that **starts** with the marker `ANSWER:` (case-insensitive). Before the word `ANSWER`, only whitespace and the markdown characters `#`, `>`, `*`, `_`, `` ` `` and `-` may appear. Between `ANSWER` and the colon, only whitespace, `*`, `_` and `` ` `` may appear. Any `*`, `_` or `` ` `` directly after the colon is part of the marker. So `**ANSWER:** x`, `**ANSWER**: x`, `## ANSWER: x`, `> ANSWER: x`, `- ANSWER: x` and `` `ANSWER: x` `` all work, but a line with any other text before the marker, such as `So my final ANSWER: x` or `Note: my answer: ...`, is not an answer line. The grader reads the **last** answer line in the final text, so prose after it never replaces it. If there is no answer line, the reward is 0. An answer on the line after an empty `ANSWER:` is not read.
 2. **Normalize** the text after the marker, and each accepted answer, the same way:
-   - trim surrounding whitespace;
+   - remove surrounding whitespace (any Unicode whitespace, including no-break spaces) and surrounding quotes (`"`, `'`, curly quotes), backticks and asterisks, repeating until neither end changes;
+   - remove one trailing period, then repeat the previous step, so `**x**.` and `**x.**` both become `x`;
    - lowercase;
-   - remove surrounding quotes (`"`, `'`, curly quotes), backticks and asterisks;
-   - remove one trailing period;
    - collapse runs of internal whitespace to a single space.
 3. **Compare.**
    - **Text tasks:** the normalized answer must equal one accepted answer exactly. Extra words fail.

@@ -155,9 +155,40 @@ def test_backticks_around_the_whole_line_are_tolerated(tmp_path):
     assert grade_text(suite, only_task(suite), "`ANSWER: 4`", tmp_path).reward == 1.0
 
 
-def test_answer_text_after_a_prefix_on_the_same_line_is_used(tmp_path):
+def test_prose_before_the_marker_means_the_line_is_not_an_answer_line(tmp_path):
     suite = suite_with(tmp_path, [task_row()])
-    assert grade_text(suite, only_task(suite), "So my final ANSWER: 4", tmp_path).reward == 1.0
+    grade = grade_text(suite, only_task(suite), "So my final ANSWER: 4", tmp_path)
+    assert grade.reward == 0.0
+    assert grade.detail == 'no "ANSWER:" line found'
+
+
+def test_later_prose_containing_answer_colon_does_not_replace_the_answer_line(tmp_path):
+    suite = suite_with(tmp_path, [task_row()])
+    text = "ANSWER: 4\n\nNote: my answer: is based on adding the two numbers."
+    grade = grade_text(suite, only_task(suite), text, tmp_path)
+    assert grade.reward == 1.0, grade.detail
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "**ANSWER:** 4",
+        "**ANSWER**: 4",
+        "ANSWER: 4.",
+        "## ANSWER: 4",
+        "> ANSWER: 4",
+        "- ANSWER: 4",
+        "* ANSWER: 4",
+        "_ANSWER:_ 4",
+        "`ANSWER: 4`",
+        "   ANSWER: 4",
+        "ANSWER : 4",
+    ],
+)
+def test_markup_before_or_around_the_marker_is_tolerated(tmp_path, line):
+    suite = suite_with(tmp_path, [task_row()])
+    grade = grade_text(suite, only_task(suite), f"Reasoning first.\n{line}", tmp_path)
+    assert grade.reward == 1.0, grade.detail
 
 
 def test_empty_answer_after_marker_scores_zero(tmp_path):
@@ -192,6 +223,22 @@ def test_text_answer_match_strips_bold_asterisks_and_trailing_period(tmp_path):
 def test_text_answer_match_collapses_internal_whitespace(tmp_path):
     suite = text_suite(tmp_path)
     assert grade_text(suite, only_task(suite), "ANSWER:   Carol \t  Ann  ", tmp_path).reward == 1.0
+
+
+@pytest.mark.parametrize(
+    "answer_text",
+    [
+        " **Carol Ann**",  # no-break space before the bold markers
+        "**Carol Ann** ",
+        " \"Carol Ann\" ",  # em spaces around quotes
+        "**  `Carol Ann`  **",  # wrappers and Unicode spaces interleaved
+        "**Carol Ann**. ",
+    ],
+)
+def test_text_answer_match_strips_wrappers_next_to_unicode_whitespace(tmp_path, answer_text):
+    suite = text_suite(tmp_path)
+    grade = grade_text(suite, only_task(suite), f"ANSWER:{answer_text}", tmp_path)
+    assert grade.detail == 'parsed answer "carol ann": correct'
 
 
 def test_any_accepted_answer_scores_one(tmp_path):

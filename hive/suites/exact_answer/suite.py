@@ -34,8 +34,14 @@ NUMERIC_RELATIVE_TOLERANCE = 1e-6
 MAX_DETAIL_ANSWER_CHARS = 200
 
 _ROW_FIELDS = {"id", "split", "question", "answers", "numeric"}
-_ANSWER_MARKER = re.compile(r"answer:", re.IGNORECASE)
-_WRAPPER_CHARS = "\"'`*“”‘’ \t"
+# The marker must open the line, behind nothing but markdown (heading, quote, list,
+# bold/italic, code) and whitespace. Anchoring it means a later line of prose that
+# merely says "my answer: ..." cannot replace the real answer line. Markup glued to
+# the colon ("**ANSWER:**", "_ANSWER:_") is consumed as part of the marker.
+_ANSWER_MARKER = re.compile(r"^[\s#>*_`-]*answer[\s*_`]*:[*_`]*", re.IGNORECASE)
+# Whitespace is not listed: str.strip() removes all Unicode whitespace, so a no-break
+# space between wrappers cannot shield them the way an ASCII-only list would.
+_WRAPPER_CHARS = "\"'`*“”‘’"
 # Python's float() also accepts "1_000", "inf" and "nan"; a strict pattern keeps
 # "a plain decimal number" meaning the same thing in the grader and in DESCRIPTION.md.
 _PLAIN_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?")
@@ -49,13 +55,23 @@ class _AnswerKey:
     numeric: bool
 
 
+def _strip_whitespace_and_wrappers(text: str) -> str:
+    """Peel whitespace and wrapper characters in turn until neither end changes."""
+    # One pass is not enough when they interleave, e.g. "**\u00a0`x`\u00a0**".
+    while True:
+        stripped = text.strip().strip(_WRAPPER_CHARS)
+        if stripped == text:
+            return text
+        text = stripped
+
+
 def normalize_answer(text: str) -> str:
     """Canonical comparison form, applied identically to agent output and accepted answers."""
-    text = text.strip(_WRAPPER_CHARS)
+    text = _strip_whitespace_and_wrappers(text)
     if text.endswith("."):
         text = text[:-1]
     # Strip again so both "**x**." and "**x.**" reduce to "x".
-    text = text.strip(_WRAPPER_CHARS)
+    text = _strip_whitespace_and_wrappers(text)
     return " ".join(text.lower().split())
 
 
@@ -70,11 +86,11 @@ def parse_number(normalized: str) -> float | None:
 
 
 def extract_answer(final_text: str) -> str | None:
-    """Text after the marker on the last line that has one; None when no line has one."""
+    """Text after the marker on the last line that opens with one; None when no line does."""
     for line in reversed(final_text.splitlines()):
-        markers = list(_ANSWER_MARKER.finditer(line))
-        if markers:
-            return line[markers[-1].end() :]
+        marker = _ANSWER_MARKER.match(line)
+        if marker:
+            return line[marker.end() :]
     return None
 
 
