@@ -62,6 +62,19 @@ class ModelSpec:
 
 
 @dataclass(frozen=True)
+class ModelEndpoint:
+    """Where an agent must send every model request during one trial (the model gateway).
+
+    `api_key` is a per-trial token minted by the controller, not the provider's key: the real
+    key never enters the trial process, and the gateway enforces the frozen model (P3), the
+    call limit and billing (P12) for every request. OpenAI-compatible: `base_url` ends in /v1.
+    """
+
+    base_url: str
+    api_key: str
+
+
+@dataclass(frozen=True)
 class Task:
     """One unit of evaluation, in a shape every suite and every agent understands.
 
