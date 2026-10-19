@@ -9,6 +9,10 @@ Three roles can be swapped, and each has one small contract here:
 Implementations are selected by name in an experiment config (see `hive.registry`).
 Nothing in the controller imports a concrete implementation, and nothing in an
 implementation imports the controller. See docs/FOUNDING_PRINCIPLES.md §5.
+
+Every plug-in class is constructed as `Cls(settings)`, where `settings` is the mapping
+from its section of the experiment config (agent adapters: `Cls()` then `build(...,
+settings)`). Unknown settings keys should be rejected, so typos fail loudly.
 """
 
 from __future__ import annotations
@@ -34,15 +38,22 @@ AGENT_ERROR_CLASSES = (
     "provider_error",  # the model provider returned an error or aborted
     "quota",  # rate limit, usage cap or billing failure
     "harness_load_error",  # the candidate's own files failed to load (e.g. a broken extension)
+    "model_mismatch",  # the run used a different model than the experiment fixed (P3)
 )
 
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """The model under test. Fixed for a whole experiment and never part of a candidate (P3)."""
+    """The model under test. Fixed for a whole experiment and never part of a candidate (P3).
+
+    `thinking` is the reasoning-effort level, when the provider has one. It belongs here,
+    not in a candidate: more reasoning buys accuracy with spend, which is a model change,
+    not a harness change. Adapters map it onto their framework's own setting.
+    """
 
     provider: str
     id: str
+    thinking: str | None = None
 
     @property
     def qualified(self) -> str:
@@ -60,6 +71,7 @@ class Task:
     id: str
     split: Split
     instruction: str
+    # Relative path -> text, written as UTF-8 into the trial workdir before the agent runs.
     workspace_files: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -107,7 +119,12 @@ class Agent(Protocol):
 
 @runtime_checkable
 class AgentAdapter(Protocol):
-    """The only code that knows a framework's native format."""
+    """The only code that knows a framework's native format.
+
+    `name` is exactly the string candidates put in `agent = "..."`: the built-in short
+    name for a built-in adapter, or the import path ("package.module:Class") for any
+    other. The registry resolves that string, and the controller checks the two match.
+    """
 
     name: str
 
@@ -153,7 +170,10 @@ class Suite(Protocol):
         ...
 
     def grade(self, task: Task, result: AgentResult, workdir: Path) -> Grade:
-        """Score a completed run. Only called when result.status == "completed"."""
+        """Score a completed run. Only called when result.status == "completed".
+
+        May be called concurrently from several threads, each with its own workdir.
+        """
         ...
 
 
