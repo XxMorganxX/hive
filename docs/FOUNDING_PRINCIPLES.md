@@ -451,3 +451,36 @@ Each item is documented behavior of the tools or a standard failure mode of eval
 - [ ] A coding-agent optimizer fixates on one idea. **Track explored valves and push toward unexplored ones.**
 - [ ] Best-of-population rises with noise alone. **Use the null-optimizer arm and promotion margins.**
 
+## 10. Budget model
+
+```
+attempts ≈ (1 + (G − 1) · N) · tasks · k        # optimizer arm
+         + arms_fixed · tasks · k               # seed, fixed topologies, self-decomposing, null
+cost     ≈ attempts · $/attempt · topology_multiplier
+```
+
+- **Worked example.** Use a 20-task search set, k = 5, G = 6 generations, N = 3 proposals each. The optimizer arm alone is 16 candidates × 100 = 1,600 attempts.
+- **At frontier-model prices this adds up fast.** The Meta-Harness paper reports about $500 per iteration on full Terminal-Bench 2. A class budget needs a cheap base model, low reasoning effort, and small slices.
+- **Multi-agent topologies multiply cost** by the number of agents involved.
+- **Measure before committing.** Calibrate `$/attempt` from the seed's noise-floor run before committing to G and N.
+
+## 11. Open decisions
+
+These are for the team. Each has a default, so work can go ahead until someone overrides it.
+
+| Decision | Default until decided | Why it matters |
+|---|---|---|
+| **Use case and suite** (proposal week 1) | Coding: a 30–40 task slice of Terminal-Bench 2.0, split by difficulty into search, validation and held-out | P14 headroom; the Harbor registry has it ready |
+| **Base model** | The cheapest current Claude or OpenAI model that puts the single-agent seed at 30–70% on the slice | P3, P14, budget |
+| **Total budget** | Set a dollar cap per experiment and per semester before the first run | Sets G, N, k |
+| **Second framework** | Strands (default lean) or Deep Agents (matches the proposal); decide in week 6 | Portability proof only |
+| **Reward for coding suites** | The verifier's binary reward first; add LLM judges only if the reward is too coarse | Judges add cost and variance |
+
+## 12. References
+
+- Project proposal: `CS 4701_ Project Proposal (1).pdf`
+- Meta-Harness paper: <https://arxiv.org/abs/2603.28052>, code at stanford-iris-lab/meta-harness
+- Mismanaged Geniuses Hypothesis: <https://alexzhang13.github.io/blog/2026/mgh/>
+- Harbor: <https://github.com/harbor-framework/harbor>
+- Pi: <https://github.com/earendil-works/pi>, <https://pi.dev/docs/latest>
+- Research notes: [harbor-and-meta-harness](research/harbor-and-meta-harness.md) · [pi-harness](research/pi-harness.md) · [langchain-deep-agents](research/langchain-deep-agents.md) · [aws-strands](research/aws-strands.md)
