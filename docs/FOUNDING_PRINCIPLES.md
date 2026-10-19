@@ -184,3 +184,35 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 
 **Why:** near the ceiling or the floor, a real improvement can't move the score enough to clear the noise floor. The experiment would be uninformative however good the optimizer is.
 
+## 4. Framework decision
+
+**Pi is the primary framework.** A second framework comes in after the Pi loop runs end to end. Its only job is to prove the interface is portable.
+
+| | **Pi** (`@earendil-works/pi` 1.3.0) | **Deep Agents** (`deepagents` 0.7.28) | **Strands** (`strands-agents` 1.61.1) |
+|---|---|---|---|
+| Language | TypeScript | Python (JS port exists) | Python (TS SDK exists) |
+| License | MIT | MIT | Apache-2.0 |
+| Valve surface | Widest: SYSTEM/AGENTS.md, skills, settings, about 30 extension hooks (context transforms, tool gating, loop continuation, compaction) | Prompt, model profile (YAML), subagent defs, skills, middleware | Prompt, tools, skills, hooks, middleware, conversation managers |
+| Valves as files vs. code | Files plus TypeScript that loads without a build step | Mostly declarative, middleware is code | Mostly Python code |
+| Multi-agent | DIY: a reference subagent extension spawns child `pi` processes | Manager-worker built in (`task` tool); anything else is LangGraph code | Richest: agents-as-tools, Graph, Swarm, A2A |
+| Harbor support | Built-in `pi` agent with ATIF; needs a thin subclass to inject our harness | Through the generic `langgraph` agent; no ATIF | Built-in `strands` agent with a custom factory and ATIF; inner Graph/Swarm turns may be lost |
+| Packaged optimizer | None | `examples/better-harness` | Strands Labs `harness-optimizer` |
+| Churn | High (about 50 breaking-change sections in 10 months) | High (pre-1.0) | High (weekly minor releases) |
+
+**Why Pi:**
+1. The proposal commits to it, and the team knows it.
+2. It has the widest valve surface, and most valves are files the optimizer can edit without a build.
+3. Harbor's Pi adapter emits ATIF natively, so traces come for free.
+4. It runs headless (`--mode json`, `--mode rpc`) and records per-message tokens and cost in its session files.
+
+**Pi's costs, and how we handle them:**
+- **Multi-agent is DIY.** That's acceptable, because topology is the research variable and we want to own it. We start from the reference subagent extension and make it keep child traces.
+- **Churn:** pin one exact version for the semester.
+- **Untyped extension edits:** run `tsc --noEmit` and a real load check before every scored run.
+
+**Second framework: deferred to week 6.** Default lean is **Strands**, because of its factory hook, its ATIF output and its topology primitives. **Deep Agents** is the alternative if we want to stay with the proposal or reuse `better-harness` as an optimizer baseline. Either way, it plugs in as one adapter, and the controller doesn't change. If it does need to change, the interface is wrong, and we fix the interface.
+
+**The controller and adapters are written in Python,** because Harbor is Python. Pi harness content stays TypeScript and Markdown inside the harness spec.
+
+Full comparisons: [pi-harness](research/pi-harness.md), [langchain-deep-agents](research/langchain-deep-agents.md), [aws-strands](research/aws-strands.md).
+
