@@ -170,7 +170,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 ### P12. Budget is a first-class constraint
 
 **Rule:**
-- Every run has a cost estimate before it starts and a hard dollar cap.
+- Every run has a dollar cap. Each evaluation is priced from the seed's measured cost per trial, and work that wouldn't fit under the cap isn't started.
 - Every result reports reward **and** cost (dollars, tokens, wall-clock), and the frontier is plotted as reward against cost.
 - Multi-agent runs also report tokens per agent call, so we can tell gains from context isolation apart from gains from simply spending more.
 
@@ -378,17 +378,25 @@ coordination: { handoff: summary, parallel_children: true, termination: entry_de
 ## 6. The improvement loop
 
 ```
-check splits are disjoint; snapshot config                         ← P7, P13
-evaluate seed on search × k  → seed report = incumbent report      ← P1 (noise floor: planned)
+check splits are disjoint, seed valid, temp dir outside git        ← P7, P10
+evaluate seed on search × k → incumbent; calibrate $/trial         ← P1 (noise floor: planned), P12
 for generation in 1..G:
-    stop if spend ≥ max_usd                                         ← P12
-    overseer.propose(brief from incumbent) → child candidate        ← P10
-    adapter.validate(child); reject empty or duplicate proposals    ← P2, P4
-    evaluate child on search × k
+    stop if another search evaluation is not expected to fit       ← P12
+    brief the overseer with COPIES of incumbent, report, traces     ← P10
+    overseer.propose(brief) → child candidate in its workspace
+    reject empty, invalid, unchanged, duplicate proposals (no spend) ← P2, P4
+    skip the child if the overseer's spend left too little budget   ← P12
+    re-hash the snapshot, evaluate child on search × k              ← P4
     promote iff child beats incumbent by > margin and ≥ seed        ← P9
     append the generation row (ids, scores, decision, rationale, cost)
-evaluate seed and final incumbent on heldout, once; write summary  ← P7
+evaluate seed and final incumbent on heldout, once, if it fits     ← P7
 ```
+
+The budget is **estimate-gated**:
+- The seed's measured cost per trial prices every later evaluation.
+- The loop never starts work it expects to push spend past `max_usd`.
+- A run can still overshoot by the estimate's error.
+- The overseer's own spend is bounded by its per-proposal cap.
 
 Bare-bones selection uses `selection_score` with a fixed margin. The 95% lower-bound rule, the noise-floor run and valve-diversity pressure (P1, P9, P11) are the next additions.
 
@@ -396,14 +404,17 @@ Bare-bones selection uses `selection_score` with a fixed margin. The 95% lower-b
 
 Modeled on the Meta-Harness paper's proposer filesystem: every candidate's files, scores and raw traces, which the overseer reads selectively.
 
+- **Evaluations are stored per generation, not per candidate id.** The null control re-measures the same id each generation.
+- **The overseer never touches this directory.** Its brief holds copies in temp dirs outside the repository, and every evaluation re-hashes its snapshot first.
+
 ```
 experience/<experiment>/<run-id>/
-  run_meta.json                        # config snapshot, versions, stop reason, spend (written in finally)
+  run_meta.json                        # config snapshot, git commit + dirty flag, stop reason, spend (written in finally)
   candidates/<id>/                     # snapshot of every evaluated candidate, with lineage.json
-  evals/<id>/search/report.json        # EvalReport
-  evals/<id>/search/trials/<task>/<n>/ # workdir/ + trace/ for each trial
-  heldout/<id>/...                     # same shape; NEVER copied into an overseer workspace
-  overseer/gen-<NNN>/                  # the overseer workspace + proposal.json
+  evals/gen-000/report.json            # the seed on search (EvalReport)
+  evals/gen-<NNN>/trials/<task>/<n>/   # workdir/ + trace/ for each trial of generation NNN's child
+  heldout/seed/, heldout/final/        # scored once at the end; NEVER copied into an overseer workspace
+  overseer/gen-<NNN>/                  # archived overseer workspace + proposal.json
   generations.jsonl                    # one row per generation
   summary.json
 ```
