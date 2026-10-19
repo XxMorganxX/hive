@@ -394,3 +394,21 @@ Its prompt contains:
 
 Other optimizers worth comparing against at the same evaluation budget, if time allows: scores-only (no traces), GEPA, and the `better-harness` or Strands `harness-optimizer` approaches.
 
+## 7. Metrics
+
+The proposal compares arms on task performance, cost, latency and consistency. Every suite reports all four, and multi-agent runs add a coordination block.
+
+| Metric | Definition | Role |
+|---|---|---|
+| **Reward** | The suite's `classify` reward, as the mean over k trials and then the mean over tasks | **Primary**: the only thing selection optimizes |
+| **Selection score** | 95% Wilson lower bound on reward, over all requested tasks × k | Ranking and promotion |
+| **Cost** | USD per task, and in total (eval plus optimizer) | Tie-breaker; Pareto axis |
+| **Latency** | Wall-clock time per trial | Reported |
+| **Consistency** | Per-task standard deviation of reward across k trials; the share of tasks that flip between trials | Reported; drives the choice of k |
+| **Coordination** (multi-agent only) | Agents spawned, delegation depth, tokens per agent call, share of tokens spent in coordination vs. work | Separates "better organization" from "more compute" (P12) |
+
+**Reward composition is per suite.**
+- Tasks with a binary verifier use the verifier's reward directly.
+- Suites that need graded quality may add LLM judges. A judge that can't score abstains, and that's recorded as null, never as 0.
+- Every judge must pass the P2 checks before its scores count.
+
