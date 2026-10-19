@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from hive.candidate import Candidate
 from hive.contracts import MetricSpec, Overseer, OverseerBrief, Proposal
 from hive.overseers.claude_code import ClaudeCodeOverseer
+from hive.overseers.claude_code.overseer import build_workspace
 
 FAKE_CLAUDE = Path(__file__).parent / "fakes" / "fake_claude.py"
 
@@ -157,6 +159,143 @@ def test_missing_evidence_dir_is_skipped_without_error(monkeypatch, fake_claude_
     assert not (workspace / "context" / "evidence").exists()
 
 
+# --- no path in the workspace leads outside it -------------------------------------------------
+
+
+@pytest.fixture
+def run_tree_brief(tmp_path) -> tuple[OverseerBrief, Path]:
+    """A brief shaped like the loop's: evidence copied out of a run dir whose path has a space
+    and a non-ASCII letter, with outcome.json, report.json and a trace naming that run dir."""
+    run_dir = tmp_path / "CS 4701 café" / "experience" / "exp" / "r1"
+    trials_root = run_dir / "evals" / "gen-000" / "trials"
+    snapshot = run_dir / "candidates" / "abc123"
+    bundle = tmp_path / "bundle"
+
+    seed = bundle / "incumbent"
+    seed.mkdir(parents=True)
+    (seed / "candidate.toml").write_text(MANIFEST_TEXT)
+
+    # The evaluator records trial_dir relative to the evaluation's directory (trials/<task>/<n>);
+    # the loop says where the trials were recorded through brief.evidence_origin.
+    trial = {"task_id": "q1", "trial": 1, "status": "scored", "trial_dir": "trials/q1/1"}
+    # json.dumps escapes the non-ASCII letter, so the path is spelled differently here than in the trace.
+    (bundle / "report.json").write_text(json.dumps({"tasks": [{"task_id": "q1", "trials": [trial]}]}, indent=2))
+
+    trial_copy = bundle / "trials" / "q1" / "1"
+    (trial_copy / "workdir").mkdir(parents=True)
+    (trial_copy / "outcome.json").write_text(json.dumps(trial, indent=2))
+    (trial_copy / "trace").mkdir()
+    (trial_copy / "trace" / "session.jsonl").write_text(
+        json.dumps({"type": "session", "cwd": str(trials_root / "q1" / "1" / "workdir")}, ensure_ascii=False)
+        + "\n"
+        + f'Failed to load extension "{snapshot / "extensions" / "broken.ts"}": boom\n'
+    )
+    (trial_copy / "workdir" / "outside-link").symlink_to(run_dir / "secret.txt")
+    (trial_copy / "workdir" / "inside-link").symlink_to("../outcome.json")
+
+    history = [{"generation": 1, "error": f"could not read {run_dir / 'heldout' / 'report.json'}"}]
+    brief = OverseerBrief(
+        incumbent=Candidate.load(seed),
+        metric=METRIC,
+        suite_description=SUITE_DESCRIPTION,
+        valves=VALVES,
+        selection_rule=SELECTION_RULE,
+        generation=2,
+        incumbent_report=bundle / "report.json",
+        evidence_dir=bundle / "trials",
+        history=history,
+        evidence_origin=trials_root,
+    )
+    return brief, run_dir
+
+
+def built_context(brief: OverseerBrief, tmp_path: Path) -> Path:
+    workspace = tmp_path / "workspace"
+    build_workspace(brief, workspace)
+    return workspace / "context"
+
+
+def test_report_trial_dirs_are_relative_to_context_evidence(run_tree_brief, tmp_path):
+    brief, _ = run_tree_brief
+    context = built_context(brief, tmp_path)
+    report = json.loads((context / "report.json").read_text())
+    trial_dir = report["tasks"][0]["trials"][0]["trial_dir"]
+    assert trial_dir == "q1/1"
+    assert (context / "evidence" / trial_dir / "outcome.json").is_file()
+
+
+def test_evidence_outcome_trial_dir_is_relative_to_context_evidence(run_tree_brief, tmp_path):
+    brief, _ = run_tree_brief
+    context = built_context(brief, tmp_path)
+    assert json.loads((context / "evidence" / "q1" / "1" / "outcome.json").read_text())["trial_dir"] == "q1/1"
+
+
+def test_trace_paths_into_the_trial_become_relative(run_tree_brief, tmp_path):
+    brief, _ = run_tree_brief
+    context = built_context(brief, tmp_path)
+    first_line = (context / "evidence" / "q1" / "1" / "trace" / "session.jsonl").read_text().splitlines()[0]
+    assert json.loads(first_line)["cwd"] == "q1/1/workdir"
+
+
+def test_paths_elsewhere_in_the_run_dir_are_redacted_but_keep_their_file_name(run_tree_brief, tmp_path):
+    brief, _ = run_tree_brief
+    context = built_context(brief, tmp_path)
+    trace = (context / "evidence" / "q1" / "1" / "trace" / "session.jsonl").read_text()
+    assert "<outside the workspace>/broken.ts" in trace
+
+
+def test_no_file_in_context_names_a_location_outside_the_workspace(run_tree_brief, tmp_path):
+    brief, run_dir = run_tree_brief
+    context = built_context(brief, tmp_path)
+    forbidden = {str(tmp_path), str(tmp_path.resolve()), json.dumps(str(run_dir))[1:-1], "café"}
+    for path in context.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            text = path.read_text()
+            for spelling in forbidden:
+                assert spelling not in text, f"{spelling!r} in {path}"
+
+
+def test_symlink_leading_outside_is_replaced_by_a_note(run_tree_brief, tmp_path):
+    brief, _ = run_tree_brief
+    context = built_context(brief, tmp_path)
+    replaced = context / "evidence" / "q1" / "1" / "workdir" / "outside-link"
+    assert not replaced.is_symlink()
+    assert "outside the workspace" in replaced.read_text()
+
+
+def test_symlink_staying_inside_the_evidence_is_kept(run_tree_brief, tmp_path):
+    brief, _ = run_tree_brief
+    context = built_context(brief, tmp_path)
+    kept = context / "evidence" / "q1" / "1" / "workdir" / "inside-link"
+    assert kept.is_symlink()
+    assert os.readlink(kept) == "../outcome.json"
+
+
+def test_read_only_evidence_is_still_rewritten(run_tree_brief, tmp_path):
+    # An agent can leave read-only files and directories in its workdir; the copy keeps the modes.
+    brief, run_dir = run_tree_brief
+    workdir = Path(brief.evidence_dir) / "q1" / "1" / "workdir"
+    note = workdir / "notes.txt"
+    note.write_text(f"saw {run_dir}/secret.txt\n")
+    note.chmod(0o444)
+    workdir.chmod(0o555)
+    try:
+        context = built_context(brief, tmp_path)
+    finally:
+        workdir.chmod(0o755)
+    copied = context / "evidence" / "q1" / "1" / "workdir"
+    assert (copied / "notes.txt").read_text() == "saw <outside the workspace>/secret.txt\n"
+    assert not (copied / "outside-link").is_symlink()
+
+
+def test_history_paths_are_redacted(run_tree_brief, tmp_path):
+    brief, _ = run_tree_brief
+    context = built_context(brief, tmp_path)
+    assert json.loads((context / "history.json").read_text())[0]["error"] == (
+        "could not read <outside the workspace>/report.json"
+    )
+
+
 # --- prompt ---------------------------------------------------------------------------------
 
 
@@ -184,6 +323,11 @@ def test_prompt_contains_the_selection_rule_and_generation(monkeypatch, fake_cla
     assert "generation 3" in prompt.lower()
 
 
+def test_prompt_says_to_read_and_write_only_inside_the_workspace(monkeypatch, fake_claude_bin, brief, tmp_path, record_path):
+    run(monkeypatch, fake_claude_bin, brief, tmp_path)
+    assert "only read and write inside this directory" in flag_value(recorded_argv(record_path), "-p").lower()
+
+
 def test_prompt_points_at_every_context_file(monkeypatch, fake_claude_bin, brief, tmp_path, record_path):
     run(monkeypatch, fake_claude_bin, brief, tmp_path)
     prompt = flag_value(recorded_argv(record_path), "-p")
@@ -204,19 +348,59 @@ def test_argv_has_every_required_flag(monkeypatch, fake_claude_bin, brief, tmp_p
     argv = recorded_argv(record_path)
     assert flag_value(argv, "--output-format") == "json"
     assert flag_value(argv, "--model") == "sonnet"
-    assert flag_value(argv, "--permission-mode") == "acceptEdits"
     assert flag_value(argv, "--tools") == "Read,Grep,Glob,Edit,Write"
-    assert flag_value(argv, "--allowedTools") == "Read,Grep,Glob,Edit,Write"
-    assert flag_value(argv, "--setting-sources") == "project,local"
     assert "--no-session-persistence" in argv
     assert float(flag_value(argv, "--max-budget-usd")) == 1.0
+
+
+def test_the_argv_that_runs_is_build_command(monkeypatch, fake_claude_bin, brief, tmp_path, record_path):
+    run(monkeypatch, fake_claude_bin, brief, tmp_path)
+    argv = recorded_argv(record_path)
+    overseer = make_overseer(fake_claude_bin)
+    assert [fake_claude_bin, *argv] == overseer.build_command(flag_value(argv, "-p"))
 
 
 def test_tools_never_include_bash(monkeypatch, fake_claude_bin, brief, tmp_path, record_path):
     run(monkeypatch, fake_claude_bin, brief, tmp_path)
     argv = recorded_argv(record_path)
     assert "Bash" not in flag_value(argv, "--tools").split(",")
-    assert "Bash" not in flag_value(argv, "--allowedTools").split(",")
+    assert not any(rule.startswith("Bash") for rule in allow_rules(argv))
+
+
+# --- the read and write fence ---------------------------------------------------------------
+
+
+def allow_rules(argv: list[str]) -> list[str]:
+    return [rule for rule in flag_value(argv, "--allowedTools").split(",") if rule]
+
+
+def test_no_allow_rule_is_a_bare_tool_name():
+    # A bare rule such as "Edit" or "Read" allows that tool on every path on the host.
+    argv = ClaudeCodeOverseer().build_command("prompt")
+    for rule in allow_rules(argv):
+        assert "(" in rule and rule.endswith(")"), rule
+
+
+def test_edits_are_allowed_only_under_candidate_and_on_rationale_md():
+    argv = ClaudeCodeOverseer().build_command("prompt")
+    assert sorted(allow_rules(argv)) == ["Edit(/RATIONALE.md)", "Edit(/candidate/**)"]
+
+
+def test_file_tools_are_confined_to_the_workspace_by_restricted_mode():
+    assert "--restricted" in ClaudeCodeOverseer().build_command("prompt")
+
+
+def test_anything_not_pre_allowed_is_denied_without_a_prompt():
+    argv = ClaudeCodeOverseer().build_command("prompt")
+    # acceptEdits would auto-approve writes anywhere in the workspace, context/ included.
+    assert flag_value(argv, "--permission-mode") == "dontAsk"
+    assert flag_value(argv, "--permission-prompts") == "none"
+
+
+def test_user_mcp_servers_and_customizations_are_not_loaded():
+    argv = ClaudeCodeOverseer().build_command("prompt")
+    assert "--strict-mcp-config" in argv
+    assert "--safe-mode" in argv
 
 
 def test_settings_override_model_and_budget(monkeypatch, fake_claude_bin, brief, tmp_path, record_path):
@@ -248,10 +432,10 @@ def test_cost_is_parsed_from_total_cost_usd(monkeypatch, fake_claude_bin, brief,
     assert proposal.cost_usd == pytest.approx(0.42)
 
 
-def test_cost_defaults_to_zero_when_absent(monkeypatch, fake_claude_bin, brief, tmp_path):
-    proposal, _ = run(monkeypatch, fake_claude_bin, brief, tmp_path, mode="no_cost")
+def test_missing_cost_is_charged_as_the_per_proposal_limit(monkeypatch, fake_claude_bin, brief, tmp_path):
+    proposal, _ = run(monkeypatch, fake_claude_bin, brief, tmp_path, mode="no_cost", max_usd_per_proposal=2.5)
     assert proposal.error is None
-    assert proposal.cost_usd == 0.0
+    assert proposal.cost_usd == 2.5
 
 
 def test_rationale_is_read_from_rationale_md(monkeypatch, fake_claude_bin, brief, tmp_path):
@@ -272,8 +456,13 @@ def test_rationale_falls_back_to_result_text_when_rationale_md_is_missing(monkey
 def test_non_json_output_yields_no_candidate(monkeypatch, fake_claude_bin, brief, tmp_path):
     proposal, _ = run(monkeypatch, fake_claude_bin, brief, tmp_path, mode="not_json")
     assert proposal.candidate_dir is None
-    assert proposal.cost_usd == 0.0
     assert "JSON" in proposal.error
+
+
+def test_non_json_output_charges_the_per_proposal_limit_as_an_upper_bound(monkeypatch, fake_claude_bin, brief, tmp_path):
+    proposal, _ = run(monkeypatch, fake_claude_bin, brief, tmp_path, mode="not_json", max_usd_per_proposal=2.5)
+    assert proposal.cost_usd == 2.5
+    assert "upper bound" in proposal.error
 
 
 def test_is_error_result_yields_no_candidate_but_keeps_cost(monkeypatch, fake_claude_bin, brief, tmp_path):
@@ -294,6 +483,14 @@ def test_timeout_yields_no_candidate(monkeypatch, fake_claude_bin, brief, tmp_pa
     proposal, _ = run(monkeypatch, fake_claude_bin, brief, tmp_path, mode="sleep", timeout_s=0.5)
     assert proposal.candidate_dir is None
     assert "timed out" in proposal.error
+
+
+def test_timeout_charges_the_per_proposal_limit_as_an_upper_bound(monkeypatch, fake_claude_bin, brief, tmp_path):
+    proposal, _ = run(
+        monkeypatch, fake_claude_bin, brief, tmp_path, mode="sleep", timeout_s=0.5, max_usd_per_proposal=2.5
+    )
+    assert proposal.cost_usd == 2.5
+    assert "upper bound" in proposal.error
 
 
 def test_missing_binary_yields_no_candidate(brief, tmp_path):

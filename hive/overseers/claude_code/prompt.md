@@ -31,11 +31,16 @@ $selection_rule
 
 ## Evidence in this workspace
 
+Your working directory is the whole workspace. Only read and write inside this directory:
+everything you need is here, and any file access outside it is refused.
+
 Everything under `context/` is read-only evidence. Read what you need:
 
 - `context/valves.md`: every part of the harness you may edit, and how. Read this first.
 - `context/report.json`: the current candidate's results on the search split, per task and per trial.
 - `context/evidence/`: the raw trace and the final working directory of every one of those trials.
+  Each trial's `trial_dir` in the report is a path relative to `context/evidence/`. Paths that
+  led outside this workspace are shown as `<outside the workspace>/<file name>`.
 - `context/history.json`: earlier generations: what was tried, how it scored, and whether it was kept.
 - `context/suite.md`, `context/metric.md`, `context/selection_rule.md`: the sections above, as files.
 
@@ -52,7 +57,7 @@ Rules:
 
 - Never hard-code task ids, questions, answers or test inputs into the harness.
 - Never edit anything outside `candidate/`, apart from writing `RATIONALE.md` below.
-  Nothing else you write is used.
+  Any other edit is refused.
 - Keep the `agent` field in `candidate/candidate.toml` exactly as it is, and keep the manifest valid TOML.
 - Do not edit `candidate/lineage.json`.
 
