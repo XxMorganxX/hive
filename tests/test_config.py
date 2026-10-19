@@ -393,3 +393,34 @@ def test_snapshot_converts_non_finite_setting_to_string(tmp_path):
     config = load_experiment(write_config(tmp_path, {"agent": {"limit": "inf"}}))
     assert snapshot(config)["agent_settings"]["limit"] == "inf"
     assert math.isinf(config.agent_settings["limit"])
+
+
+# --- path-valued plug-in settings -----------------------------------------------------------
+
+
+def test_relative_file_and_dir_settings_resolve_against_the_config_file(tmp_path):
+    path = write_config(
+        tmp_path,
+        {"suite": {"tasks_file": '"data/tasks.jsonl"'}, "agent": {"cache_dir": '"cache"'}},
+    )
+    config = load_experiment(path)
+    assert config.suite_settings["tasks_file"] == str((path.parent / "data" / "tasks.jsonl").resolve())
+    assert config.agent_settings["cache_dir"] == str((path.parent / "cache").resolve())
+
+
+def test_absolute_path_settings_are_kept(tmp_path):
+    absolute = tmp_path / "elsewhere" / "tasks.jsonl"
+    config = load_experiment(write_config(tmp_path, {"suite": {"tasks_file": f'"{absolute}"'}}))
+    assert config.suite_settings["tasks_file"] == str(absolute.resolve())
+
+
+def test_settings_without_a_path_suffix_are_left_alone(tmp_path):
+    # Binaries like pi_bin are looked up on PATH, not relative to the config.
+    config = load_experiment(write_config(tmp_path, {"overseer": {"claude_bin": '"claude"', "model": '"sonnet"'}}))
+    assert config.overseer_settings["claude_bin"] == "claude"
+    assert config.overseer_settings["model"] == "sonnet"
+
+
+def test_a_non_string_path_setting_is_a_problem(tmp_path):
+    problems = problems_for(write_config(tmp_path, {"suite": {"tasks_file": "3"}}))
+    assert any("tasks_file" in problem for problem in problems)

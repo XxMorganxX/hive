@@ -10,7 +10,9 @@ keys are errors. Every problem is collected and reported at once, so fixing a
 config takes one round trip rather than one per mistake.
 
 Plug-in sections ([agent], [suite], [overseer]) are open: their extra keys belong
-to the plug-in, which validates them itself.
+to the plug-in, which validates them itself. One convention applies to all of them:
+a key ending in `_file` or `_dir` is a path, and a relative one resolves against the
+config file's directory, like `seed_candidate` and `output_dir` do.
 """
 
 from __future__ import annotations
@@ -168,6 +170,23 @@ def _resolve_path(base: Path, text: str) -> Path:
     return (path if path.is_absolute() else base / path).resolve()
 
 
+# Plug-in settings named like these are paths. They resolve against the config file, as
+# seed_candidate and output_dir do, so a config behaves the same from any working directory.
+PATH_SETTING_SUFFIXES = ("_file", "_dir")
+
+
+def _resolve_path_settings(section: str, settings: dict[str, Any], base: Path, problems: list[str]) -> dict[str, Any]:
+    resolved = dict(settings)
+    for key, value in settings.items():
+        if not key.endswith(PATH_SETTING_SUFFIXES):
+            continue
+        if not isinstance(value, str) or not value:
+            problems.append(f"[{section}] {key} must be a non-empty path string, got {value!r}")
+            continue
+        resolved[key] = str(_resolve_path(base, value))
+    return resolved
+
+
 def load_experiment(path: Path | str) -> ExperimentConfig:
     config_path = Path(path).expanduser().resolve()
     data = _read_toml(config_path)
@@ -218,26 +237,30 @@ def load_experiment(path: Path | str) -> ExperimentConfig:
     overseer = sections["overseer"]
     overseer_kind = overseer.string("kind")
 
+    base = config_path.parent
+    agent_settings = _resolve_path_settings("agent", sections["agent"].settings(), base, problems)
+    suite_settings = _resolve_path_settings("suite", suite.settings(excluding="name"), base, problems)
+    overseer_settings = _resolve_path_settings("overseer", overseer.settings(excluding="kind"), base, problems)
+
     if problems:
         raise ConfigError(config_path, problems)
 
-    base = config_path.parent
     return ExperimentConfig(
         name=name,
         config_path=config_path,
         seed_candidate=_resolve_path(base, seed_candidate),
         output_dir=_resolve_path(base, output_dir),
         model=ModelSpec(provider=provider, id=model_id),
-        agent_settings=sections["agent"].settings(),
+        agent_settings=agent_settings,
         suite_name=suite_name,
-        suite_settings=suite.settings(excluding="name"),
+        suite_settings=suite_settings,
         trials_per_task=trials_per_task,
         concurrency=concurrency,
         generations=generations,
         promotion_margin=promotion_margin,
         max_usd=max_usd,
         overseer_kind=overseer_kind,
-        overseer_settings=overseer.settings(excluding="kind"),
+        overseer_settings=overseer_settings,
     )
 
 
