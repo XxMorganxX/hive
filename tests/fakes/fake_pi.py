@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A stand-in for the `pi` executable, so adapter tests never call a real (paid) model.
 
-It records how it was invoked (argv, cwd, stdin, its agent dir) as JSON to the path in
-FAKE_PI_RECORD, then plays the scenario named in FAKE_PI_SCENARIO (default "success").
+It records how it was invoked (argv, cwd, stdin, its agent dir, its environment's
+variable names) as JSON to the path in FAKE_PI_RECORD, then plays the scenario named in FAKE_PI_SCENARIO (default "success").
 Its behaviour mirrors Pi 0.75.3 where the adapter depends on it:
 
 - `--version` goes to stderr when stdin is not a TTY (main.js takes over stdout first).
@@ -131,7 +131,8 @@ def write_session(extra_entries: list[dict] | None = None) -> None:
 
 
 def snapshot_agent_dir() -> dict:
-    """What Pi would see in its agent dir: symlink targets, and settings.json's text."""
+    """What Pi would see in its agent dir: symlink targets, and the text of settings.json and
+    models.json (the latter is where a gateway run's base URL and token reach Pi)."""
     agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
     if not agent_dir or not os.path.isdir(agent_dir):
         return {}
@@ -139,7 +140,7 @@ def snapshot_agent_dir() -> dict:
     for name in sorted(os.listdir(agent_dir)):
         path = os.path.join(agent_dir, name)
         entry: dict = {"symlink": os.readlink(path) if os.path.islink(path) else None}
-        if name == "settings.json":
+        if name in ("settings.json", "models.json"):
             with open(path) as handle:
                 entry["text"] = handle.read()
         snapshot[name] = entry
@@ -158,6 +159,7 @@ def record_invocation(stdin_text: str) -> None:
                 "stdin": stdin_text,
                 "agent_dir": os.environ.get("PI_CODING_AGENT_DIR"),
                 "agent_dir_entries": snapshot_agent_dir(),
+                "env_names": sorted(os.environ),
                 "pid": os.getpid(),
             },
             handle,

@@ -12,8 +12,29 @@ dist/core/sdk.js, dist/core/skills.js, dist/modes/print-mode.js, pi-agent-core a
 - `--no-extensions` / `--no-skills` drop discovered resources but keep explicit `-e` / `--skill`.
 - The flags don't stop Pi reading settings.json (retry, compaction, shell, thinking budgets)
   and models.json (base URLs, costs) from its agent dir. Pi takes that dir from
-  $PI_CODING_AGENT_DIR (config.js getAgentDir), so every run gets a fresh one: links to the
-  user's credentials and fd/rg binaries, a pinned settings.json and no models.json.
+  $PI_CODING_AGENT_DIR (config.js getAgentDir), so every run gets a fresh one: a link to the
+  user's fd/rg binaries, a pinned settings.json, and then either (offline, no endpoint) a
+  link to the user's credentials and no models.json, or (a model gateway endpoint) no
+  credentials and a models.json that sends all traffic to the gateway (gateway_models_json).
+- models.json can override a built-in provider without redefining its models
+  (core/model-registry.js): `{"providers": {"<provider>": {"baseUrl": ..., "apiKey": ...}}}`
+  passes ProviderConfigSchema and validateConfig ("override-only" needs just a baseUrl), and
+  loadBuiltInModels swaps the baseUrl into every built-in model of that provider, keeping
+  their ids, api type (openai-responses for openai) and prices. The apiKey is used only when
+  auth storage has no key for the provider (getApiKeyAndHeaders), and auth storage reads
+  auth.json, then the provider's environment variable (auth-storage.js getApiKey,
+  pi-ai env-api-keys.js). So a gateway run links no auth.json and strips credential
+  variables from Pi's environment; the apiKey value is resolved as "!command", then as an
+  environment variable name, then as a literal (resolve-config-value.js), so a token
+  starting with "!" is refused.
+- Reasoning effort: for a reasoning model, pi-ai's openai-responses provider always sends
+  `reasoning.effort`: the `--thinking` level, after the session clamps it to the levels the
+  model supports (pi-ai models.js clampThinkingLevel), or at "off" the model's off mapping
+  ("none" by default). gpt-5-nano maps off to null, i.e. unsupported, so "off" clamps to
+  "minimal"; checked with the real binary through the gateway. So Pi can never send "no
+  effort" to a reasoning model: a gateway run needs `[model] thinking` set to a level the
+  model supports, or the gateway refuses every call (P3) and the trial is model_mismatch.
+  The adapter passes the experiment's level unchanged and leaves that verdict to the gateway.
 - `--tools` is an allowlist over built-in and extension tools alike.
 - A positional argument starting with "-" or "@" is parsed as a flag or a file reference,
   and piped stdin is read into the prompt. So such instructions go on stdin, and stdin is
@@ -33,6 +54,10 @@ dist/core/sdk.js, dist/core/skills.js, dist/modes/print-mode.js, pi-agent-core a
 - Usage comes from each assistant message's `usage`. Compaction's summary call is the
   exception: it emits no message and Pi keeps no usage for it, only a `compaction` entry in
   the session file, so the adapter adds an upper-bound estimate per entry (compaction_usage).
+  These figures, and the cost Pi prices from its built-in model table, are what an offline
+  run reports. They are not authoritative: on a gateway run the gateway's ledger is the
+  authority for usage and cost (P12), and the controller replaces the adapter's numbers
+  with it. The adapter still reports them, as a cross-check.
 - Extensions (see extension_spec() and EXTENSIONS_API.md). Pi loads every `-e` file, and if
   any failed it prints `Error: Failed to load extension "<path>": ...` per failure and exits
   1 before the session header (main.js reportDiagnostics; core/extensions/loader.js). So
@@ -73,6 +98,7 @@ from hive.contracts import (
     ExtensionSpec,
     LifecyclePoint,
     LoadReport,
+    ModelEndpoint,
     ModelSpec,
     Task,
     Usage,
@@ -101,6 +127,13 @@ ENV_AGENT_DIR = "PI_CODING_AGENT_DIR"
 # Linked, never copied, from the user's real agent dir: credentials are secrets, and bin/
 # holds the fd/rg binaries Pi's grep/find tools need when it can't download them offline.
 LINKED_AGENT_ENTRIES = ("auth.json", "bin")
+# A gateway run links no credentials: the per-trial token in models.json is Pi's only key.
+GATEWAY_LINKED_AGENT_ENTRIES = ("bin",)
+MODELS_FILE = "models.json"
+# Environment variables a gateway run never passes to Pi: every provider key pi-ai reads
+# (env-api-keys.js: OPENAI_API_KEY, ANTHROPIC_OAUTH_TOKEN, HF_TOKEN, AWS_BEARER_TOKEN_BEDROCK,
+# ...), and any other secret-looking variable, since candidate code runs in that process.
+CREDENTIAL_ENV_NAME = re.compile(r"API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|^AWS_", re.IGNORECASE)
 # The settings.json every run gets: Pi's own defaults for the pinned version, whatever the
 # user's settings say, so retry, compaction, shell and thinking-budget settings can't drift.
 PINNED_SETTINGS: Mapping[str, Any] = {}
@@ -781,8 +814,14 @@ class PiAgent:
     extensions: tuple[ExtensionFile, ...]  # the candidate's extension files, for the load report
     user_agent_dir: Path  # the user's real Pi agent dir, source of the credential links
 
-    def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
+    def run(self, task: Task, workdir: Path, trace_dir: Path, endpoint: ModelEndpoint | None = None) -> AgentResult:
+        """With `endpoint`, Pi sends every request to the gateway with the per-trial token, and
+        sees neither the user's credentials nor provider keys in its environment."""
         trace_dir.mkdir(parents=True, exist_ok=True)
+        if endpoint is not None and endpoint.api_key.startswith("!"):
+            # Pi would run it as a shell command (see module doc); a gateway token never is one.
+            message = "the model endpoint's token starts with '!', which Pi would run as a command"
+            return errored("agent_error", message, Usage(), 0.0, None)
         session_dir = trace_dir / "session"
         argv = [self.pi_bin, *self.options, "--session-dir", str(session_dir)]
         stdin_text: str | None = None
@@ -793,8 +832,8 @@ class PiAgent:
 
         started = time.monotonic()
         try:
-            with isolated_agent_dir(self.user_agent_dir) as agent_dir:
-                env = {**os.environ, ENV_AGENT_DIR: str(agent_dir)}
+            with isolated_agent_dir(self.user_agent_dir, self.model, endpoint) as agent_dir:
+                env = {**trial_environment(os.environ, endpoint), ENV_AGENT_DIR: str(agent_dir)}
                 outcome = self._execute(argv, workdir, stdin_text, env)
         except OSError as error:  # the temp agent dir could not be made; Pi never ran
             outcome = ProcessOutcome(b"", b"", None, False, error)
@@ -858,17 +897,39 @@ class PiAgent:
             tracked.kill_all()
 
 
+def gateway_models_json(model: ModelSpec, endpoint: ModelEndpoint) -> dict[str, Any]:
+    """An override-only models.json entry for the experiment's built-in provider: the same
+    models (ids, api type) at the gateway's base URL, with the per-trial token as the key."""
+    return {"providers": {model.provider: {"baseUrl": endpoint.base_url, "apiKey": endpoint.api_key}}}
+
+
+def trial_environment(environ: Mapping[str, str], endpoint: ModelEndpoint | None) -> dict[str, str]:
+    """Pi's environment. Through the gateway, without any credential variable: Pi would
+    prefer a provider key there over the token (see module doc)."""
+    if endpoint is None:
+        return dict(environ)
+    return {name: value for name, value in environ.items() if not CREDENTIAL_ENV_NAME.search(name)}
+
+
 @contextmanager
-def isolated_agent_dir(real_agent_dir: Path) -> Iterator[Path]:
+def isolated_agent_dir(real_agent_dir: Path, model: ModelSpec, endpoint: ModelEndpoint | None) -> Iterator[Path]:
     """A fresh Pi agent dir outside the repo, removed afterwards. One per run, because Pi
-    writes into it (lock files, settings it changes) and runs happen concurrently."""
+    writes into it (lock files, settings it changes) and runs happen concurrently. With an
+    endpoint it holds the gateway's models.json and no link to the user's credentials."""
     agent_dir = Path(tempfile.mkdtemp(prefix="hive-pi-agent-"))
     try:
-        for name in LINKED_AGENT_ENTRIES:
+        linked = LINKED_AGENT_ENTRIES if endpoint is None else GATEWAY_LINKED_AGENT_ENTRIES
+        for name in linked:
             source = real_agent_dir / name
             if source.exists():
                 (agent_dir / name).symlink_to(source)
         (agent_dir / "settings.json").write_text(json.dumps(PINNED_SETTINGS), encoding="utf-8")
+        if endpoint is not None:
+            models_path = agent_dir / MODELS_FILE
+            # Owner-only: it holds the trial's token (mkdtemp already makes the dir 0700).
+            fd = os.open(models_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(gateway_models_json(model, endpoint), handle)
         yield agent_dir
     finally:
         # rmtree unlinks the symlinks themselves; it never follows them into the real dir.
@@ -1152,6 +1213,8 @@ def text_of(message: Mapping[str, Any]) -> str:
 
 
 def usage_of(message: Mapping[str, Any]) -> Usage:
+    """One message's usage as Pi reports it, priced from Pi's own model table, not from
+    `[model] prices`. Not authoritative: on a gateway run the ledger overrides it (module doc)."""
     usage = message.get("usage")
     if not isinstance(usage, dict):
         return Usage()

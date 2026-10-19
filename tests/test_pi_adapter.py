@@ -1,20 +1,25 @@
 import json
 import os
+import shutil
 import signal
 import time
 from pathlib import Path
 
 import pytest
 
+from fakes.fake_openai_upstream import FakeOpenAIUpstream
 from hive.agents.pi import PiAdapter
 import hive.agents.pi.adapter as pi_adapter
 from hive.agents.pi.adapter import PiAgent, PiVersionMismatch, check_pi_version
 from hive.candidate import Candidate
 from hive.contracts import (
-    LIFECYCLE_POINTS, Agent, AgentAdapter, ExtensionSpec, Grade, LoadReport, MetricSpec, ModelSpec, Task, Usage,
+    LIFECYCLE_POINTS, Agent, AgentAdapter, ExtensionSpec, Grade, LoadReport, MetricSpec, ModelEndpoint, ModelSpec,
+    Task, Usage,
 )  # fmt: skip
 from hive.evaluate import evaluate
 from hive.extensions import expected_extension_files, load_problem, render_extension_guide
+from hive.gateway import ModelGateway
+from hive.pricing import Prices
 
 FAKE_PI = Path(__file__).parent / "fakes" / "fake_pi.py"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -707,6 +712,136 @@ def test_agent_dir_skips_auth_and_bin_the_user_does_not_have(tmp_path, fake_pi, 
     (user_agent_dir / "bin").rmdir()
     run(build_agent(write_candidate(tmp_path / "c")), tmp_path)
     assert set(fake_pi()["agent_dir_entries"]) == {"settings.json"}
+
+
+# --- the model gateway: every request goes to the endpoint, with the per-trial token --------
+
+# Placeholders only: no real key is ever read or sent by these tests.
+GATEWAY_TOKEN = "trial-token-placeholder-7f3a"
+ENDPOINT = ModelEndpoint(base_url="http://127.0.0.1:9/v1", api_key=GATEWAY_TOKEN)
+
+
+def run_via_gateway(agent: PiAgent, tmp_path: Path, endpoint: ModelEndpoint = ENDPOINT, task: Task = TASK):
+    workdir = tmp_path / "work"
+    workdir.mkdir(exist_ok=True)
+    trace_dir = tmp_path / "trace"
+    return agent.run(task, workdir, trace_dir, endpoint=endpoint), workdir, trace_dir
+
+
+def test_gateway_run_points_the_experiments_provider_at_the_endpoint_with_the_token(tmp_path, fake_pi):
+    result, _, _ = run_via_gateway(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    assert result.status == "completed"
+    models_json = fake_pi()["agent_dir_entries"]["models.json"]
+    assert models_json["symlink"] is None
+    assert json.loads(models_json["text"]) == {
+        "providers": {"openai": {"baseUrl": "http://127.0.0.1:9/v1", "apiKey": GATEWAY_TOKEN}}
+    }
+
+
+def test_gateway_run_keeps_the_model_id_so_the_model_check_and_gateway_policy_match(tmp_path, fake_pi):
+    run_via_gateway(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    assert flag_values(fake_pi()["argv"], "--model") == ["openai/gpt-5-nano"]
+
+
+def test_gateway_run_never_links_the_users_credentials(tmp_path, fake_pi, user_agent_dir):
+    run_via_gateway(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    entries = fake_pi()["agent_dir_entries"]
+    assert "auth.json" not in entries
+    assert entries["bin"]["symlink"] == str(user_agent_dir / "bin")
+    assert json.loads(entries["settings.json"]["text"]) == pi_adapter.PINNED_SETTINGS
+
+
+def test_gateway_run_drops_provider_keys_from_pis_environment(tmp_path, fake_pi, monkeypatch):
+    # Pi's auth storage prefers OPENAI_API_KEY from the environment over models.json's apiKey.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-placeholder-not-a-real-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+    monkeypatch.setenv("HF_TOKEN", "hf-placeholder")
+    run_via_gateway(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    names = set(fake_pi()["env_names"])
+    assert not names & {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HF_TOKEN"}
+    assert {"PATH", "HOME", "PI_CODING_AGENT_DIR"} <= names
+
+
+def test_run_without_an_endpoint_keeps_the_environment_and_the_credential_link(tmp_path, fake_pi, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-placeholder-not-a-real-key")
+    run(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    record = fake_pi()
+    assert "OPENAI_API_KEY" in record["env_names"]
+    assert "auth.json" in record["agent_dir_entries"]
+    assert "models.json" not in record["agent_dir_entries"]
+
+
+def test_gateway_token_appears_in_no_trace_file(tmp_path, fake_pi):
+    result, _, trace_dir = run_via_gateway(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    files = [path for path in trace_dir.rglob("*") if path.is_file()]
+    assert files  # events, stderr and the session file
+    for path in files:
+        assert GATEWAY_TOKEN not in path.read_text(errors="replace"), path
+    assert GATEWAY_TOKEN not in repr(result)
+
+
+def test_gateway_agent_dir_and_its_token_are_removed_after_the_run(tmp_path, fake_pi):
+    run_via_gateway(build_agent(write_candidate(tmp_path / "c")), tmp_path)
+    assert not Path(fake_pi()["agent_dir"]).exists()
+
+
+def test_gateway_run_with_fixed_thinking_sends_that_effort(tmp_path, fake_pi):
+    model = ModelSpec(provider="openai", id="gpt-5-nano", thinking="high")
+    run_via_gateway(build_agent(write_candidate(tmp_path / "c"), model), tmp_path)
+    assert flag_values(fake_pi()["argv"], "--thinking") == ["high"]
+
+
+def test_gateway_run_refuses_a_token_pi_would_run_as_a_shell_command(tmp_path, fake_pi):
+    # Pi resolves a models.json apiKey starting with "!" by running it (resolve-config-value.js).
+    endpoint = ModelEndpoint(base_url="http://127.0.0.1:9/v1", api_key="!echo pwned")
+    result, _, _ = run_via_gateway(build_agent(write_candidate(tmp_path / "c")), tmp_path, endpoint)
+    assert result.status == "errored"
+    assert result.error_class == "agent_error"
+    assert "pwned" not in (result.error or "")
+    assert not (tmp_path / "fake_pi_record.json").exists()
+
+
+def require_real_pi() -> None:
+    if shutil.which("pi") is None:
+        pytest.skip("needs the real pi binary")
+    try:
+        check_pi_version("pi", "0.75.3")
+    except (PiVersionMismatch, OSError) as error:
+        pytest.skip(f"needs pi 0.75.3: {error}")
+
+
+def test_real_pi_sends_every_request_to_the_gateway_with_the_token(tmp_path, user_agent_dir, monkeypatch):
+    """The real binary, with no network and no paid call: Pi -> ModelGateway -> a fake upstream.
+    It proves Pi honours the models.json override (base URL and token), sends the experiment's
+    effort, and uses neither the user's auth.json nor a provider key in its environment: either
+    would reach the gateway as an unknown token and be refused with 401."""
+    require_real_pi()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-placeholder-must-never-reach-pi")
+    model = ModelSpec(provider="openai", id="gpt-5-nano", thinking="low")
+    agent = PiAdapter().build(
+        write_candidate(tmp_path / "c", valves="tools = []\n"), model, {"pi_bin": "pi", "timeout_s": 120}
+    )
+    upstream_key = "sk-fake-upstream-placeholder"
+    with FakeOpenAIUpstream() as upstream, ModelGateway(
+        model=model, prices=Prices(input=0.05, output=0.40), upstream_url=upstream.url,
+        upstream_key=upstream_key, max_calls_per_trial=5,
+    ) as gateway:  # fmt: skip
+        trial_key, endpoint = gateway.open_trial()
+        result, _, trace_dir = run_via_gateway(agent, tmp_path, endpoint, Task(id="t", split="search", instruction="Say hi."))
+        ledger = gateway.close_trial(trial_key)
+        received = list(upstream.requests)
+
+    assert result.status == "completed", result.error
+    assert ledger.calls and ledger.violations == ()
+    assert all(call.status == 200 and call.model_requested == "gpt-5-nano" for call in ledger.calls)
+    assert len(received) == len(ledger.calls)
+    for request in received:
+        assert request.headers["authorization"] == f"Bearer {upstream_key}"
+        body = json.loads(request.body)
+        assert body["model"] == "gpt-5-nano"
+        assert body["reasoning"]["effort"] == "low"
+    for path in (path for path in trace_dir.rglob("*") if path.is_file()):
+        assert endpoint.api_key not in path.read_text(errors="replace"), path
 
 
 def test_real_agent_dir_defaults_to_home_pi_agent(monkeypatch, tmp_path):

@@ -2,8 +2,11 @@
 
 A Pi candidate is a directory. HIVE runs it with the Pi coding agent (`pi --mode json -p`), one
 fresh session per task, with the task's working directory as Pi's working directory. Each run
-gets its own empty Pi agent directory: the user's credentials are linked in, `settings.json` is
-pinned to Pi's defaults, and there is no `models.json`. Pi's discovery of extensions, skills,
+gets its own empty Pi agent directory, with `settings.json` pinned to Pi's defaults. On a real
+run, a `models.json` sends every model request to HIVE's model gateway with a per-trial token,
+and no provider key is present (an offline run links the user's credentials instead and has no
+`models.json`). The gateway fixes the model and effort, counts calls and bills the trial, so
+nothing in the candidate can change them. Pi's discovery of extensions, skills,
 prompt templates and context files is switched off. So the only extensions, skills and prompts
 the agent gets are the ones in this directory.
 
