@@ -118,7 +118,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 ### P8. Errors are not failures
 
 **Rule:**
-- Every trial is either `scored` (it has a reward) or `errored`. An errored trial carries an error class: `agent_error`, `timeout`, `provider_error`, `quota`, `harness_load_error`, `model_mismatch`, `grader_error` or `workspace_error`.
+- Every trial is either `scored` (it has a reward) or `errored`. An errored trial carries an error class: `agent_error`, `timeout`, `provider_error`, `quota`, `harness_load_error`, `extension_error`, `model_mismatch`, `grader_error` or `workspace_error`.
 - The reported `measured_mean` leaves errored trials out.
 - **Selection** still uses all requested tasks as the denominator, so a candidate can't improve its rank by pushing hard tasks into "errored".
 - Never trust an exit code. Count completed trials. Pi's JSON mode doesn't signal failure through its exit code, so parse `stopReason`.
@@ -263,6 +263,7 @@ class AgentAdapter(Protocol):
     def build(self, candidate: Candidate, model: ModelSpec,
               settings: Mapping[str, Any]) -> Agent: ...
     def describe_valves(self) -> str: ...                            # every editable valve, for the overseer
+    def extension_spec(self) -> ExtensionSpec | None: ...           # how extensions are written; None if unsupported
 
 class Agent(Protocol):
     def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult: ...
@@ -274,17 +275,41 @@ class AgentResult:
     usage: Usage                               # tokens + cost_usd
     wall_clock_s: float
     error: str | None = None
-    error_class: str | None = None             # agent_error | timeout | provider_error | quota | harness_load_error | model_mismatch
+    error_class: str | None = None             # agent_error | timeout | provider_error | quota | harness_load_error
+                                               # | extension_error | model_mismatch
+    load_report: LoadReport | None = None      # which extension files loaded; required when there are any
 ```
 
 - **`run` never raises for agent-side failures.** It returns `status="errored"`, and it writes native traces into `trace_dir`.
 
-**Pi adapter obligations:**
-- **Isolate from the user's global Pi config.** Pass `--no-extensions --no-skills --no-prompt-templates --no-context-files`, then pass the candidate's own files explicitly (`--system-prompt`, `--append-system-prompt`, `-e`, `--skill`).
-- **Run against a fresh agent dir per run:** `PI_CODING_AGENT_DIR` points at a temp dir holding symlinks to the real `auth.json` and `bin/`, a pinned `settings.json`, and no `models.json`. Run with `--offline`.
-- **Check the pinned Pi version.**
-- **Ignore the exit code.** JSON mode exits 0 on provider errors. Status comes from the last assistant `message_end.stopReason`, and usage is summed over every assistant `message_end`.
-- **Catch failed extension loads.** An extension error on stderr makes the trial `errored`, with class `harness_load_error`.
+**Extensions: first-class, native code.** Extensions are candidate code that hooks the agent loop:
+- Pi extensions (`.ts`);
+- Deep Agents middleware (`.py`);
+- Strands hooks and plugins (`.py`).
+
+They are a primary lever for harness evolution. A portable extension API would shrink to the lowest common denominator: the frameworks give the "same" hook different semantics. So the contract shares the shape around the code instead:
+
+| Shared piece | What it is |
+|---|---|
+| `extensions/` | One directory name in every candidate (`EXTENSIONS_DIR`) |
+| `ExtensionSpec` | Declared by each adapter: language, file suffixes, entry convention, pinned framework version, forbidden APIs (P3), and the pinned API reference text. It also holds a catalog over 10 neutral `LIFECYCLE_POINTS`, each mapped to the native API with support level and caveats: `before_run`, `system_prompt`, `before_model_call`, `after_model_call`, `wrap_model_call`, `before_tool_call`, `after_tool_call`, `register_tool`, `compaction`, `after_run` |
+| `LoadReport` | Returned with every run of a candidate that has extensions: which files loaded, what each registered, and any runtime throws |
+| `hive/extensions.py` | Trusted code. It picks the expected files, checks the report (any file not loaded → `harness_load_error`; a throw mid-run → `extension_error`) and renders the spec into the overseer's extension guide, the same way for every framework |
+
+The **controller**, not the adapter, decides whether a run's extensions all loaded. An adapter that quietly skips a broken file can't make a candidate look like it ran as written (P8).
+
+**Adapter obligations, every framework:**
+- **Isolate the run** from user and global framework config.
+- **Pass the candidate's own files explicitly.**
+- **Check the pinned framework version.**
+- **Derive status from the framework's own end-of-run signal,** never from an exit code.
+- **Report usage and the model each response actually came from:** `model_mismatch` on any other model (P3).
+- **Stop a timed-out run completely,** including the shell commands it started in their own sessions.
+
+**Process model.**
+- **Pi** runs as a CLI subprocess.
+- **The Python frameworks** run in a runner script under their own pinned venv (`.venvs/<framework>`). The runner writes `trace.jsonl` (one line per model call, with usage and the reported model) and `result.json` (status, text, load report). `hive/agents/runner_protocol.py` is the single reader for both.
+- **Cost** comes from a `prices` table in `[agent]`, because these frameworks don't compute dollars.
 
 ### 5.3 Suite contract (use-case seam)
 
