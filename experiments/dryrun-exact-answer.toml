@@ -1,0 +1,37 @@
+# dryrun-exact-answer: a zero-spend dry run of the whole loop on the exact_answer suite.
+# The scripted agent replays canned outputs (no model is called) and the null overseer
+# proposes unchanged copies, so this checks the plumbing, not any harness.
+#
+# [experiment]  name of the run directory, the seed harness, and where run outputs go
+# [model]       a placeholder model: the scripted agent ignores it, but every run records one (P3)
+# [agent]       settings for the scripted adapter: it has none
+# [suite]       which evaluation suite to score on
+# [evaluation]  trials per task (k) and how many trials run at once
+# [loop]        generations to search, the promotion margin, and the hard dollar cap (nothing is spent)
+# [overseer]    the null control, which re-proposes the incumbent unchanged to measure noise (P9)
+
+[experiment]
+name = "dryrun-exact-answer"
+seed_candidate = "../harnesses/scripted-exact-answer"
+output_dir = "../experience"
+
+[model]
+provider = "scripted"
+id = "none"
+
+[agent]
+
+[suite]
+name = "exact_answer"
+
+[evaluation]
+trials_per_task = 2
+concurrency = 4
+
+[loop]
+generations = 2
+promotion_margin = 0.05
+max_usd = 1.0
+
+[overseer]
+kind = "null"

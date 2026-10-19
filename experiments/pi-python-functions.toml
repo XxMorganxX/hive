@@ -1,0 +1,41 @@
+# pi-python-functions: the Pi seed improved by the Claude Code overseer on the python_functions suite.
+# Every tunable for this experiment lives here; relative paths resolve against this file.
+#
+# [experiment]  name of the run directory, the seed harness, and where run outputs go
+# [model]       the frozen model under test, never part of a candidate (P3)
+# [agent]       settings for the agent adapter the seed names (here Pi): pinned version, per-trial timeout
+# [suite]       which evaluation suite to score on
+# [evaluation]  trials per task (k) and how many trials run at once
+# [loop]        generations to search, the promotion margin, and the hard dollar cap for the whole run (P12)
+# [overseer]    the improvement strategy and its settings, including its own per-proposal dollar cap
+
+[experiment]
+name = "pi-python-functions"
+seed_candidate = "../harnesses/pi-baseline"
+output_dir = "../experience"
+
+[model]
+provider = "openai"
+id = "gpt-5-nano"
+
+[agent]
+pi_version = "0.75.3"
+timeout_s = 300
+
+[suite]
+name = "python_functions"
+
+[evaluation]
+trials_per_task = 2
+concurrency = 4
+
+[loop]
+generations = 3
+promotion_margin = 0.05
+max_usd = 3.0
+
+[overseer]
+kind = "claude_code"
+model = "sonnet"
+max_usd_per_proposal = 1.0
+timeout_s = 900
