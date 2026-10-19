@@ -4,8 +4,15 @@ Started by hive/agents/deepagents/adapter.py as
 
     <venv python> -I runner.py <trace_dir>/run_spec.json        (cwd = the trial workdir)
 
-with one JSON line on stdin, `{"credentials": {"OPENAI_API_KEY": "..."}}` (empty for the
-scripted provider). This file imports only the stdlib and the framework, never hive: it runs in another venv,
+with one JSON line on stdin that says how to reach the model:
+
+- `{"endpoint": {"base_url": "...", "api_key": "<per-trial token>"}}`: the controller's model
+  gateway, for every real provider. The chat model is `ChatOpenAI(base_url=..., api_key=token)`;
+  the real provider key never enters this process.
+- `{"credentials": {"OPENAI_API_KEY": "..."}}`: the legacy no-gateway path (empty for the
+  scripted provider, which makes no network calls and ignores an endpoint).
+
+This file imports only the stdlib and the framework, never hive: it runs in another venv,
 and nothing in the controller may depend on the framework. It speaks the runner protocol of
 hive/agents/runner_protocol.py through files:
 
@@ -22,6 +29,10 @@ and langchain-openai 1.7.2. Why the less obvious choices:
 
 - Usage is summed per model call from `on_llm_end` callbacks, not from the final state: the
   final state holds only the main agent's messages, so subagent calls would go unpaid (P12).
+- The request checks, the call count and the traced usage below are a second line. With an
+  endpoint, the gateway is the authority: it refuses another model or effort, enforces the call
+  limit, and its ledger is what the controller bills (P3, P12). The runner's own checks still
+  stop a violating request before it is sent and name the cause in the trace.
 - Every request that goes through the agent's chat model is checked in `on_chat_model_start`
   (model id and reasoning effort) and counted there against `max_model_calls`, and the callback
   raises before the request is sent: an extension that overrides the model or its settings must
@@ -40,14 +51,16 @@ and langchain-openai 1.7.2. Why the less obvious choices:
   reaches it (graph.py), so when it is on, HIVE builds it explicitly with its guards, and binds
   the experiment's recursion_limit on it: create_agent binds 9_999, and a subagent's bound
   config wins over the parent's run config.
-- The provider credential never enters the environment. A process's exec-time environment
+- The token (or legacy key) never enters the environment. A process's exec-time environment
   stays readable by its children (`ps eww $PPID`, /proc/<pid>/environ) after os.environ.pop,
-  so the key arrives on stdin, read to EOF before anything else runs, and goes straight to the
+  so it arrives on stdin, read to EOF before anything else runs, and goes straight to the
   client constructor. Shell commands get an explicit PATH/HOME/LANG environment.
 - Extension code runs in this process, so it can reach the built model object, which holds the
-  key and the provider client. The request checks, the call count and the trace see only calls
+  token and the provider client. The request checks, the call count and the trace see only calls
   made through the langchain model; they detect mistakes and plain violations, but they are not
-  a sandbox, and the static checks in validate() are not either.
+  a sandbox, and the static checks in validate() are not either. A call made through the client
+  directly still goes to the gateway with the trial's token, so it is checked and billed there.
+  On the legacy path the client holds the real key and nothing outside this process sees it.
 """
 
 from __future__ import annotations
@@ -141,11 +154,11 @@ def clip(text: Any, limit: int = TRACE_TEXT_CHARS) -> str:
 
 
 def main(argv: list[str]) -> int:
-    # First thing, before the spec or any framework or candidate code: take the key off stdin.
+    # First thing, before the spec or any framework or candidate code: take the token or key off stdin.
     try:
-        credentials, credentials_error = read_credentials(), None
+        access, access_error = read_model_access(), None
     except Exception as error:  # noqa: BLE001 (reported in result.json like any other runner failure)
-        credentials, credentials_error = {}, error
+        access, access_error = {"credentials": {}}, error
     spec = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
     # No "extensions" key until the load phase has run: a run that failed before it has no load
     # report, and an empty one would tell the controller every extension file went missing.
@@ -153,9 +166,9 @@ def main(argv: list[str]) -> int:
                               "runtime_errors": []}  # fmt: skip
     trial = None
     try:
-        if credentials_error is not None:
-            raise credentials_error
-        trial = Trial(spec, credentials)
+        if access_error is not None:
+            raise access_error
+        trial = Trial(spec, access)
         try:
             result.update(trial.run())
         finally:
@@ -169,11 +182,13 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def read_credentials() -> dict[str, str]:
-    """The provider credentials the adapter sends as one JSON line on stdin, read to EOF.
+def read_model_access() -> dict[str, Any]:
+    """How to reach the model, as the adapter sends it: one JSON line on stdin, read to EOF.
 
-    stdin is then pointed at /dev/null, so nothing started later can read the pipe. The key is
-    never put in os.environ (see the module doc). An empty stdin means no credentials.
+    Exactly one of `{"endpoint": {"base_url", "api_key"}}` (the gateway) or `{"credentials":
+    {"NAME": "value"}}` (legacy). stdin is then pointed at /dev/null, so nothing started later
+    can read the pipe. Nothing is put in os.environ (see the module doc). An empty stdin means
+    no credentials. Error messages never repeat the token.
     """
     text = sys.stdin.read() if sys.stdin is not None else ""
     devnull = os.open(os.devnull, os.O_RDONLY)
@@ -182,20 +197,33 @@ def read_credentials() -> dict[str, str]:
     finally:
         os.close(devnull)
     if not text.strip():
-        return {}
+        return {"credentials": {}}
     payload = json.loads(text)
-    credentials = payload.get("credentials") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or len(payload) != 1 or not ({"endpoint", "credentials"} & set(payload)):
+        raise ValueError('stdin must hold one JSON object: {"endpoint": {"base_url": ..., "api_key": ...}} '
+                         'or (legacy) {"credentials": {"NAME": "value", ...}}')  # fmt: skip
+    if "endpoint" in payload:
+        endpoint = payload["endpoint"]
+        valid = (
+            isinstance(endpoint, dict) and set(endpoint) == {"base_url", "api_key"}
+            and all(isinstance(value, str) and value for value in endpoint.values())
+            and endpoint["base_url"].startswith(("http://", "https://"))
+        )  # fmt: skip
+        if not valid:
+            raise ValueError('the model endpoint on stdin must be {"base_url": "http(s)://...", "api_key": "<token>"}')
+        return {"endpoint": dict(endpoint)}
+    credentials = payload["credentials"]
     if not isinstance(credentials, dict) or not all(
         isinstance(name, str) and isinstance(value, str) for name, value in credentials.items()
     ):
-        raise ValueError('stdin must hold one JSON object {"credentials": {"NAME": "value", ...}}')
-    return credentials
+        raise ValueError('stdin credentials must be {"NAME": "value", ...}')
+    return {"credentials": dict(credentials)}
 
 
 class Trial:
-    def __init__(self, spec: dict[str, Any], credentials: dict[str, str] | None = None):
+    def __init__(self, spec: dict[str, Any], access: dict[str, Any] | None = None):
         self.spec = spec
-        self.credentials = credentials if credentials is not None else {}
+        self.access = access if access is not None else {"credentials": {}}
         self.loads: list[dict[str, Any]] | None = None  # set once the load phase has run
         self.workdir = Path(spec["workdir"])
         self.trace = TraceFile(Path(spec["trace_file"]))
@@ -211,8 +239,8 @@ class Trial:
     def run(self) -> dict[str, Any]:
         # Framework imports happen here, inside main()'s catch-all: a broken venv is a result too.
         fw = Framework()
-        model = build_model(fw, self.spec, self.credentials)
-        self.credentials.clear()  # the model holds the key now; main() and this object keep no copy
+        model = build_model(fw, self.spec, self.access)
+        self.access.clear()  # the model holds the token or key now; this object keeps no copy
 
         loads, middleware, tools = load_extensions(
             fw, self.spec["extensions"], allowed=set(self.spec["tools"]), builtin=set(self.spec["builtin_tools"])
@@ -417,18 +445,27 @@ class Framework:
         return isinstance(error, openai.OpenAIError)
 
 
-def build_model(fw: Framework, spec: dict[str, Any], credentials: dict[str, str]) -> Any:
+def build_model(fw: Framework, spec: dict[str, Any], access: dict[str, Any]) -> Any:
     model = spec["model"]
     if model["provider"] == "openai":
         from langchain_openai import ChatOpenAI
 
-        key = credentials.get(OPENAI_CREDENTIAL)
-        if not key:
-            raise ValueError(f"no {OPENAI_CREDENTIAL} arrived on stdin for model provider 'openai'")
+        endpoint = access.get("endpoint")
+        if endpoint is not None:
+            # The gateway: its base_url and the per-trial token. Explicit, so OPENAI_BASE_URL could
+            # not redirect the client even if it were in the environment.
+            server = {"base_url": endpoint["base_url"], "api_key": endpoint["api_key"]}
+        else:
+            # Legacy, no gateway: the real key, on the SDK's default base URL.
+            key = (access.get("credentials") or {}).get(OPENAI_CREDENTIAL)
+            if not key:
+                raise ValueError(f"neither a model endpoint nor {OPENAI_CREDENTIAL} arrived on stdin for model "
+                                 "provider 'openai'")  # fmt: skip
+            server = {"api_key": key}
         limits = spec["limits"]
         return ChatOpenAI(
             model=model["id"],
-            api_key=key,  # explicit: the key is never in os.environ for the client to find
+            **server,  # explicit: neither the token nor the key is ever in os.environ for the client to find
             use_responses_api=True,
             reasoning={"effort": model["reasoning_effort"]},
             timeout=limits["provider_timeout_s"],

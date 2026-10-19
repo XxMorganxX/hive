@@ -5,10 +5,17 @@ Each test runs a real trial through the adapter: the venv's interpreter, runner.
 that replays turns from a file (provider "scripted"), so nothing touches the network or a
 key. Skipped unless `.venvs/deepagents` exists (scripts/setup-framework-venvs.sh deepagents).
 
-The last tests drive the real OpenAI provider class against a local HTTP stub instead, by
-starting the runner directly with OPENAI_BASE_URL set (the adapter itself never passes it).
+The last tests drive the real OpenAI provider class (ChatOpenAI) over HTTP instead:
+
+- against a local stub, with the runner started directly and given the stub as its endpoint
+  on stdin (or, for the legacy no-gateway path, a key on stdin and OPENAI_BASE_URL);
+- through the adapter, with a real ModelGateway (run in this test process) in front of
+  tests/fakes/fake_openai_upstream.py, which is how every real-provider trial now runs.
+
+Every key and token here is a placeholder; nothing reaches the network beyond 127.0.0.1.
 """
 
+import dataclasses
 import json
 import os
 import re
@@ -22,15 +29,16 @@ from pathlib import Path
 import pytest
 
 import hive.agents.deepagents.adapter as da
+from fakes.fake_openai_upstream import RESPONSES_USAGE, SNAPSHOT_SUFFIX, FakeOpenAIUpstream
 from hive.agents.deepagents import DeepAgentsAdapter
-from hive.agents.runner_protocol import parse_prices
 from hive.candidate import Candidate
-from hive.contracts import ModelSpec, Task
+from hive.contracts import ModelEndpoint, ModelSpec, Task, Usage
 from hive.extensions import expected_extension_files, load_problem
+from hive.gateway import ModelGateway
+from hive.pricing import Prices
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENV_PYTHON = REPO_ROOT / ".venvs" / "deepagents" / "bin" / "python"
-PRICES = {"input": 0.05, "output": 0.40, "cache_read": 0.005}
 MODEL = ModelSpec(provider="scripted", id="gpt-5-nano", thinking="low")
 REPORTED = "gpt-5-nano-2025-08-07"
 
@@ -69,9 +77,8 @@ def trial(tmp_path: Path, turns: list[dict], *, valves: str = "", files: dict[st
     turns_file.write_text(json.dumps(turns) if turns_text is None else turns_text)
     adapter = DeepAgentsAdapter()
     assert adapter.validate(candidate) == []
-    agent = adapter.build(candidate, MODEL, {"python_path": str(VENV_PYTHON), "prices": PRICES,
-                                             "scripted_turns_path": str(turns_file), "timeout_s": 120,
-                                             **settings})  # fmt: skip
+    agent = adapter.build(candidate, MODEL, {"python_path": str(VENV_PYTHON), "scripted_turns_path": str(turns_file),
+                                             "timeout_s": 120, **settings})  # fmt: skip
     workdir = tmp_path / "workdir"
     workdir.mkdir()
     for relative, text in (workspace or {}).items():
@@ -121,7 +128,7 @@ def test_trace_has_one_usage_line_per_model_call_with_the_reported_model(tmp_pat
     # input_tokens excludes cache reads (the provider's count includes them).
     assert calls[0]["usage"] == {"input_tokens": 100, "output_tokens": 7, "cache_read_tokens": 20, "cache_write_tokens": 0}
     assert (result.usage.input_tokens, result.usage.output_tokens, result.usage.cache_read_tokens) == (300, 17, 20)
-    assert result.usage.cost_usd == pytest.approx((300 * 0.05 + 17 * 0.40 + 20 * 0.005) / 1e6)
+    assert result.usage.cost_usd == 0.0  # dollars come from the gateway's ledger, never from the trace
 
 
 def test_shell_commands_start_in_the_workdir(tmp_path):
@@ -665,12 +672,15 @@ def stub_openai():
 
 
 PLACEHOLDER_KEY = "sk-offline-placeholder-not-a-key"
+PLACEHOLDER_TOKEN = "hive-trial-token-placeholder-not-a-key"
 
 
-def openai_trial(tmp_path: Path, server, files: dict[str, str] | None = None):
-    """The runner started directly (not through the adapter) so OPENAI_BASE_URL can point at the stub.
+def openai_trial(tmp_path: Path, server, files: dict[str, str] | None = None, access: str = "endpoint"):
+    """The runner started directly (not through the adapter), with the stub as its model server.
 
-    The key goes on stdin, as the adapter sends it, never in the runner's environment.
+    access "endpoint": the stub is the trial's endpoint, sent on stdin with a placeholder token,
+    exactly as the adapter sends a gateway grant. access "legacy": the no-gateway path, a key on
+    stdin and OPENAI_BASE_URL in the environment (the adapter itself never sets it).
     """
     candidate = write_candidate(tmp_path / "candidate", files=files)
     workdir, trace_dir = tmp_path / "workdir", tmp_path / "trace"
@@ -681,30 +691,35 @@ def openai_trial(tmp_path: Path, server, files: dict[str, str] | None = None):
         python_path=str(VENV_PYTHON), candidate_root=candidate.root, system_prompt=None,
         extensions=tuple((p.relative_to(candidate.root).as_posix(), str(p)) for p in layout.extensions),
         skills_dir=None, tools=da.DEFAULT_TOOLS, general_purpose_subagent=False,
-        model=ModelSpec(provider="openai", id="gpt-5-nano", thinking="low"), reasoning_effort="low", credential=None,
+        model=ModelSpec(provider="openai", id="gpt-5-nano", thinking="low"), reasoning_effort="low",
         limits={"max_model_calls": 10, "recursion_limit": 100, "shell_timeout_s": 30, "provider_timeout_s": 30,
                 "max_retries": 0},
-        timeout_s=60, term_grace_s=1, prices=parse_prices(PRICES), scripted_turns_file=None, workdir_prompt="Workdir: {workdir}",
+        timeout_s=60, term_grace_s=1, scripted_turns_file=None, workdir_prompt="Workdir: {workdir}",
     ).run_spec(Task(id="t", split="search", instruction="What is 6 * 7?"), workdir.resolve(), trace_dir)  # fmt: skip
     (trace_dir / "run_spec.json").write_text(json.dumps(spec))
-    env = {"PATH": os.environ["PATH"], "HOME": str(trace_dir), "LANG": "C.UTF-8",
-           "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1"}  # fmt: skip
-    stdin = json.dumps({"credentials": {"OPENAI_API_KEY": PLACEHOLDER_KEY}}) + "\n"
+    base_url = f"http://127.0.0.1:{server.server_port}/v1"
+    env = {"PATH": os.environ["PATH"], "HOME": str(trace_dir), "LANG": "C.UTF-8"}
+    if access == "endpoint":
+        stdin = json.dumps({"endpoint": {"base_url": base_url, "api_key": PLACEHOLDER_TOKEN}}) + "\n"
+    else:
+        env["OPENAI_BASE_URL"] = base_url
+        stdin = json.dumps({"credentials": {"OPENAI_API_KEY": PLACEHOLDER_KEY}}) + "\n"
     completed = subprocess.run([str(VENV_PYTHON), "-I", str(da.RUNNER), str(trace_dir / "run_spec.json")], cwd=workdir,
                                env=env, input=stdin, text=True, timeout=120, capture_output=True)  # fmt: skip
     (trace_dir / "runner.stderr").write_text(completed.stderr)
     return json.loads((trace_dir / "result.json").read_text()), trace_dir
 
 
-def test_openai_usage_and_reported_model_are_traced(tmp_path, stub_openai):
-    result, trace_dir = openai_trial(tmp_path, stub_openai)
+@pytest.mark.parametrize("access, secret", [("endpoint", PLACEHOLDER_TOKEN), ("legacy", PLACEHOLDER_KEY)])
+def test_openai_usage_and_reported_model_are_traced(tmp_path, stub_openai, access, secret):
+    result, trace_dir = openai_trial(tmp_path, stub_openai, access=access)
     assert result["status"] == "completed" and result["final_text"] == "ANSWER: 42"
     [line] = trace_lines(trace_dir, "model_call")
     assert line["model"] == REPORTED
     assert line["usage"] == {"input_tokens": 200, "output_tokens": 40, "cache_read_tokens": 1000, "cache_write_tokens": 0}
     request = stub_openai.requests[0]
     assert request["body"]["model"] == "gpt-5-nano" and request["body"]["reasoning"] == {"effort": "low"}
-    assert request["authorization"] == f"Bearer {PLACEHOLDER_KEY}"
+    assert request["authorization"] == f"Bearer {secret}"
 
 
 def test_openai_insufficient_quota_is_quota(tmp_path, stub_openai):
@@ -713,24 +728,116 @@ def test_openai_insufficient_quota_is_quota(tmp_path, stub_openai):
     assert (result["status"], result["error_class"]) == ("errored", "quota")
 
 
-def test_extensions_cannot_read_the_provider_key_from_the_environment(tmp_path, stub_openai):
+@pytest.mark.parametrize("stdin", [
+    {"endpoint": {"base_url": "http://127.0.0.1:9/v1"}},
+    {"endpoint": {"base_url": "file:///etc/passwd", "api_key": PLACEHOLDER_TOKEN}},
+    {"endpoint": {"base_url": "http://127.0.0.1:9/v1", "api_key": PLACEHOLDER_TOKEN}, "credentials": {}},
+])  # fmt: skip
+def test_a_malformed_endpoint_on_stdin_fails_before_any_model_call(tmp_path, stub_openai, stdin):
+    spec_path = tmp_path / "run_spec.json"
+    trial_spec = {"result_file": str(tmp_path / "result.json"), "trace_file": str(tmp_path / "trace.jsonl")}
+    spec_path.write_text(json.dumps(trial_spec))
+    completed = subprocess.run([str(VENV_PYTHON), "-I", str(da.RUNNER), str(spec_path)], cwd=tmp_path, input=json.dumps(stdin),
+                               env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)}, text=True, timeout=60,
+                               capture_output=True)  # fmt: skip
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert (result["status"], result["error_class"]) == ("errored", "agent_error"), completed.stderr
+    assert "endpoint" in result["error"] and PLACEHOLDER_TOKEN not in result["error"]
+    assert stub_openai.requests == []
+
+
+@pytest.mark.parametrize("access", ["endpoint", "legacy"])
+def test_extensions_cannot_read_the_provider_key_from_the_environment(tmp_path, stub_openai, access):
     source = "import os\n\ndef extension():\n    open('key_seen.txt', 'w').write(os.environ.get('OPENAI_API_KEY', 'absent'))\n    return []\n"
-    result, _ = openai_trial(tmp_path, stub_openai, files={"extensions/peek.py": source})
+    result, _ = openai_trial(tmp_path, stub_openai, files={"extensions/peek.py": source}, access=access)
     assert result["status"] == "completed"
     assert (tmp_path / "workdir" / "key_seen.txt").read_text() == "absent"
 
 
-def test_the_agent_shell_cannot_read_the_provider_key(tmp_path, stub_openai):
+@pytest.mark.parametrize("access, secret", [("endpoint", PLACEHOLDER_TOKEN), ("legacy", PLACEHOLDER_KEY)])
+def test_the_agent_shell_cannot_read_the_provider_key(tmp_path, stub_openai, access, secret):
     # `ps eww -p $PPID` prints the runner's exec-time environment, which os.environ.pop never clears.
     command = "env; ps eww -o command= -p $PPID"
     # Its own response id: messages sharing an id replace each other in the agent's state.
     execute = {**RESPONSE, "id": "resp_0", "output": [{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "execute",
                                        "status": "completed", "arguments": json.dumps({"command": command})}]}  # fmt: skip
     stub_openai.replies = [(200, execute)]
-    result, trace_dir = openai_trial(tmp_path, stub_openai)
+    result, trace_dir = openai_trial(tmp_path, stub_openai, access=access)
     assert result["status"] == "completed", (result, stderr(trace_dir))
     [tool_end] = [line for line in trace_lines(trace_dir, "tool_end") if line["name"] == "execute"]
     assert "PATH=" in tool_end["output"] and "runner.py" in tool_end["output"]  # both commands ran
-    assert stub_openai.requests[0]["authorization"] == f"Bearer {PLACEHOLDER_KEY}"  # the key did reach the provider
-    leaked = [str(path) for path in trace_dir.rglob("*") if path.is_file() and PLACEHOLDER_KEY in path.read_text(errors="replace")]
+    assert stub_openai.requests[0]["authorization"] == f"Bearer {secret}"  # the secret did reach the model server
+    leaked = [str(path) for path in trace_dir.rglob("*") if path.is_file() and secret in path.read_text(errors="replace")]
     assert leaked == []
+
+
+# --- the real gateway in front of the fake OpenAI upstream ------------------------------------
+
+GATEWAY_MODEL = ModelSpec(provider="openai", id="gpt-5-nano", thinking="low")
+GATEWAY_PRICES = Prices(input=0.05, output=0.40, cache_read=0.005)
+# A made-up stand-in for the provider key, held only by the gateway. Never a real key.
+UPSTREAM_KEY = "sk-fake-upstream-key-for-deepagents-tests-0123456789"
+
+
+def gateway_trial(tmp_path: Path, gateway: ModelGateway, endpoint: ModelEndpoint):
+    """One trial through the adapter, as the controller runs it: endpoint passed as a keyword."""
+    candidate = write_candidate(tmp_path / "candidate")
+    agent = DeepAgentsAdapter().build(candidate, GATEWAY_MODEL, {"python_path": str(VENV_PYTHON), "timeout_s": 120,
+                                                                 "max_retries": 0})  # fmt: skip
+    workdir, trace_dir = tmp_path / "workdir", tmp_path / "trace"
+    workdir.mkdir()
+    trace_dir.mkdir()
+    result = agent.run(Task(id="t1", split="search", instruction="Say hello."), workdir, trace_dir, endpoint=endpoint)
+    return result, trace_dir
+
+
+def test_a_real_run_goes_through_the_gateway_which_records_its_calls_and_usage(tmp_path, monkeypatch):
+    # The controller's environment has no provider key at all: only the gateway holds one.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with FakeOpenAIUpstream() as upstream, ModelGateway(model=GATEWAY_MODEL, prices=GATEWAY_PRICES, upstream_url=upstream.url,
+                                                        upstream_key=UPSTREAM_KEY, max_calls_per_trial=10) as gateway:  # fmt: skip
+        trial_key, endpoint = gateway.open_trial()
+        result, trace_dir = gateway_trial(tmp_path, gateway, endpoint)
+        ledger = gateway.close_trial(trial_key)
+
+    assert result.status == "completed", (result.error, stderr(trace_dir))
+    assert result.final_text == "Hello world"
+
+    # The ledger, the authority for usage and cost (P12) and for model violations (P3).
+    assert ledger.violations == () and not ledger.limit_reached
+    [call_record] = ledger.calls
+    assert (call_record.path, call_record.status) == ("/v1/responses", 200)
+    assert call_record.model_requested == "gpt-5-nano"
+    assert call_record.model_reported == "gpt-5-nano" + SNAPSHOT_SUFFIX
+    cached = RESPONSES_USAGE["input_tokens_details"]["cached_tokens"]
+    tokens = Usage(input_tokens=RESPONSES_USAGE["input_tokens"] - cached, output_tokens=RESPONSES_USAGE["output_tokens"],
+                   cache_read_tokens=cached)  # fmt: skip
+    assert call_record.usage == dataclasses.replace(tokens, cost_usd=GATEWAY_PRICES.cost(tokens))
+
+    # The upstream saw the provider key and the frozen effort; the trial saw only its token.
+    [request] = upstream.requests
+    assert request.headers["authorization"] == f"Bearer {UPSTREAM_KEY}"
+    assert request.json["model"] == "gpt-5-nano" and request.json["reasoning"]["effort"] == "low"
+
+    # The runner's own trace agrees, as the second line: same tokens, no dollars.
+    [line] = trace_lines(trace_dir, "model_call")
+    assert line["model"] == call_record.model_reported
+    assert (result.usage.input_tokens, result.usage.output_tokens, result.usage.cache_read_tokens) == (
+        tokens.input_tokens, tokens.output_tokens, tokens.cache_read_tokens)
+    assert result.usage.cost_usd == 0.0
+
+    # Neither the trial token nor the provider key is written anywhere under the trace dir.
+    for secret in (endpoint.api_key, UPSTREAM_KEY):
+        leaked = [str(path) for path in trace_dir.rglob("*") if path.is_file() and secret in path.read_text(errors="replace")]
+        assert leaked == [], secret
+
+
+def test_a_revoked_token_gets_no_model_call_through(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with FakeOpenAIUpstream() as upstream, ModelGateway(model=GATEWAY_MODEL, prices=GATEWAY_PRICES, upstream_url=upstream.url,
+                                                        upstream_key=UPSTREAM_KEY, max_calls_per_trial=10) as gateway:  # fmt: skip
+        trial_key, endpoint = gateway.open_trial()
+        gateway.close_trial(trial_key)
+        result, trace_dir = gateway_trial(tmp_path, gateway, endpoint)
+    assert (result.status, result.error_class) == ("errored", "provider_error"), (result.error, stderr(trace_dir))
+    assert upstream.requests == []

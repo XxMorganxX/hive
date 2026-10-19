@@ -6,6 +6,7 @@ cover what the controller decides (validation, settings, the launch, classificat
 cleanup) without a venv and without any model call.
 """
 
+import dataclasses
 import json
 import os
 import shutil
@@ -20,14 +21,16 @@ import hive.agents.deepagents.adapter as da
 from hive.agents.deepagents import DeepAgentsAdapter
 from hive.agents.process import TRIAL_MARKER_ENV
 from hive.candidate import Candidate
-from hive.contracts import LIFECYCLE_POINTS, AgentAdapter, ModelSpec, Task
+from hive.contracts import LIFECYCLE_POINTS, AgentAdapter, ModelEndpoint, ModelSpec, Task
 from hive.extensions import expected_extension_files, render_extension_guide
 
 FAKE_PYTHON = Path(__file__).parent / "fakes" / "deepagents_fake_python.py"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE = REPO_ROOT / "harnesses" / "deepagents-baseline"
 MODEL = ModelSpec(provider="openai", id="gpt-5-nano", thinking="low")
-PRICES = {"input": 0.05, "output": 0.40, "cache_read": 0.005}
+# Placeholders only: a made-up provider key (the legacy path) and a made-up gateway grant.
+LEGACY_KEY = "sk-test-not-a-real-key"
+ENDPOINT = ModelEndpoint(base_url="http://127.0.0.1:9/v1", api_key="hive-trial-token-placeholder-0123456789")
 
 GOOD_EXTENSION = '''
 from langchain.agents.middleware import AgentMiddleware
@@ -69,24 +72,30 @@ def fake_python(tmp_path) -> Path:
 
 @pytest.fixture(autouse=True)
 def openai_key(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-a-real-key")
+    monkeypatch.setenv("OPENAI_API_KEY", LEGACY_KEY)
 
 
 def settings(fake_python: Path, **overrides) -> dict:
-    return {"python_path": str(fake_python), "prices": PRICES, **overrides}
+    return {"python_path": str(fake_python), **overrides}
 
 
 def build(candidate: Candidate, fake_python: Path, model: ModelSpec = MODEL, **overrides):
     return DeepAgentsAdapter().build(candidate, model, settings(fake_python, **overrides))
 
 
-def run(agent, tmp_path: Path, instruction: str = "SCENARIO completed"):
+def run(agent, tmp_path: Path, instruction: str = "SCENARIO completed", endpoint: ModelEndpoint | None = None):
     workdir = tmp_path / "work"
     workdir.mkdir(exist_ok=True)
     trace_dir = tmp_path / "trace"
     trace_dir.mkdir(exist_ok=True)
-    result = agent.run(Task(id="t1", split="search", instruction=instruction), workdir, trace_dir)
+    task = Task(id="t1", split="search", instruction=instruction)
+    # As the controller calls it: endpoint as a keyword, and only when there is one.
+    result = agent.run(task, workdir, trace_dir) if endpoint is None else agent.run(task, workdir, trace_dir, endpoint=endpoint)
     return result, workdir, trace_dir
+
+
+def files_under(directory: Path) -> list[Path]:
+    return [path for path in directory.rglob("*") if path.is_file()]
 
 
 def record(trace_dir: Path) -> dict:
@@ -284,12 +293,13 @@ def test_validate_reports_an_unreadable_extension_instead_of_raising(tmp_path):
 
 def test_build_requires_a_python_path(tmp_path):
     with pytest.raises(ValueError, match="python_path"):
-        DeepAgentsAdapter().build(Candidate.load(BASELINE), MODEL, {"prices": PRICES})
+        DeepAgentsAdapter().build(Candidate.load(BASELINE), MODEL, {})
 
 
-def test_build_requires_prices(tmp_path, fake_python):
-    with pytest.raises(ValueError, match="prices"):
-        DeepAgentsAdapter().build(Candidate.load(BASELINE), MODEL, {"python_path": str(fake_python)})
+def test_prices_are_no_longer_an_adapter_setting(fake_python):
+    # Cost comes from the gateway's ledger, priced by [model] prices; a leftover table is pointed there.
+    with pytest.raises(ValueError, match=r"prices.*\[model\] prices"):
+        build(Candidate.load(BASELINE), fake_python, prices={"input": 0.05, "output": 0.40})
 
 
 def test_build_rejects_an_unknown_setting(fake_python):
@@ -329,7 +339,7 @@ def test_build_checks_the_installed_version_once_and_runs_do_not(tmp_path, fake_
 def test_build_raises_when_the_interpreter_cannot_be_started(tmp_path):
     with pytest.raises(da.DeepAgentsVersionMismatch, match="could not run"):
         DeepAgentsAdapter().build(Candidate.load(BASELINE), MODEL,
-                                  {"python_path": str(tmp_path / "missing" / "python"), "prices": PRICES})  # fmt: skip
+                                  {"python_path": str(tmp_path / "missing" / "python")})  # fmt: skip
 
 
 def test_build_rejects_an_unsupported_provider(fake_python):
@@ -342,10 +352,25 @@ def test_build_rejects_an_unknown_thinking_level(fake_python):
         build(Candidate.load(BASELINE), fake_python, model=ModelSpec(provider="openai", id="gpt-5-nano", thinking="max"))
 
 
-def test_build_raises_when_the_provider_credential_is_missing(fake_python, monkeypatch):
+def test_build_does_not_need_the_provider_key(fake_python, monkeypatch):
+    # With the gateway, the key stays in the controller's gateway; the adapter never reads it.
     monkeypatch.delenv("OPENAI_API_KEY")
-    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
-        build(Candidate.load(BASELINE), fake_python)
+    agent = build(Candidate.load(BASELINE), fake_python)
+    assert "credential" not in {field.name for field in dataclasses.fields(agent)}
+
+
+def test_a_run_with_an_endpoint_needs_no_provider_key(tmp_path, fake_python, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY")
+    result, _, _ = run(build(Candidate.load(BASELINE), fake_python), tmp_path, endpoint=ENDPOINT)
+    assert result.status == "completed", result.error
+
+
+def test_a_legacy_run_without_an_endpoint_or_a_key_is_an_agent_error(tmp_path, fake_python, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY")
+    result, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python), tmp_path)
+    assert (result.status, result.error_class) == ("errored", "agent_error")
+    assert "OPENAI_API_KEY" in result.error and "endpoint" in result.error
+    assert not (trace_dir / "fake_record.json").exists()  # the runner never started
 
 
 def test_scripted_provider_requires_a_turns_file(fake_python):
@@ -393,13 +418,43 @@ def test_environment_holds_only_path_home_and_lang(tmp_path, fake_python, monkey
     assert set(env) == {"PATH", "HOME", "LANG"}
 
 
-def test_the_provider_key_is_sent_as_one_json_line_on_stdin(tmp_path, fake_python):
-    # Not in the environment: a process's exec-time environment stays readable (ps eww) after
-    # os.environ.pop, so the runner reads the key from stdin and hands it to the client.
+def test_the_endpoint_is_sent_as_one_json_line_on_stdin_in_place_of_credentials(tmp_path, fake_python):
+    # The controller's environment still has OPENAI_API_KEY (the autouse fixture): it must not reach the runner.
+    _, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python), tmp_path, endpoint=ENDPOINT)
+    stdin = record(trace_dir)["stdin"]
+    assert stdin.endswith("\n") and stdin.count("\n") == 1
+    assert json.loads(stdin) == {"endpoint": {"base_url": ENDPOINT.base_url, "api_key": ENDPOINT.api_key}}
+
+
+def test_with_an_endpoint_the_provider_key_reaches_no_file_argv_or_environment(tmp_path, fake_python):
+    _, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python), tmp_path, endpoint=ENDPOINT)
+    recorded = record(trace_dir)
+    assert LEGACY_KEY not in json.dumps(recorded)  # argv, cwd, environment and stdin
+    assert [path for path in files_under(trace_dir) if LEGACY_KEY in path.read_text(errors="replace")] == []
+
+
+def test_the_trial_token_never_appears_in_argv_the_environment_or_the_run_spec(tmp_path, fake_python):
+    _, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python), tmp_path, endpoint=ENDPOINT)
+    recorded = record(trace_dir)
+    assert ENDPOINT.api_key not in json.dumps(recorded["argv"]) + json.dumps(recorded["env"])
+    assert ENDPOINT.api_key not in (trace_dir / "run_spec.json").read_text()
+
+
+def test_without_an_endpoint_the_provider_key_is_sent_on_stdin_as_the_legacy_path(tmp_path, fake_python):
+    # Legacy (no gateway): not in the environment, since a process's exec-time environment stays
+    # readable (ps eww) after os.environ.pop, so the runner reads the key from stdin.
     _, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python), tmp_path)
     stdin = record(trace_dir)["stdin"]
     assert stdin.endswith("\n") and stdin.count("\n") == 1
-    assert json.loads(stdin) == {"credentials": {"OPENAI_API_KEY": "sk-test-not-a-real-key"}}
+    assert json.loads(stdin) == {"credentials": {"OPENAI_API_KEY": LEGACY_KEY}}
+
+
+def test_the_legacy_key_is_read_when_the_trial_runs_not_kept_from_build(tmp_path, fake_python, monkeypatch):
+    agent = build(Candidate.load(BASELINE), fake_python)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-rotated-placeholder")
+    _, _, trace_dir = run(agent, tmp_path)
+    assert json.loads(record(trace_dir)["stdin"]) == {"credentials": {"OPENAI_API_KEY": "sk-test-rotated-placeholder"}}
+    assert "sk-test" not in repr(agent)
 
 
 def test_home_is_a_fresh_directory_in_the_trace_dir(tmp_path, fake_python):
@@ -410,8 +465,8 @@ def test_home_is_a_fresh_directory_in_the_trace_dir(tmp_path, fake_python):
 
 def test_the_key_never_appears_in_argv_or_the_run_spec(tmp_path, fake_python):
     _, _, trace_dir = run(build(Candidate.load(BASELINE), fake_python), tmp_path)
-    assert not any("sk-test-not-a-real-key" in arg for arg in record(trace_dir)["argv"])
-    assert "sk-test-not-a-real-key" not in (trace_dir / "run_spec.json").read_text()
+    assert not any(LEGACY_KEY in arg for arg in record(trace_dir)["argv"])
+    assert LEGACY_KEY not in (trace_dir / "run_spec.json").read_text()
 
 
 def test_scripted_provider_gets_no_credential(tmp_path, fake_python):
@@ -468,12 +523,13 @@ def test_thinking_defaults_to_low_reasoning_effort(tmp_path, fake_python):
 # --- classification (through hive.agents.runner_protocol) ----------------------------------
 
 
-def test_a_completed_run_returns_its_text_usage_and_cost(tmp_path, fake_python):
-    result, _, _ = run(build(Candidate.load(BASELINE), fake_python), tmp_path)
+def test_a_completed_run_returns_its_text_and_traced_tokens_but_no_cost(tmp_path, fake_python):
+    # The trace's tokens are the second line; dollars come only from the gateway's ledger (P12).
+    result, _, _ = run(build(Candidate.load(BASELINE), fake_python), tmp_path, endpoint=ENDPOINT)
     assert result.status == "completed"
     assert result.final_text == "ANSWER: 42"
     assert (result.usage.input_tokens, result.usage.output_tokens, result.usage.cache_read_tokens) == (300, 50, 50)
-    assert result.usage.cost_usd == pytest.approx((300 * 0.05 + 50 * 0.40 + 50 * 0.005) / 1_000_000)
+    assert result.usage.cost_usd == 0.0
     assert result.wall_clock_s > 0
 
 

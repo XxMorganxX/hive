@@ -21,12 +21,22 @@ Behaviour below was checked against deepagents 0.7.28 / langchain 1.4.6 / langch
   dir. LangSmith tracing turns on from LANGSMITH_* / LANGCHAIN_* variables and the OpenAI SDK
   honours OPENAI_BASE_URL, so an inherited environment could leak traces or redirect the model
   (P3, P10). `-I` keeps PYTHONPATH, user site-packages and the script directory off sys.path.
-- The one credential the ModelSpec's provider needs goes on the runner's stdin as one JSON
-  line, `{"credentials": {"OPENAI_API_KEY": "..."}}`, never in its environment: a process's
-  exec-time environment stays readable by its children (`ps eww $PPID`), so the agent's own
-  shell could print the key into the trace. The runner hands it to the client constructor.
+- Model access goes on the runner's stdin as one JSON line, never in its environment, argv or
+  the run spec: a process's exec-time environment stays readable by its children
+  (`ps eww $PPID`), so the agent's own shell could print it into the trace.
+  - With a `ModelEndpoint` (the controller's model gateway; every real provider): the line is
+    `{"endpoint": {"base_url": ..., "api_key": <per-trial token>}}` and the runner builds
+    `ChatOpenAI(base_url=..., api_key=token)`. The real provider key never enters the trial,
+    and this adapter never reads it. The gateway decides P3 (model and effort) and P12 (usage
+    and cost) for every request, including any an extension sends past the runner.
+  - Legacy, without an endpoint (provider "openai" only): `{"credentials": {"OPENAI_API_KEY":
+    ...}}`, read from the controller's environment when the trial starts. The real key is then
+    in the trial process, next to candidate code, and nothing outside it checks or bills the
+    calls; kept only for running the adapter without a gateway.
 - The verdict comes from the runner's result.json and trace.jsonl, read by
-  hive.agents.runner_protocol, never from the exit code (P8).
+  hive.agents.runner_protocol, never from the exit code (P8). The trace's model check and token
+  counts are a second line behind the gateway: the reported usage carries tokens but no dollars,
+  because cost is priced once, from the gateway's ledger (`[model] prices`, hive.pricing).
 - The framework starts shell commands in sessions of their own, so the runner lists their
   process groups in child_pgids.txt and the process helper kills them after every trial.
 - validate() never runs candidate code: each extension is parsed with `ast` and checked for
@@ -49,9 +59,19 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hive.agents.process import run_process_group
-from hive.agents.runner_protocol import RESULT_FILE, TRACE_FILE, Prices, interpret_runner, parse_prices
+from hive.agents.runner_protocol import RESULT_FILE, TRACE_FILE, interpret_runner
 from hive.candidate import MANIFEST, Candidate, content_files
-from hive.contracts import EXTENSIONS_DIR, AgentResult, ExtensionSpec, LifecyclePoint, ModelSpec, Task, Usage
+from hive.contracts import (
+    EXTENSIONS_DIR,
+    AgentResult,
+    ExtensionSpec,
+    LifecyclePoint,
+    ModelEndpoint,
+    ModelSpec,
+    Task,
+    Usage,
+)
+from hive.pricing import Prices
 
 # The version every fact in this module, the runner, VALVES.md and EXTENSIONS_API.md was
 # checked against (P13). requirements.txt pins the whole lock around it.
@@ -86,10 +106,14 @@ DEFAULT_GENERAL_PURPOSE_SUBAGENT = False
 # ModelSpec.thinking is passed to OpenAI as the reasoning effort, unchanged.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DEFAULT_THINKING = "low"
-# Provider -> the one environment variable its credential comes from. "scripted" replays
-# canned turns for tests and needs none; there are deliberately no Bedrock, Anthropic or
-# Google paths, so a typo can never fall through to a default cloud provider.
+# Provider -> the environment variable its credential comes from on the legacy path (a run
+# without a gateway endpoint). "scripted" replays canned turns for tests and needs none; there
+# are deliberately no Bedrock, Anthropic or Google paths, so a typo can never fall through to a
+# default cloud provider.
 PROVIDER_CREDENTIALS: Mapping[str, str | None] = {"openai": "OPENAI_API_KEY", "scripted": None}
+# What the runner's trace is priced at: nothing. Dollars come only from the gateway's ledger,
+# so the token counts this adapter reports are never mistaken for the authoritative spend (P12).
+UNPRICED = Prices(input=0.0, output=0.0)
 
 DEFAULT_SETTINGS: Mapping[str, Any] = {
     "python_path": None,  # required: the pinned venv's interpreter
@@ -100,11 +124,14 @@ DEFAULT_SETTINGS: Mapping[str, Any] = {
     "recursion_limit": 1000,  # LangGraph super-steps: model, tool and middleware nodes all count
     "shell_timeout_s": 120,  # default per `execute` command
     "provider_timeout_s": 120,  # per model request
-    "max_retries": 2,  # per model request, inside the OpenAI SDK
-    "prices": None,  # required: USD per million tokens (hive.agents.runner_protocol.parse_prices)
+    "max_retries": 2,  # per model request, inside the OpenAI SDK; each retry is a gateway call
     "scripted_turns_path": None,  # provider "scripted" only: the turns the test model replays
 }
 _POSITIVE_NUMBERS = ("timeout_s", "provider_timeout_s")
+# Settings that used to exist, with where their job went, so an old config fails with a pointer.
+REMOVED_SETTINGS: Mapping[str, str] = {
+    "prices": "cost now comes from the model gateway's ledger; move the table to [model] prices",
+}
 _POSITIVE_INTEGERS = ("max_model_calls", "recursion_limit", "shell_timeout_s")
 
 VERSION_CHECK_TIMEOUT_S = 60
@@ -113,10 +140,11 @@ VERSION_CHECK_CODE = "import importlib.metadata as m; print(m.version('deepagent
 # Names an extension must not use: each builds or swaps a chat model or a provider profile,
 # which would change the model the experiment fixed (P3). validate() rejects them statically,
 # and since a static scan can be dodged, the runner also checks every request made through the
-# agent's chat model and the controller every reply the runner traced. All of this is
-# detection: extension code runs in the runner's process and can reach the model object's key
-# and provider client, and a call made through that client directly is neither checked,
-# counted nor traced.
+# agent's chat model and the controller every reply the runner traced. All of this is in-process
+# detection, a second line: extension code runs in the runner's process and can reach the model
+# object's token and provider client. The boundary is the gateway, which checks, counts and
+# bills every request made with the trial's token, including one sent through that client
+# directly (which the runner neither checks, counts nor traces).
 FORBIDDEN_NAMES = (
     "ChatOpenAI", "AzureChatOpenAI", "ChatAnthropic", "ChatAnthropicVertex", "ChatGoogleGenerativeAI",
     "ChatBedrock", "ChatBedrockConverse", "init_chat_model", "register_harness_profile",
@@ -251,9 +279,10 @@ FORBIDDEN_APIS = (
     "middleware that builds or calls a model of its own: ModelFallbackMiddleware, LLMToolSelectorMiddleware, "
     "LLMToolEmulator, SummarizationMiddleware (langchain's or deepagents')",
     "deepagents.register_harness_profile / register_provider_profile / HarnessProfile",
-    "reading provider credentials (OPENAI_API_KEY, or the key the model object holds) or setting OPENAI_BASE_URL",
+    "reading provider credentials (OPENAI_API_KEY, or the token the model object holds) or setting OPENAI_BASE_URL",
     "calling the provider client behind the model directly (request.model.client / root_client, openai.OpenAI): "
-    "such calls skip HIVE's checks and usage count, so they are forbidden, not merely untracked",
+    "such calls skip the runner's checks and trace; the model gateway still checks and bills them, and refuses "
+    "any other model or effort (model_mismatch), so they are forbidden and never free",
 )
 
 
@@ -428,6 +457,10 @@ def valve_problems(valves: Mapping[str, Any]) -> list[str]:
 
 def resolve_settings(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULT_SETTINGS, **defaults, **overrides}
+    removed = sorted(set(merged) & set(REMOVED_SETTINGS))
+    if removed:
+        raise ValueError("; ".join(f"'{name}' is no longer a Deep Agents setting: {REMOVED_SETTINGS[name]}"
+                                   for name in removed))  # fmt: skip
     unknown = sorted(set(merged) - set(DEFAULT_SETTINGS))
     if unknown:
         raise ValueError(
@@ -454,17 +487,10 @@ def resolve_settings(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) 
     retries = merged["max_retries"]
     if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
         raise ValueError(f"Deep Agents setting 'max_retries' must be an integer >= 0; got {retries!r}")
-    if merged["prices"] is None:
-        raise ValueError("Deep Agents setting 'prices' is required (USD per million tokens): " + _prices_hint())
-    merged["prices"] = parse_prices(merged["prices"])
     turns = merged["scripted_turns_path"]
     if turns is not None and (not isinstance(turns, str) or not turns):
         raise ValueError("Deep Agents setting 'scripted_turns_path' must be a path string or unset")
     return merged
-
-
-def _prices_hint() -> str:
-    return "e.g. prices = { input = 0.05, output = 0.40, cache_read = 0.005 }"
 
 
 def reasoning_effort(model: ModelSpec) -> str:
@@ -541,13 +567,8 @@ class DeepAgentsAdapter:
         if (model.provider == "scripted") != (turns is not None):
             raise ValueError("Deep Agents setting 'scripted_turns_path' is required with provider 'scripted' and "
                              "allowed only with it")  # fmt: skip
-        credential_name = PROVIDER_CREDENTIALS[model.provider]
-        credential = None
-        if credential_name is not None:
-            # Read now, from the environment HIVE started in, and failed on before any trial is paid for.
-            credential = os.environ.get(credential_name)
-            if not credential:
-                raise ValueError(f"{credential_name} must be set for model provider {model.provider!r}")
+        # No credential is read here: with the gateway, the key never leaves it, and the legacy
+        # path (no endpoint) reads it when a trial starts, so the agent object never holds it.
         check_deepagents_version(resolved["python_path"], resolved["deepagents_version"])
 
         layout = read_layout(candidate.root)
@@ -564,12 +585,10 @@ class DeepAgentsAdapter:
             general_purpose_subagent=valves.get("general_purpose_subagent", DEFAULT_GENERAL_PURPOSE_SUBAGENT),
             model=model,
             reasoning_effort=effort,
-            credential=(credential_name, credential) if credential_name and credential else None,
             limits={name: resolved[name] for name in
                     ("max_model_calls", "recursion_limit", "shell_timeout_s", "provider_timeout_s", "max_retries")},
             timeout_s=float(resolved["timeout_s"]),
             term_grace_s=float(resolved["term_grace_s"]),
-            prices=resolved["prices"],
             scripted_turns_file=str(Path(turns).expanduser().resolve()) if turns is not None else None,
             workdir_prompt=WORKDIR_PROMPT.read_text(encoding="utf-8"),
         )  # fmt: skip
@@ -603,50 +622,70 @@ class DeepAgentsAgent:
     general_purpose_subagent: bool
     model: ModelSpec
     reasoning_effort: str
-    credential: tuple[str, str] | None  # (name, value); sent on the runner's stdin, never in a file, argv or env
     limits: Mapping[str, int | float]
     timeout_s: float
     term_grace_s: float
-    prices: Prices
     scripted_turns_file: str | None
     workdir_prompt: str
 
     def __repr__(self) -> str:
-        # The dataclass repr would print the credential into any log or traceback that shows the agent.
         return f"DeepAgentsAgent(model={self.model.qualified!r}, candidate_root={str(self.candidate_root)!r})"
 
-    def run(self, task: Task, workdir: Path, trace_dir: Path) -> AgentResult:
+    def run(self, task: Task, workdir: Path, trace_dir: Path, endpoint: ModelEndpoint | None = None) -> AgentResult:
+        """One trial. With `endpoint`, every model request goes to it with its per-trial token.
+
+        Usage in the result is the runner's traced token count with no cost: the controller takes
+        usage and cost from the gateway's ledger, which is the authority (P12).
+        """
         started = time.monotonic()
         try:
-            return self._run(task, workdir, trace_dir, started)
+            return self._run(task, workdir, trace_dir, endpoint, started)
         except Exception as error:  # run never raises (Agent contract); an adapter fault is this trial's error
             return AgentResult(status="errored", final_text="", usage=Usage(), wall_clock_s=time.monotonic() - started,
                                error=f"the Deep Agents adapter failed: {type(error).__name__}: {error}",
                                error_class="agent_error")  # fmt: skip
 
-    def _run(self, task: Task, workdir: Path, trace_dir: Path, started: float) -> AgentResult:
+    def _run(self, task: Task, workdir: Path, trace_dir: Path, endpoint: ModelEndpoint | None,
+             started: float) -> AgentResult:  # fmt: skip
+        access = self.model_access(endpoint)
         trace_dir.mkdir(parents=True, exist_ok=True)
         home = trace_dir / HOME_DIR
         home.mkdir(exist_ok=True)
         spec_path = trace_dir / RUN_SPEC_FILE
         spec_path.write_text(json.dumps(self.run_spec(task, workdir.resolve(), trace_dir), indent=2) + "\n")
-        credentials = dict([self.credential]) if self.credential is not None else {}
         outcome = run_process_group(
             [self.python_path, "-I", str(RUNNER), str(spec_path)],
             cwd=workdir,
             env=_base_environment(home=home),
-            stdin_text=json.dumps({"credentials": credentials}) + "\n",
+            stdin_text=json.dumps(access) + "\n",
             timeout_s=self.timeout_s,
             stdout_path=trace_dir / STDOUT_FILE,
             stderr_path=trace_dir / STDERR_FILE,
             term_grace_s=self.term_grace_s,
             extra_pgids_file=trace_dir / CHILD_PGIDS_FILE,
         )
-        return interpret_runner(trace_dir, outcome, model=self.model, prices=self.prices,
+        return interpret_runner(trace_dir, outcome, model=self.model, prices=UNPRICED,
                                 wall_clock_s=time.monotonic() - started)  # fmt: skip
 
+    def model_access(self, endpoint: ModelEndpoint | None) -> dict[str, Any]:
+        """The stdin line's payload: the gateway endpoint, or (legacy) the provider credential.
+
+        The legacy key is read from the controller's environment here, when the trial starts, so
+        it is never kept on this object; a missing key fails the trial before anything runs.
+        """
+        if endpoint is not None:
+            return {"endpoint": {"base_url": endpoint.base_url, "api_key": endpoint.api_key}}
+        name = PROVIDER_CREDENTIALS[self.model.provider]
+        if name is None:
+            return {"credentials": {}}
+        value = os.environ.get(name)
+        if not value:
+            raise ValueError(f"no model endpoint was given and {name} is not set for model provider "
+                             f"{self.model.provider!r} (the legacy no-gateway path)")  # fmt: skip
+        return {"credentials": {name: value}}
+
     def run_spec(self, task: Task, workdir: Path, trace_dir: Path) -> dict[str, Any]:
-        """Everything the runner needs, as plain JSON. Never the credential: it travels on stdin."""
+        """Everything the runner needs, as plain JSON. Never a key or token: those travel on stdin."""
         return {
             "instruction": task.instruction,
             "workdir": str(workdir),

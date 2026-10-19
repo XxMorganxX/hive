@@ -142,8 +142,9 @@ Decorator forms (each returns an `AgentMiddleware` instance; `name=` sets its na
 ```python
 class ModelRequest(Generic[ContextT]):
     model: BaseChatModel                  # HIVE: read-only. Replacing it is forbidden (P3). It also holds the
-                                          # API key and the provider client: reading them or calling the
-                                          # client directly is forbidden (such calls skip HIVE's checks).
+                                          # trial's gateway token and the provider client: reading them or
+                                          # calling the client directly is forbidden (such calls skip the
+                                          # runner's checks; the gateway still refuses and bills them).
     messages: list[AnyMessage]            # excluding the system message
     system_message: SystemMessage | None
     tool_choice: Any | None
