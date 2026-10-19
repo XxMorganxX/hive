@@ -375,49 +375,51 @@ coordination: { handoff: summary, parallel_children: true, termination: entry_de
   - `selection_score`: the mean over all tasks × k, with errored trials counted as 0, so a candidate can't hide hard tasks behind errors (P8);
   - `stderr`, cost and tokens.
 
-## 6. The optimizer loop
+## 6. The improvement loop
 
 ```
-measure noise floor (seed × k on search)                         ← P1, once per experiment
+check splits are disjoint; snapshot config                         ← P7, P13
+evaluate seed on search × k  → seed report = incumbent report      ← P1 (noise floor: planned)
 for generation in 1..G:
-    optimizer reads experience store → writes N proposals         ← P10
-    controller: validate → smoke (1 task) → score on search × k   ← P2, P8
-    controller: classify → rank (Wilson LB) → promote if margin   ← P9
-    controller: append everything to experience store             ← P6
-    stop on: dollar cap | ≥50% quota/infra errors | seed unmeasurable
-score final best + seed on validation (choose) and held-out (report once)   ← P7
+    stop if spend ≥ max_usd                                         ← P12
+    overseer.propose(brief from incumbent) → child candidate        ← P10
+    adapter.validate(child); reject empty or duplicate proposals    ← P2, P4
+    evaluate child on search × k
+    promote iff child beats incumbent by > margin and ≥ seed        ← P9
+    append the generation row (ids, scores, decision, rationale, cost)
+evaluate seed and final incumbent on heldout, once; write summary  ← P7
 ```
+
+Bare-bones selection uses `selection_score` with a fixed margin. The 95% lower-bound rule, the noise-floor run and valve-diversity pressure (P1, P9, P11) are the next additions.
 
 ### 6.1 Experience store layout
 
-Modeled on the Meta-Harness paper's proposer filesystem: every prior candidate's code, scores and raw traces, which the optimizer reads selectively with grep and cat.
+Modeled on the Meta-Harness paper's proposer filesystem: every candidate's files, scores and raw traces, which the overseer reads selectively.
 
 ```
-experience/<experiment>/
-  noise_floor.json                       # seed SD, MDE, k used
-  gen-NNN/
-    candidates/<id>/                     # full harness spec + lineage.json
-    scores/<id>.json                     # per-task Outcomes + aggregates
-    traces/<id>/<task>/trial-<k>/        # trajectory.json, native session, load_report
-    flips/<id>.json                      # per-task change vs. parent and vs. seed
-  frontier.json
-  evolution.jsonl                        # one row per generation
+experience/<experiment>/<run-id>/
+  run_meta.json                        # config snapshot, versions, stop reason, spend (written in finally)
+  candidates/<id>/                     # snapshot of every evaluated candidate, with lineage.json
+  evals/<id>/search/report.json        # EvalReport
+  evals/<id>/search/trials/<task>/<n>/ # workdir/ + trace/ for each trial
+  heldout/<id>/...                     # same shape; NEVER copied into an overseer workspace
+  overseer/gen-<NNN>/                  # the overseer workspace + proposal.json
+  generations.jsonl                    # one row per generation
+  summary.json
 ```
 
-- **`flips/`** records, per task, what changed versus the parent and versus the seed. Aggregate pass rates hide which valve did what.
-- Held-out results go to `runs/<experiment>/heldout/`. They never go here.
+### 6.2 What the overseer is given
 
-### 6.2 The optimizer contract
+The overseer is given exactly what you'd give a human engineer asked to improve the harness:
+- the current candidate config (an editable copy);
+- the evaluation metric;
+- the suite description;
+- the valve catalog;
+- the real selection rule;
+- the incumbent's search-split report with raw traces;
+- the history of earlier attempts.
 
-The optimizer runs headless: `claude -p` with Read, Grep, Glob and Write, scoped to the experience store, and a proposals file as its only output.
-
-Its prompt contains:
-- the adapter's `describe_schema()`;
-- the experience store layout;
-- **the real selection rule**;
-- the fact that a hidden held-out set exists;
-- the noise floor;
-- the valves explored so far, so it can be pushed toward unexplored ones (P11).
+It is never given the held-out split, the reference answers, the hidden tests or the controller.
 
 ### 6.3 Arms every experiment runs
 
