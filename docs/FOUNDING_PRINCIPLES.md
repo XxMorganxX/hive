@@ -64,9 +64,9 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 
 ### P3. The model is frozen; the harness is the variable
 
-**Rule:** inside one experiment, the model id, its parameters and the provider are fixed and recorded. The overseer may not change them. Comparing models is a separate experiment with its own seed.
+**Rule:** inside one experiment, the provider, the model id and its parameters (including the reasoning-effort level, `[model] thinking`) are fixed and recorded. The overseer may not change them. The agent adapter checks which model every response actually came from, and a mismatch errors the trial (`model_mismatch`). Comparing models is a separate experiment with its own seed.
 
-**Why:** otherwise we can't tell a harness gain from a model gain, and the research question is about harnesses.
+**Why:** otherwise we can't tell a harness gain from a model gain, and the research question is about harnesses. More reasoning effort buys accuracy with spend, so it counts as a model change, not a harness change.
 
 ### P4. A harness is data
 
@@ -81,7 +81,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
   - **`AgentAdapter` / `Agent`:** frameworks (Pi, Strands, Deep Agents, …).
   - **`Suite`:** evaluation use cases.
   - **`Overseer`:** the improvement strategy (Claude Code, a null control, …).
-- Implementations are chosen by name in the experiment config through one registry.
+- Implementations are chosen by name through one registry. The experiment config names the suite and the overseer. The candidate's own manifest (`agent = "..."`) names its agent adapter.
 - Framework-specific code stays inside its adapter, and nothing outside an adapter imports a framework.
 - Harbor plugs in **behind** these contracts: as a `Suite` that runs Harbor datasets in Docker, and as an execution backend for agents.
 
@@ -106,9 +106,9 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 
 **Rule:**
 - Every suite has disjoint **search**, **validation** and **held-out** sets. The controller asserts the sets don't overlap before spending anything.
-- Held-out results never enter the experience store.
+- Held-out results never enter an overseer brief or workspace; they are stored apart from search evaluations.
 - The held-out set is scored once per experiment, at the end.
-- Verifiers run in a separate container (`environment_mode="separate"`).
+- Verifiers run in a separate container (`environment_mode="separate"`) once the Harbor suite exists. Until then, grading runs on the host (see the §9 checklist).
 
 **Why:**
 - The Meta-Harness paper's Terminal-Bench-2 result used the same tasks for search and test.
@@ -118,8 +118,8 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 ### P8. Errors are not failures
 
 **Rule:**
-- Every outcome has one status: `passed`, `failed`, `errored`, `noop` or `incomplete`. An unmeasured outcome also has an error class (`INFRA_TIMEOUT`, `INFRA_QUOTA`, `INFRA_OOM`, `INFRA_MISSING`, `MEASUREMENT_LOST`).
-- The reported pass rate leaves errors out of the denominator.
+- Every trial is either `scored` (it has a reward) or `errored`. An errored trial carries an error class: `agent_error`, `timeout`, `provider_error`, `quota`, `harness_load_error`, `model_mismatch`, `grader_error` or `workspace_error`.
+- The reported `measured_mean` leaves errored trials out.
 - **Selection** still uses all requested tasks as the denominator, so a candidate can't improve its rank by pushing hard tasks into "errored".
 - Never trust an exit code. Count completed trials. Pi's JSON mode doesn't signal failure through its exit code, so parse `stopReason`.
 
@@ -131,7 +131,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 
 **Rule:**
 - Score each task as its **mean reward over k trials**, never pass@k.
-- Rank candidates by the 95% Wilson lower bound over tasks × k.
+- Rank candidates conservatively. In the scaffold, rank by `selection_score` (errored trials count as 0) plus a fixed promotion margin. Next: the 95% lower bound over tasks × k.
 - A child is promoted only if it beats the incumbent by more than the promotion margin, and never if it scores below the seed.
 - Accuracy comes first. Cost only breaks ties among statistically tied candidates.
 - Every search also runs a **null-overseer control**: the same loop with no edits.
@@ -181,7 +181,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 ### P13. Every run can be reproduced
 
 **Rule:**
-- Pin exact versions of the framework (Pi, Deep Agents), Harbor and the model id.
+- Pin exact versions of the framework (Pi, Deep Agents), Harbor and the model id. Pi is pinned at the installed 0.75.3, with `[agent] pi_version` checked at build. Upgrading to 1.3.x is a deliberate change that means re-verifying the adapter against Pi's source.
 - Run Pi with `--offline` so its model catalog (and with it the cost numbers) can't change between runs.
 - Every run writes a `run_meta.json` with versions, the candidate id, the suite split, k, seeds and cost, written even when the run crashes.
 - Resuming a run reloads paid evaluations by candidate id.
@@ -198,7 +198,7 @@ Each principle has a rule and the reason for it. The reasons come from the Meta-
 
 **Pi is the primary framework.** A second framework comes in after the Pi loop runs end to end. Its only job is to prove the interface is portable.
 
-| | **Pi** (`@earendil-works/pi` 1.3.0) | **Deep Agents** (`deepagents` 0.7.28) | **Strands** (`strands-agents` 1.61.1) |
+| | **Pi** (`@earendil-works/pi-coding-agent`; pinned 0.75.3, latest researched 1.3.0) | **Deep Agents** (`deepagents` 0.7.28) | **Strands** (`strands-agents` 1.61.1) |
 |---|---|---|---|
 | Language | TypeScript | Python (JS port exists) | Python (TS SDK exists) |
 | License | MIT | MIT | Apache-2.0 |
@@ -274,7 +274,7 @@ class AgentResult:
     usage: Usage                               # tokens + cost_usd
     wall_clock_s: float
     error: str | None = None
-    error_class: str | None = None             # agent_error | timeout | provider_error | quota | harness_load_error
+    error_class: str | None = None             # agent_error | timeout | provider_error | quota | harness_load_error | model_mismatch
 ```
 
 - **`run` never raises for agent-side failures.** It returns `status="errored"`, and it writes native traces into `trace_dir`.
@@ -353,7 +353,7 @@ The **null overseer** returns an unchanged copy, so the loop measures pure noise
 ```
 
 - **The candidate id is a content hash** of every file except `lineage.json`, so identical edits deduplicate (P4).
-- **The model is not in the candidate (P3).**
+- **The model is not in the candidate (P3),** and neither is its thinking level.
 - **Planned: `topology.yaml`,** compiled by each adapter into its framework's multi-agent primitives. Schema v0:
 
 ```yaml
@@ -450,8 +450,8 @@ The proposal compares arms on task performance, cost, latency and consistency. E
 
 | Metric | Definition | Role |
 |---|---|---|
-| **Reward** | The suite's `classify` reward, as the mean over k trials and then the mean over tasks | **Primary**: the only thing selection optimizes |
-| **Selection score** | 95% Wilson lower bound on reward, over all requested tasks × k | Ranking and promotion |
+| **Reward** | The suite's `grade` reward, as the mean over k trials and then the mean over tasks | **Primary**: the only thing selection optimizes |
+| **Selection score** | Mean reward over all tasks × k, with errored trials counted as 0. A 95% lower bound comes next (P9). | Ranking and promotion |
 | **Cost** | USD per task, and in total (eval plus overseer) | Tie-breaker; Pareto axis |
 | **Latency** | Wall-clock time per trial | Reported |
 | **Consistency** | Per-task standard deviation of reward across k trials; the share of tasks that flip between trials | Reported; drives the choice of k |
@@ -499,7 +499,7 @@ Each item is documented behavior of the tools or a standard failure mode of eval
 - [ ] Pi refreshes its model catalog at runtime, which can change cost numbers. **Run with `--offline`.**
 - [ ] Extension TypeScript isn't typechecked when it loads. **Run `tsc --noEmit` and a real load check in `validate`.**
 - [ ] Harbor forces an old Pi (0.85.1) when MCP servers are configured. **Avoid MCP in harness specs, or override the pin.**
-- [ ] Usage caps and quotas look like task failures. **Classify them as `INFRA_QUOTA`, and stop the generation if ≥50% hit it.**
+- [ ] Usage caps and quotas look like task failures. **The Pi adapter classifies them as `quota` (errored, not failed). Next: stop a generation when ≥50% of trials hit it.**
 - [ ] A broken judge (bad key, model outage) quietly collapses rewards. **Run a judge health check before each generation; an abstaining judge is null, never 0.**
 - [ ] A task that never ran can look like a cheap failure. **Flag trials with zero tokens or zero cost.**
 - [ ] A coding-agent overseer fixates on one idea. **Track explored valves and push toward unexplored ones.**
